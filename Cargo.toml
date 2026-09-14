@@ -1,0 +1,21 @@
+[package]
+name = "subject0"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "s0"
+path = "src/main.rs"
+
+[dependencies]
+# Modern, maintained terminal UI framework
+ratatui = "0.29"
+
+# Terminal raw mode, ANSI control, and event handling
+crossterm = { version = "0.28", features = ["event-stream"] }
+
+# Production-grade UTF-8 text rope data structure
+ropey = "1.6"
+
+# Ergonomic error handling
+anyhow = "1.0"
