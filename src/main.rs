@@ -1,14 +1,15 @@
+mod editor;
+mod lsp;
+
 use std::{
     cmp::Ordering,
     env,
-    fs::File,
-    io::{stdout, BufWriter, Write},
-    path::{Path, PathBuf},
-    process::Stdio,
+    io::{stdout, Write},
+    path::PathBuf,
     time::Duration,
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
@@ -25,996 +26,22 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
     Frame, Terminal,
 };
-use ropey::Rope;
-use serde_json::Value;
-use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    process::{ChildStdin, Command as TokioCommand},
-    sync::mpsc,
+use tokio::sync::mpsc;
+
+use editor::{Editor, Focus, Mode};
+use lsp::{
+    completion_kind_icon, file_icon_and_color, run_lsp_actor, LspInbound, LspOutbound, LspStatus,
+    SuggestionItem, SupportedLanguage,
 };
-use tree_sitter::{Parser, Tree};
-
-// -----------------------------------------------------------------------------
-// LSP Types & Actor Protocol
-// -----------------------------------------------------------------------------
-
-#[derive(Debug, Clone)]
-pub struct DiagnosticItem {
-    pub line: usize,
-    pub col: usize,
-    pub message: String,
-    pub severity: u8,
-}
-
-#[derive(Debug, Clone)]
-pub struct SuggestionItem {
-    pub label: String,
-    pub insert_text: String,
-    pub detail: Option<String>,
-    pub kind: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LspStatus {
-    Disabled,
-    NotFound(String),
-    Starting(String),
-    Ready(String),
-    Error(String),
-}
-
-pub enum LspInbound {
-    Change { text: String, version: i64 },
-    Save,
-    Completion { line: usize, col: usize, req_id: i64 },
-}
-
-pub enum LspOutbound {
-    Status(LspStatus),
-    Diagnostics(Vec<DiagnosticItem>),
-    Completions { req_id: i64, items: Vec<SuggestionItem> },
-}
-
-fn resolve_binary_path(cmd: &str) -> Option<PathBuf> {
-    if let Ok(path_var) = env::var("PATH") {
-        for dir in env::split_paths(&path_var) {
-            let candidate = dir.join(cmd);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    if let Ok(home) = env::var("HOME") {
-        let cargo_bin = PathBuf::from(home).join(".cargo/bin").join(cmd);
-        if cargo_bin.is_file() {
-            return Some(cargo_bin);
-        }
-    }
-    None
-}
-
-fn file_to_uri(path: &Path) -> String {
-    let abs = if path.is_absolute() {
-        path.to_path_buf()
-    } else if let Ok(cwd) = env::current_dir() {
-        cwd.join(path)
-    } else {
-        path.to_path_buf()
-    };
-    format!("file://{}", abs.to_string_lossy())
-}
-
-async fn read_lsp_message<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> Result<Value> {
-    let mut content_length = 0usize;
-    let mut line = String::new();
-
-    loop {
-        line.clear();
-        let bytes_read = reader.read_line(&mut line).await?;
-        if bytes_read == 0 {
-            return Err(anyhow!("LSP stream closed"));
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            break;
-        }
-        if let Some(val) = trimmed.strip_prefix("Content-Length:") {
-            content_length = val.trim().parse::<usize>()?;
-        }
-    }
-
-    if content_length == 0 {
-        return Err(anyhow!("Missing Content-Length header"));
-    }
-
-    let mut body = vec![0u8; content_length];
-    reader.read_exact(&mut body).await?;
-    let val: Value = serde_json::from_slice(&body)?;
-    Ok(val)
-}
-
-async fn send_lsp_message<W: AsyncWriteExt + Unpin>(writer: &mut W, value: &Value) -> Result<()> {
-    let body = serde_json::to_string(value)?;
-    let header = format!("Content-Length: {}\r\n\r\n", body.len());
-    writer.write_all(header.as_bytes()).await?;
-    writer.write_all(body.as_bytes()).await?;
-    writer.flush().await?;
-    Ok(())
-}
-
-async fn run_lsp_actor(
-    file_path: PathBuf,
-    lang_id: String,
-    server_cmd: String,
-    mut rx: mpsc::UnboundedReceiver<LspInbound>,
-    tx: mpsc::UnboundedSender<LspOutbound>,
-    initial_text: String,
-) {
-    let bin_path = match resolve_binary_path(&server_cmd) {
-        Some(p) => p,
-        None => {
-            let _ = tx.send(LspOutbound::Status(LspStatus::NotFound(server_cmd)));
-            return;
-        }
-    };
-
-    let _ = tx.send(LspOutbound::Status(LspStatus::Starting(server_cmd.clone())));
-
-    let mut child = match TokioCommand::new(bin_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = tx.send(LspOutbound::Status(LspStatus::Error(e.to_string())));
-            return;
-        }
-    };
-
-    let mut stdin: ChildStdin = child.stdin.take().expect("Child stdin acquired");
-    let mut stdout = BufReader::new(child.stdout.take().expect("Child stdout acquired"));
-
-    let root_uri = match env::current_dir() {
-        Ok(d) => file_to_uri(&d),
-        Err(_) => "file://.".to_string(),
-    };
-    let file_uri = file_to_uri(&file_path);
-
-    let init_req = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "processId": std::process::id(),
-            "rootUri": root_uri,
-            "capabilities": {
-                "textDocument": {
-                    "synchronization": {
-                        "openClose": true,
-                        "change": 1,
-                        "save": { "includeText": false }
-                    },
-                    "completion": {
-                        "completionItem": {
-                            "snippetSupport": false,
-                            "documentationFormat": ["plaintext"]
-                        }
-                    },
-                    "publishDiagnostics": {
-                        "relatedInformation": true
-                    }
-                }
-            },
-            "initializationOptions": {
-                "checkOnSave": true
-            }
-        }
-    });
-
-    if send_lsp_message(&mut stdin, &init_req).await.is_err() {
-        let _ = tx.send(LspOutbound::Status(LspStatus::Error("Init request failed".into())));
-        return;
-    }
-
-    loop {
-        match read_lsp_message(&mut stdout).await {
-            Ok(msg) => {
-                if msg.get("id").and_then(|v| v.as_i64()) == Some(1) {
-                    break;
-                }
-            }
-            Err(_) => {
-                let _ = tx.send(LspOutbound::Status(LspStatus::Error("Init rejected".into())));
-                return;
-            }
-        }
-    }
-
-    let initialized = serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": "initialized",
-        "params": {}
-    });
-    let _ = send_lsp_message(&mut stdin, &initialized).await;
-
-    let did_open = serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": "textDocument/didOpen",
-        "params": {
-            "textDocument": {
-                "uri": file_uri,
-                "languageId": lang_id,
-                "version": 1,
-                "text": initial_text
-            }
-        }
-    });
-    let _ = send_lsp_message(&mut stdin, &did_open).await;
-    let _ = tx.send(LspOutbound::Status(LspStatus::Ready(server_cmd)));
-
-    loop {
-        tokio::select! {
-            cmd = rx.recv() => {
-                match cmd {
-                    Some(LspInbound::Change { text, version }) => {
-                        let did_change = serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "method": "textDocument/didChange",
-                            "params": {
-                                "textDocument": { "uri": file_uri, "version": version },
-                                "contentChanges": [{ "text": text }]
-                            }
-                        });
-                        let _ = send_lsp_message(&mut stdin, &did_change).await;
-                    }
-                    Some(LspInbound::Save) => {
-                        let did_save = serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "method": "textDocument/didSave",
-                            "params": { "textDocument": { "uri": file_uri } }
-                        });
-                        let _ = send_lsp_message(&mut stdin, &did_save).await;
-                    }
-                    Some(LspInbound::Completion { line, col, req_id }) => {
-                        let comp_req = serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "id": req_id,
-                            "method": "textDocument/completion",
-                            "params": {
-                                "textDocument": { "uri": file_uri },
-                                "position": { "line": line, "character": col }
-                            }
-                        });
-                        let _ = send_lsp_message(&mut stdin, &comp_req).await;
-                    }
-                    None => break,
-                }
-            }
-            msg = read_lsp_message(&mut stdout) => {
-                match msg {
-                    Ok(json) => {
-                        if json.get("method").and_then(|m| m.as_str()) == Some("textDocument/publishDiagnostics") {
-                            if let Some(params) = json.get("params") {
-                                let mut items = Vec::new();
-                                if let Some(diag_array) = params.get("diagnostics").and_then(|d| d.as_array()) {
-                                    for d in diag_array {
-                                        let line = d["range"]["start"]["line"].as_u64().unwrap_or(0) as usize;
-                                        let col = d["range"]["start"]["character"].as_u64().unwrap_or(0) as usize;
-                                        let message = d["message"].as_str().unwrap_or("").to_string();
-                                        let severity = d["severity"].as_u64().unwrap_or(1) as u8;
-                                        items.push(DiagnosticItem { line, col, message, severity });
-                                    }
-                                }
-                                let _ = tx.send(LspOutbound::Diagnostics(items));
-                            }
-                        } else if let Some(resp_id) = json.get("id").and_then(|id| id.as_i64()) {
-                            let mut results = Vec::new();
-                            let result_val = json.get("result");
-
-                            let items_array = result_val.and_then(|r| {
-                                if r.is_array() {
-                                    Some(r.as_array().unwrap())
-                                } else {
-                                    r.get("items").and_then(|it| it.as_array())
-                                }
-                            });
-
-                            if let Some(arr) = items_array {
-                                for item in arr {
-                                    if let Some(label) = item.get("label").and_then(|l| l.as_str()) {
-                                        let insert_text = item
-                                            .get("insertText")
-                                            .and_then(|it| it.as_str())
-                                            .unwrap_or(label)
-                                            .to_string();
-                                        let detail = item
-                                            .get("detail")
-                                            .and_then(|d| d.as_str())
-                                            .map(|s| s.to_string());
-                                        let kind = item.get("kind").and_then(|k| k.as_u64()).unwrap_or(0);
-
-                                        results.push(SuggestionItem {
-                                            label: label.to_string(),
-                                            insert_text,
-                                            detail,
-                                            kind,
-                                        });
-                                    }
-                                }
-                            }
-                            let _ = tx.send(LspOutbound::Completions { req_id: resp_id, items: results });
-                        }
-                    }
-                    Err(_) => {
-                        let _ = tx.send(LspOutbound::Status(LspStatus::Error("Terminated".into())));
-                        break;
-                    }
-                }
-            }
-        }
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Syntax Highlighting Engine
-// -----------------------------------------------------------------------------
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum SupportedLanguage {
-    Rust,
-    Python,
-    Markdown,
-    Plain,
-}
-
-pub struct SyntaxEngine {
-    pub language: SupportedLanguage,
-    parser: Option<Parser>,
-    #[allow(dead_code)]
-    tree: Option<Tree>,
-}
-
-impl SyntaxEngine {
-    pub fn new(path: Option<&PathBuf>) -> Self {
-        let ext = path
-            .and_then(|p| p.extension())
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
-
-        let (language, parser) = match ext {
-            "rs" => {
-                let mut p = Parser::new();
-                let _ = p.set_language(&tree_sitter_rust::language());
-                (SupportedLanguage::Rust, Some(p))
-            }
-            "py" => {
-                let mut p = Parser::new();
-                let _ = p.set_language(&tree_sitter_python::language());
-                (SupportedLanguage::Python, Some(p))
-            }
-            "md" => (SupportedLanguage::Markdown, None),
-            _ => (SupportedLanguage::Plain, None),
-        };
-
-        Self {
-            language,
-            parser,
-            tree: None,
-        }
-    }
-
-    pub fn reparse(&mut self, text: &str) {
-        if let Some(parser) = &mut self.parser {
-            self.tree = parser.parse(text, None);
-        }
-    }
-
-    pub fn highlight_line(&self, line_text: &str, _line_idx: usize) -> Vec<Span<'static>> {
-        if line_text.is_empty() {
-            return vec![Span::raw("")];
-        }
-
-        match self.language {
-            SupportedLanguage::Markdown => Self::highlight_markdown(line_text),
-            SupportedLanguage::Rust | SupportedLanguage::Python => {
-                Self::highlight_code(line_text, self.language)
-            }
-            SupportedLanguage::Plain => vec![Span::raw(line_text.to_string())],
-        }
-    }
-
-    fn highlight_markdown(line_text: &str) -> Vec<Span<'static>> {
-        let trimmed = line_text.trim_start();
-        if trimmed.starts_with("# ") {
-            vec![Span::styled(
-                line_text.to_string(),
-                Style::default().fg(Color::Rgb(80, 200, 240)).add_modifier(Modifier::BOLD),
-            )]
-        } else if trimmed.starts_with("## ") {
-            vec![Span::styled(
-                line_text.to_string(),
-                Style::default().fg(Color::Rgb(120, 180, 255)).add_modifier(Modifier::BOLD),
-            )]
-        } else if trimmed.starts_with("### ") {
-            vec![Span::styled(
-                line_text.to_string(),
-                Style::default().fg(Color::Rgb(180, 160, 240)).add_modifier(Modifier::BOLD),
-            )]
-        } else if trimmed.starts_with("```") {
-            vec![Span::styled(
-                line_text.to_string(),
-                Style::default().fg(Color::Rgb(240, 180, 90)),
-            )]
-        } else {
-            vec![Span::styled(
-                line_text.to_string(),
-                Style::default().fg(Color::Rgb(210, 215, 225)),
-            )]
-        }
-    }
-
-    fn highlight_code(line_text: &str, lang: SupportedLanguage) -> Vec<Span<'static>> {
-        let mut spans = Vec::new();
-        let mut idx = 0;
-        let chars: Vec<char> = line_text.chars().collect();
-        let len = chars.len();
-
-        while idx < len {
-            if (lang == SupportedLanguage::Rust && idx + 1 < len && chars[idx] == '/' && chars[idx + 1] == '/')
-                || (lang == SupportedLanguage::Python && chars[idx] == '#')
-            {
-                let rest: String = chars[idx..].iter().collect();
-                spans.push(Span::styled(
-                    rest,
-                    Style::default().fg(Color::Rgb(100, 110, 125)).add_modifier(Modifier::ITALIC),
-                ));
-                break;
-            }
-
-            if chars[idx] == '"' || chars[idx] == '\'' {
-                let quote = chars[idx];
-                let mut end = idx + 1;
-                while end < len {
-                    if chars[end] == '\\' && end + 1 < len {
-                        end += 2;
-                        continue;
-                    }
-                    if chars[end] == quote {
-                        end += 1;
-                        break;
-                    }
-                    end += 1;
-                }
-                let token: String = chars[idx..end].iter().collect();
-                spans.push(Span::styled(token, Style::default().fg(Color::Rgb(150, 210, 120))));
-                idx = end;
-                continue;
-            }
-
-            if chars[idx].is_ascii_digit() {
-                let mut end = idx;
-                while end < len && (chars[end].is_ascii_alphanumeric() || chars[end] == '.') {
-                    end += 1;
-                }
-                let num: String = chars[idx..end].iter().collect();
-                spans.push(Span::styled(num, Style::default().fg(Color::Rgb(250, 170, 90))));
-                idx = end;
-                continue;
-            }
-
-            if chars[idx].is_alphabetic() || chars[idx] == '_' {
-                let mut end = idx;
-                while end < len && (chars[end].is_alphanumeric() || chars[end] == '_') {
-                    end += 1;
-                }
-                let word: String = chars[idx..end].iter().collect();
-
-                let style = match lang {
-                    SupportedLanguage::Rust => match word.as_str() {
-                        "fn" | "let" | "mut" | "pub" | "struct" | "enum" | "match" | "if"
-                        | "else" | "impl" | "for" | "in" | "while" | "return" | "use" | "mod"
-                        | "async" | "await" | "trait" | "type" | "where" | "loop" => {
-                            Style::default().fg(Color::Rgb(220, 110, 240)).add_modifier(Modifier::BOLD)
-                        }
-                        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "usize"
-                        | "isize" | "f32" | "f64" | "bool" | "char" | "String" | "Option"
-                        | "Result" | "Some" | "None" | "Ok" | "Err" | "Self" | "self" => {
-                            Style::default().fg(Color::Rgb(240, 200, 90))
-                        }
-                        _ => {
-                            if end < len && chars[end] == '(' {
-                                Style::default().fg(Color::Rgb(100, 170, 255))
-                            } else {
-                                Style::default().fg(Color::Rgb(220, 225, 235))
-                            }
-                        }
-                    },
-                    SupportedLanguage::Python => match word.as_str() {
-                        "def" | "class" | "if" | "elif" | "else" | "for" | "while" | "return"
-                        | "import" | "from" | "as" | "with" | "try" | "except" | "finally"
-                        | "lambda" | "yield" | "pass" | "break" | "continue" | "in" | "is"
-                        | "not" | "and" | "or" => {
-                            Style::default().fg(Color::Rgb(220, 110, 240)).add_modifier(Modifier::BOLD)
-                        }
-                        "True" | "False" | "None" | "self" | "int" | "str" | "list" | "dict" => {
-                            Style::default().fg(Color::Rgb(240, 200, 90))
-                        }
-                        _ => {
-                            if end < len && chars[end] == '(' {
-                                Style::default().fg(Color::Rgb(100, 170, 255))
-                            } else {
-                                Style::default().fg(Color::Rgb(220, 225, 235))
-                            }
-                        }
-                    },
-                    _ => Style::default().fg(Color::Rgb(220, 225, 235)),
-                };
-
-                spans.push(Span::styled(word, style));
-                idx = end;
-                continue;
-            }
-
-            spans.push(Span::styled(
-                chars[idx].to_string(),
-                Style::default().fg(Color::Rgb(140, 150, 170)),
-            ));
-            idx += 1;
-        }
-
-        spans
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Core Editor Model
-// -----------------------------------------------------------------------------
-
-#[derive(PartialEq, Eq, Clone, Copy)]
-pub enum Mode {
-    Normal,
-    Insert,
-    Command,
-}
-
-pub struct Editor {
-    pub rope: Rope,
-    pub path: Option<PathBuf>,
-    pub mode: Mode,
-    pub cursor_x: usize,
-    pub cursor_y: usize,
-    pub scroll_x: usize,
-    pub scroll_y: usize,
-    pub modified: bool,
-    pub status_msg: String,
-    pub command_buffer: String,
-    pub pending_key: Option<char>,
-    pub undo_stack: Vec<Rope>,
-    pub syntax: SyntaxEngine,
-    pub diagnostics: Vec<DiagnosticItem>,
-    pub lsp_status: LspStatus,
-    pub lsp_tx: Option<mpsc::UnboundedSender<LspInbound>>,
-    pub lsp_req_id: i64,
-    pub doc_version: i64,
-
-    // Completions State
-    pub completions: Vec<SuggestionItem>,
-    pub completion_idx: usize,
-    pub completion_scroll: usize,
-    pub completion_visible: bool,
-    pub should_quit: bool,
-}
-
-impl Editor {
-    pub fn new(path: Option<PathBuf>) -> Result<Self> {
-        let (rope, status_msg) = match &path {
-            Some(p) if p.exists() => {
-                let file = File::open(p)?;
-                (Rope::from_reader(file)?, format!("Loaded {}", p.display()))
-            }
-            Some(p) => (Rope::new(), format!("New: {}", p.display())),
-            None => (Rope::new(), "Ready".to_string()),
-        };
-
-        let mut syntax = SyntaxEngine::new(path.as_ref());
-        let text = rope.to_string();
-        syntax.reparse(&text);
-
-        Ok(Self {
-            rope,
-            path,
-            mode: Mode::Normal,
-            cursor_x: 0,
-            cursor_y: 0,
-            scroll_x: 0,
-            scroll_y: 0,
-            modified: false,
-            status_msg,
-            command_buffer: String::new(),
-            pending_key: None,
-            undo_stack: Vec::new(),
-            syntax,
-            diagnostics: Vec::new(),
-            lsp_status: LspStatus::Disabled,
-            lsp_tx: None,
-            lsp_req_id: 10,
-            doc_version: 1,
-            completions: Vec::new(),
-            completion_idx: 0,
-            completion_scroll: 0,
-            completion_visible: false,
-            should_quit: false,
-        })
-    }
-
-    pub fn snapshot(&mut self) {
-        if self.undo_stack.len() >= 64 {
-            self.undo_stack.remove(0);
-        }
-        self.undo_stack.push(self.rope.clone());
-    }
-
-    pub fn undo(&mut self) {
-        if let Some(prev) = self.undo_stack.pop() {
-            self.rope = prev;
-            self.modified = true;
-            self.status_msg = "Reverted change".to_string();
-            self.clamp_cursor();
-            self.on_buffer_modified();
-        }
-    }
-
-    pub fn on_buffer_modified(&mut self) {
-        let text = self.rope.to_string();
-        self.syntax.reparse(&text);
-        self.doc_version += 1;
-
-        if let Some(tx) = &self.lsp_tx {
-            let _ = tx.send(LspInbound::Change {
-                text,
-                version: self.doc_version,
-            });
-        }
-    }
-
-    pub fn request_completions(&mut self) {
-        if let Some(tx) = &self.lsp_tx {
-            self.lsp_req_id += 1;
-            let _ = tx.send(LspInbound::Completion {
-                line: self.cursor_y,
-                col: self.cursor_x,
-                req_id: self.lsp_req_id,
-            });
-        }
-    }
-
-    pub fn current_line_len(&self) -> usize {
-        line_len(&self.rope, self.cursor_y)
-    }
-
-    pub fn char_index(&self) -> usize {
-        let line_start = self.rope.line_to_char(self.cursor_y);
-        line_start + self.cursor_x
-    }
-
-    pub fn char_under_cursor(&self) -> Option<char> {
-        let idx = self.char_index();
-        if idx < self.rope.len_chars() {
-            Some(self.rope.char(idx))
-        } else {
-            None
-        }
-    }
-
-    pub fn current_word_prefix(&self) -> String {
-        if self.cursor_y >= self.rope.len_lines() {
-            return String::new();
-        }
-        let line = self.rope.line(self.cursor_y);
-        let chars: Vec<char> = line.chars().collect();
-        let mut start = self.cursor_x;
-        while start > 0 {
-            let c = chars.get(start - 1).copied().unwrap_or(' ');
-            if c.is_alphanumeric() || c == '_' {
-                start -= 1;
-            } else {
-                break;
-            }
-        }
-        if start < self.cursor_x && self.cursor_x <= chars.len() {
-            chars[start..self.cursor_x].iter().collect()
-        } else {
-            String::new()
-        }
-    }
-
-    pub fn insert_char(&mut self, c: char) {
-        let idx = self.char_index();
-        self.rope.insert_char(idx, c);
-        self.cursor_x += 1;
-        self.modified = true;
-        self.on_buffer_modified();
-    }
-
-    pub fn insert_pair(&mut self, open: char, close: char) {
-        let idx = self.char_index();
-        self.rope.insert_char(idx, open);
-        self.rope.insert_char(idx + 1, close);
-        self.cursor_x += 1;
-        self.modified = true;
-        self.on_buffer_modified();
-    }
-
-    pub fn insert_newline(&mut self) {
-        let idx = self.char_index();
-        let current_line = if self.cursor_y < self.rope.len_lines() {
-            self.rope.line(self.cursor_y).to_string()
-        } else {
-            String::new()
-        };
-
-        let indent: String = current_line
-            .chars()
-            .take_while(|c| *c == ' ' || *c == '\t')
-            .collect();
-
-        let char_before = if idx > 0 { Some(self.rope.char(idx - 1)) } else { None };
-        let char_after = if idx < self.rope.len_chars() { Some(self.rope.char(idx)) } else { None };
-
-        // Smart expand: enter between {} creates clean indentation block
-        if char_before == Some('{') && char_after == Some('}') {
-            let inner_indent = format!("{}    ", indent);
-            let to_insert = format!("\n{}\n{}", inner_indent, indent);
-            self.rope.insert(idx, &to_insert);
-            self.cursor_y += 1;
-            self.cursor_x = inner_indent.chars().count();
-        } else {
-            let to_insert = format!("\n{}", indent);
-            self.rope.insert(idx, &to_insert);
-            self.cursor_y += 1;
-            self.cursor_x = indent.chars().count();
-        }
-
-        self.modified = true;
-        self.completion_visible = false;
-        self.on_buffer_modified();
-    }
-
-    pub fn backspace(&mut self) {
-        if self.cursor_x > 0 {
-            let idx = self.char_index();
-            let char_before = self.rope.char(idx - 1);
-            let char_after = if idx < self.rope.len_chars() {
-                Some(self.rope.char(idx))
-            } else {
-                None
-            };
-
-            let is_pair = match (char_before, char_after) {
-                ('(', Some(')')) => true,
-                ('[', Some(']')) => true,
-                ('{', Some('}')) => true,
-                ('"', Some('"')) => true,
-                ('\'', Some('\'')) => true,
-                _ => false,
-            };
-
-            if is_pair {
-                self.rope.remove(idx - 1..idx + 1);
-            } else {
-                self.rope.remove(idx - 1..idx);
-            }
-
-            self.cursor_x -= 1;
-            self.modified = true;
-            self.on_buffer_modified();
-        } else if self.cursor_y > 0 {
-            let prev_len = line_len(&self.rope, self.cursor_y - 1);
-            let current_line_idx = self.rope.line_to_char(self.cursor_y);
-
-            if current_line_idx > 0 {
-                self.rope.remove(current_line_idx - 1..current_line_idx);
-            }
-
-            self.cursor_y -= 1;
-            self.cursor_x = prev_len;
-            self.modified = true;
-            self.on_buffer_modified();
-        }
-        self.completion_visible = false;
-    }
-
-    pub fn update_completion_scroll(&mut self, max_visible: usize) {
-        if self.completion_idx < self.completion_scroll {
-            self.completion_scroll = self.completion_idx;
-        } else if self.completion_idx >= self.completion_scroll + max_visible {
-            self.completion_scroll = self.completion_idx + 1 - max_visible;
-        }
-    }
-
-    pub fn accept_completion(&mut self) {
-        if !self.completion_visible || self.completions.is_empty() {
-            return;
-        }
-
-        let item = &self.completions[self.completion_idx];
-        let replacement = item.insert_text.clone();
-        let prefix = self.current_word_prefix();
-        let prefix_len = prefix.chars().count();
-
-        let idx = self.char_index();
-        let start = idx.saturating_sub(prefix_len);
-
-        self.rope.remove(start..idx);
-        self.rope.insert(start, &replacement);
-
-        self.cursor_x = self.cursor_x - prefix_len + replacement.chars().count();
-        self.modified = true;
-        self.completion_visible = false;
-        self.on_buffer_modified();
-    }
-
-    pub fn delete_under_cursor(&mut self) {
-        let line_len = self.current_line_len();
-        if self.cursor_x < line_len {
-            self.snapshot();
-            let idx = self.char_index();
-            self.rope.remove(idx..idx + 1);
-            self.modified = true;
-            self.on_buffer_modified();
-        }
-    }
-
-    pub fn delete_current_line(&mut self) {
-        if self.rope.len_lines() == 0 {
-            return;
-        }
-        self.snapshot();
-        let start = self.rope.line_to_char(self.cursor_y);
-        let end = if self.cursor_y + 1 < self.rope.len_lines() {
-            self.rope.line_to_char(self.cursor_y + 1)
-        } else {
-            self.rope.len_chars()
-        };
-
-        if start < end {
-            self.rope.remove(start..end);
-            self.modified = true;
-            self.on_buffer_modified();
-        }
-
-        if self.cursor_y >= self.rope.len_lines() && self.cursor_y > 0 {
-            self.cursor_y -= 1;
-        }
-        self.clamp_cursor();
-    }
-
-    pub fn save(&mut self) -> Result<()> {
-        if let Some(path) = &self.path {
-            let file = File::create(path)?;
-            let mut writer = BufWriter::new(file);
-            for chunk in self.rope.chunks() {
-                writer.write_all(chunk.as_bytes())?;
-            }
-            writer.flush()?;
-            self.modified = false;
-            self.status_msg = format!("Saved {}", path.display());
-
-            if let Some(tx) = &self.lsp_tx {
-                let _ = tx.send(LspInbound::Save);
-            }
-        } else {
-            self.status_msg = "No file name (use :w <name>)".to_string();
-        }
-        Ok(())
-    }
-
-    pub fn execute_command(&mut self) {
-        let cmd = self.command_buffer.trim().to_string();
-        self.command_buffer.clear();
-
-        if cmd == "q" {
-            if self.modified {
-                self.status_msg = "Unsaved changes! Use :q! to force quit".to_string();
-            } else {
-                self.should_quit = true;
-            }
-        } else if cmd == "q!" {
-            self.should_quit = true;
-        } else if cmd == "w" {
-            let _ = self.save();
-        } else if cmd == "wq" {
-            if self.save().is_ok() {
-                self.should_quit = true;
-            }
-        } else if !cmd.is_empty() {
-            self.status_msg = format!("Unknown command: :{}", cmd);
-        }
-    }
-
-    pub fn clamp_cursor(&mut self) {
-        let max_lines = self.rope.len_lines().max(1);
-        if self.cursor_y >= max_lines {
-            self.cursor_y = max_lines - 1;
-        }
-
-        let line_len = self.current_line_len();
-        let max_x = match self.mode {
-            Mode::Insert => line_len,
-            Mode::Normal | Mode::Command => line_len.saturating_sub(1),
-        };
-
-        if self.cursor_x > max_x {
-            self.cursor_x = max_x;
-        }
-    }
-
-    pub fn update_scroll(&mut self, width: usize, height: usize) {
-        if self.cursor_y < self.scroll_y {
-            self.scroll_y = self.cursor_y;
-        } else if self.cursor_y >= self.scroll_y + height {
-            self.scroll_y = self.cursor_y - height + 1;
-        }
-
-        if self.cursor_x < self.scroll_x {
-            self.scroll_x = self.cursor_x;
-        } else if self.cursor_x >= self.scroll_x + width {
-            self.scroll_x = self.cursor_x - width + 1;
-        }
-    }
-}
-
-fn line_len(rope: &Rope, line_idx: usize) -> usize {
-    if line_idx >= rope.len_lines() {
-        return 0;
-    }
-    let line = rope.line(line_idx);
-    let mut len = line.len_chars();
-    if len > 0 && line.char(len - 1) == '\n' {
-        len -= 1;
-        if len > 0 && line.char(len - 1) == '\r' {
-            len -= 1;
-        }
-    }
-    len
-}
-
-fn file_icon_and_color(path: Option<&PathBuf>) -> (&'static str, Color) {
-    let ext = path
-        .and_then(|p| p.extension())
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
-
-    match ext {
-        "rs" => ("", Color::Rgb(235, 102, 60)),
-        "py" => ("", Color::Rgb(255, 212, 59)),
-        "md" => ("", Color::Rgb(120, 180, 255)),
-        _ => ("󰈔", Color::Rgb(160, 165, 175)),
-    }
-}
-
-fn completion_kind_icon(kind: u64) -> (&'static str, Color) {
-    match kind {
-        2 | 3 => ("󰊕", Color::Rgb(80, 200, 240)),  // Method / Function
-        4 => ("󰌗", Color::Rgb(240, 180, 70)),       // Constructor
-        5 | 6 => ("󰫧", Color::Rgb(250, 210, 90)),   // Field / Variable
-        7 | 8 => ("󱡠", Color::Rgb(120, 160, 255)),  // Class / Struct / Interface
-        9 => ("󰏗", Color::Rgb(140, 220, 120)),      // Module
-        14 => ("󰌆", Color::Rgb(220, 110, 240)),     // Keyword
-        _ => ("󰈚", Color::Rgb(170, 175, 190)),       // Text / Other
-    }
-}
 
 fn set_terminal_cursor_style(mode: Mode) {
     let mut stdout = stdout();
     match mode {
-        Mode::Normal | Mode::Command => {
-            let _ = stdout.write_all(b"\x1b[2 q");
+        Mode::Normal | Mode::Command | Mode::Visual { .. } => {
+            let _ = stdout.write_all(b"\x1b[2 q"); // Block
         }
         Mode::Insert => {
-            let _ = stdout.write_all(b"\x1b[6 q");
+            let _ = stdout.write_all(b"\x1b[6 q"); // Thin Bar
         }
     }
     let _ = stdout.flush();
@@ -1093,7 +120,6 @@ async fn main() -> Result<()> {
                             })
                             .collect();
 
-                        // Intelligent ranking: exact -> prefix -> substring
                         filtered.sort_by(|a, b| {
                             let a_lbl = &a.label;
                             let b_lbl = &b.label;
@@ -1156,14 +182,124 @@ async fn main() -> Result<()> {
 // -----------------------------------------------------------------------------
 
 fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
-    let gutter_digits = editor.rope.len_lines().max(1).to_string().len().max(2);
-    let gutter_width = gutter_digits + 4;
-
+    let status_row = size.height.saturating_sub(2);
+    let cmd_row = size.height.saturating_sub(1);
     let viewport_top = 1u16;
     let viewport_bottom = size.height.saturating_sub(3);
-    let content_left = 1u16 + gutter_width as u16;
 
-    // Handle mouse events on the open completion popup
+    // 1. Command Palette Touch Events
+    if editor.palette.visible {
+        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+            let width = 50u16.min(size.width.saturating_sub(4));
+            let height = 14u16.min(size.height.saturating_sub(4));
+            let x = (size.width.saturating_sub(width)) / 2;
+            let y = 2u16;
+
+            if mouse.column >= x && mouse.column < x + width && mouse.row >= y + 3 && mouse.row < y + height - 1 {
+                let clicked_row = (mouse.row - (y + 3)) as usize;
+                let cmds = editor.palette.filtered_commands();
+                let actual_idx = editor.palette.scroll + clicked_row;
+                if actual_idx < cmds.len() {
+                    let cmd_id = cmds[actual_idx].id;
+                    editor.execute_palette_command(cmd_id);
+                    return;
+                }
+            } else if mouse.column < x || mouse.column >= x + width || mouse.row < y || mouse.row >= y + height {
+                editor.palette.visible = false;
+                return;
+            }
+        }
+        return;
+    }
+
+    // 2. Statusline Taps (Strict Non-Overlapping Hitboxes)
+    if mouse.row == status_row {
+        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+            if mouse.column <= 10 {
+                editor.mode = match editor.mode {
+                    Mode::Normal => Mode::Insert,
+                    Mode::Insert => Mode::Normal,
+                    Mode::Command | Mode::Visual { .. } => Mode::Normal,
+                };
+                set_terminal_cursor_style(editor.mode);
+                editor.completion_visible = false;
+            } else if mouse.column <= 21 {
+                // Sidebar Toggle
+                editor.explorer.visible = !editor.explorer.visible;
+                if editor.explorer.visible {
+                    editor.explorer.refresh();
+                    editor.focus = Focus::Explorer;
+                } else {
+                    editor.focus = Focus::Editor;
+                }
+            } else if mouse.column <= 33 {
+                // Line Wrap Toggle
+                editor.line_wrap = !editor.line_wrap;
+                editor.status_msg = format!("Line Wrap: {}", if editor.line_wrap { "ON" } else { "OFF" });
+            } else if mouse.column <= 44 {
+                // Command Palette
+                editor.palette.visible = true;
+                editor.palette.query.clear();
+                editor.palette.selected_idx = 0;
+            }
+        }
+        return;
+    }
+
+    if mouse.row == cmd_row {
+        return;
+    }
+
+    let explorer_width = if editor.explorer.visible {
+        if size.width < 70 {
+            (size.width * 7 / 10).max(26).min(size.width)
+        } else {
+            26u16
+        }
+    } else {
+        0u16
+    };
+
+    // 3. File Explorer Sidebar Interactions
+    if editor.explorer.visible && mouse.column < explorer_width {
+        let max_visible = viewport_bottom.saturating_sub(viewport_top) as usize;
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if mouse.row >= viewport_top && mouse.row < viewport_bottom {
+                    let clicked_idx = editor.explorer.scroll + (mouse.row - viewport_top) as usize;
+                    if clicked_idx < editor.explorer.entries.len() {
+                        editor.explorer.selected_idx = clicked_idx;
+                        if editor.explorer.entries[clicked_idx].is_dir {
+                            editor.explorer.toggle_expand(clicked_idx);
+                        } else {
+                            let path = editor.explorer.entries[clicked_idx].path.clone();
+                            let _ = editor.open_file(path);
+                            editor.focus = Focus::Editor;
+                            if size.width < 70 {
+                                editor.explorer.visible = false;
+                            }
+                        }
+                    }
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if editor.explorer.selected_idx + 1 < editor.explorer.entries.len() {
+                    editor.explorer.selected_idx += 1;
+                    editor.explorer.update_scroll(max_visible);
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                if editor.explorer.selected_idx > 0 {
+                    editor.explorer.selected_idx -= 1;
+                    editor.explorer.update_scroll(max_visible);
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    // 4. Completion Dropdown Interactions
     if editor.completion_visible && !editor.completions.is_empty() {
         let max_visible = 6usize;
         match mouse.kind {
@@ -1181,36 +317,17 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
                     return;
                 }
             }
-            MouseEventKind::Down(MouseButton::Left) => {
-                // If user taps on the status mode pill, toggle mode
-                if mouse.row == size.height.saturating_sub(2) && mouse.column <= 12 {
-                    editor.mode = match editor.mode {
-                        Mode::Normal => Mode::Insert,
-                        Mode::Insert => Mode::Normal,
-                        Mode::Command => Mode::Normal,
-                    };
-                    set_terminal_cursor_style(editor.mode);
-                    editor.completion_visible = false;
-                    return;
-                }
-            }
             _ => {}
         }
     }
 
+    // 5. Document Viewport Interactions
+    let gutter_digits = editor.rope.len_lines().max(1).to_string().len().max(2);
+    let gutter_width = gutter_digits + 4;
+    let content_left = explorer_width + 1u16 + gutter_width as u16;
+
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {
-            if mouse.row == size.height.saturating_sub(2) && mouse.column <= 12 {
-                editor.mode = match editor.mode {
-                    Mode::Normal => Mode::Insert,
-                    Mode::Insert => Mode::Normal,
-                    Mode::Command => Mode::Normal,
-                };
-                set_terminal_cursor_style(editor.mode);
-                editor.completion_visible = false;
-                return;
-            }
-
             if mouse.row >= viewport_top && mouse.row < viewport_bottom {
                 let target_line = editor.scroll_y + (mouse.row - viewport_top) as usize;
                 if target_line < editor.rope.len_lines() {
@@ -1222,6 +339,11 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
                     }
                     editor.clamp_cursor();
                     editor.completion_visible = false;
+                    editor.focus = Focus::Editor;
+
+                    if size.width < 70 && editor.explorer.visible {
+                        editor.explorer.visible = false;
+                    }
                 }
             }
         }
@@ -1249,6 +371,92 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
     let prev_mode = editor.mode;
     let max_visible = 6usize;
 
+    // Intercept Command Palette Events
+    if editor.palette.visible {
+        let cmds = editor.palette.filtered_commands();
+        match key.code {
+            KeyCode::Esc => {
+                editor.palette.visible = false;
+            }
+            KeyCode::Down => {
+                if !cmds.is_empty() {
+                    editor.palette.selected_idx = (editor.palette.selected_idx + 1) % cmds.len();
+                }
+            }
+            KeyCode::Up => {
+                if !cmds.is_empty() {
+                    editor.palette.selected_idx = if editor.palette.selected_idx == 0 {
+                        cmds.len() - 1
+                    } else {
+                        editor.palette.selected_idx - 1
+                    };
+                }
+            }
+            KeyCode::Enter => {
+                if !cmds.is_empty() && editor.palette.selected_idx < cmds.len() {
+                    let cmd_id = cmds[editor.palette.selected_idx].id;
+                    editor.execute_palette_command(cmd_id);
+                }
+            }
+            KeyCode::Backspace => {
+                editor.palette.query.pop();
+                editor.palette.selected_idx = 0;
+            }
+            KeyCode::Char(c) => {
+                editor.palette.query.push(c);
+                editor.palette.selected_idx = 0;
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    // Toggle File Explorer: Ctrl-E
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('e') {
+        editor.explorer.visible = !editor.explorer.visible;
+        if editor.explorer.visible {
+            editor.explorer.refresh();
+            editor.focus = Focus::Explorer;
+        } else {
+            editor.focus = Focus::Editor;
+        }
+        return;
+    }
+
+    // Explorer navigation when active
+    if editor.focus == Focus::Explorer && editor.explorer.visible {
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                if editor.explorer.selected_idx + 1 < editor.explorer.entries.len() {
+                    editor.explorer.selected_idx += 1;
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if editor.explorer.selected_idx > 0 {
+                    editor.explorer.selected_idx -= 1;
+                }
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                let idx = editor.explorer.selected_idx;
+                if idx < editor.explorer.entries.len() {
+                    if editor.explorer.entries[idx].is_dir {
+                        editor.explorer.toggle_expand(idx);
+                    } else {
+                        let path = editor.explorer.entries[idx].path.clone();
+                        let _ = editor.open_file(path);
+                        editor.focus = Focus::Editor;
+                    }
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('q') => {
+                editor.focus = Focus::Editor;
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    // Editor Buffer Handling
     match editor.mode {
         Mode::Normal => {
             editor.completion_visible = false;
@@ -1259,6 +467,12 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                         editor.cursor_y = 0;
                         editor.cursor_x = 0;
                     }
+                    ('g', KeyCode::Char('h')) => editor.cursor_x = 0,
+                    ('g', KeyCode::Char('l')) => editor.cursor_x = editor.current_line_len().saturating_sub(1),
+                    ('g', KeyCode::Char('e')) => {
+                        editor.cursor_y = editor.rope.len_lines().saturating_sub(1);
+                        editor.cursor_x = 0;
+                    }
                     _ => {}
                 }
                 editor.clamp_cursor();
@@ -1266,8 +480,32 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
             }
 
             match key.code {
+                KeyCode::Char(' ') => {
+                    // Helix Space Menu -> Command Palette
+                    editor.palette.visible = true;
+                    editor.palette.query.clear();
+                    editor.palette.selected_idx = 0;
+                }
+                KeyCode::Char('v') => {
+                    editor.mode = Mode::Visual {
+                        anchor_x: editor.cursor_x,
+                        anchor_y: editor.cursor_y,
+                    };
+                }
+                KeyCode::Char('%') => editor.select_all(),
+                KeyCode::Char('y') => editor.yank_selection(),
+                KeyCode::Char('p') => editor.paste(),
+                KeyCode::Char('~') => editor.toggle_case(),
+                KeyCode::Char('J') => editor.join_lines(),
+                KeyCode::Char('o') => editor.insert_line_below(),
+                KeyCode::Char('O') => editor.insert_line_above(),
                 KeyCode::Char('i') => {
                     editor.snapshot();
+                    editor.mode = Mode::Insert;
+                }
+                KeyCode::Char('I') => {
+                    editor.snapshot();
+                    editor.cursor_x = 0;
                     editor.mode = Mode::Insert;
                 }
                 KeyCode::Char('a') => {
@@ -1278,10 +516,9 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                     }
                     editor.mode = Mode::Insert;
                 }
-                KeyCode::Char('o') => {
+                KeyCode::Char('A') => {
                     editor.snapshot();
                     editor.cursor_x = editor.current_line_len();
-                    editor.insert_newline();
                     editor.mode = Mode::Insert;
                 }
                 KeyCode::Char('u') => editor.undo(),
@@ -1295,6 +532,8 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                     editor.mode = Mode::Command;
                     editor.command_buffer.clear();
                 }
+                KeyCode::Char('0') => editor.cursor_x = 0,
+                KeyCode::Char('$') => editor.cursor_x = editor.current_line_len().saturating_sub(1),
                 KeyCode::Char('h') | KeyCode::Left => {
                     editor.cursor_x = editor.cursor_x.saturating_sub(1);
                 }
@@ -1313,6 +552,47 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                     }
                 }
                 KeyCode::Char('x') => editor.delete_under_cursor(),
+                _ => {}
+            }
+        }
+        Mode::Visual { .. } => {
+            match key.code {
+                KeyCode::Esc => {
+                    editor.mode = Mode::Normal;
+                }
+                KeyCode::Char('d') | KeyCode::Char('x') => {
+                    editor.delete_selection();
+                }
+                KeyCode::Char('c') => {
+                    editor.delete_selection();
+                    editor.mode = Mode::Insert;
+                }
+                KeyCode::Char('y') => {
+                    editor.yank_selection();
+                }
+                KeyCode::Char('~') => {
+                    editor.toggle_case();
+                }
+                KeyCode::Char('%') => {
+                    editor.select_all();
+                }
+                KeyCode::Char('h') | KeyCode::Left => {
+                    editor.cursor_x = editor.cursor_x.saturating_sub(1);
+                }
+                KeyCode::Char('l') | KeyCode::Right => {
+                    let max = editor.current_line_len().saturating_sub(1);
+                    if editor.cursor_x < max {
+                        editor.cursor_x += 1;
+                    }
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    editor.cursor_y = editor.cursor_y.saturating_sub(1);
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if editor.cursor_y + 1 < editor.rope.len_lines() {
+                        editor.cursor_y += 1;
+                    }
+                }
                 _ => {}
             }
         }
@@ -1468,7 +748,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
 }
 
 // -----------------------------------------------------------------------------
-// Viewport & UI Render Pipeline
+// UI Render Pipeline
 // -----------------------------------------------------------------------------
 
 fn render_ui(frame: &mut Frame, editor: &mut Editor) {
@@ -1483,6 +763,88 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         ])
         .split(size);
 
+    let (explorer_area, editor_area) = if editor.explorer.visible {
+        let is_mobile = size.width < 70;
+        let sidebar_width = if is_mobile {
+            (size.width * 7 / 10).max(26).min(size.width)
+        } else {
+            26u16
+        };
+
+        let h_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(sidebar_width),
+                Constraint::Min(10),
+            ])
+            .split(main_chunks[0]);
+
+        (Some(h_chunks[0]), h_chunks[1])
+    } else {
+        (None, main_chunks[0])
+    };
+
+    // 1. Render File Explorer (Sidebar)
+    if let Some(exp_rect) = explorer_area {
+        let is_focused = editor.focus == Focus::Explorer;
+        let border_color = if is_focused {
+            Color::Rgb(80, 140, 255)
+        } else {
+            Color::Rgb(55, 60, 75)
+        };
+
+        let exp_block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(border_color))
+            .title(Line::from(vec![
+                Span::styled(" 󰉓 Files ", Style::default().fg(Color::Rgb(220, 225, 235)).add_modifier(Modifier::BOLD)),
+            ]));
+
+        let inner_exp = exp_block.inner(exp_rect);
+        frame.render_widget(exp_block, exp_rect);
+
+        editor.explorer.update_scroll(inner_exp.height as usize);
+
+        let mut tree_lines = Vec::new();
+        let scroll_start = editor.explorer.scroll;
+        let scroll_end = (scroll_start + inner_exp.height as usize).min(editor.explorer.entries.len());
+
+        for i in scroll_start..scroll_end {
+            let entry = &editor.explorer.entries[i];
+            let is_sel = i == editor.explorer.selected_idx;
+            let indent = "  ".repeat(entry.depth);
+
+            let (icon, icon_color) = if entry.is_dir {
+                if entry.expanded {
+                    (" ", Color::Rgb(240, 200, 90))
+                } else {
+                    (" ", Color::Rgb(220, 180, 70))
+                }
+            } else {
+                file_icon_and_color(Some(&entry.path))
+            };
+
+            let item_style = if is_sel {
+                Style::default()
+                    .bg(Color::Rgb(40, 75, 145))
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Rgb(200, 205, 220))
+            };
+
+            tree_lines.push(Line::from(vec![
+                Span::raw(indent),
+                Span::styled(icon, Style::default().fg(icon_color)),
+                Span::styled(format!(" {}", entry.name), item_style),
+            ]));
+        }
+
+        frame.render_widget(Paragraph::new(tree_lines), inner_exp);
+    }
+
+    // 2. Render Document Editor Viewport
     let (icon, icon_color) = file_icon_and_color(editor.path.as_ref());
     let file_title = editor
         .path
@@ -1502,38 +864,47 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         Span::raw(" "),
     ]);
 
-    let rounded_block = Block::default()
+    let editor_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Rgb(55, 60, 75)))
+        .border_style(Style::default().fg(if editor.focus == Focus::Editor { Color::Rgb(65, 70, 85) } else { Color::Rgb(45, 50, 60) }))
         .title(window_title);
 
-    let inner_area = rounded_block.inner(main_chunks[0]);
-    frame.render_widget(rounded_block, main_chunks[0]);
+    let inner_area = editor_block.inner(editor_area);
+    frame.render_widget(editor_block, editor_area);
 
     let total_lines = editor.rope.len_lines().max(1);
     let line_digits = total_lines.to_string().len().max(2);
     let gutter_width = line_digits + 4;
-    let text_area_width = (inner_area.width as usize).saturating_sub(gutter_width);
+    let text_area_width = (inner_area.width as usize).saturating_sub(gutter_width).max(1);
 
     editor.update_scroll(text_area_width, inner_area.height as usize);
 
+    // Build visible lines: Decompose into syntax-styled characters
     let mut visible_lines = Vec::new();
+    let mut cursor_screen_pos: Option<(u16, u16)> = None;
+
     let start_line = editor.scroll_y;
     let end_line = (start_line + inner_area.height as usize).min(editor.rope.len_lines());
 
+    let mut current_row = 0u16;
+
     for y in start_line..end_line {
-        let is_current = y == editor.cursor_y;
+        if (current_row as usize) >= inner_area.height as usize {
+            break;
+        }
+
+        let is_cursor_line = y == editor.cursor_y;
 
         let line_diag = editor.diagnostics.iter().find(|d| d.line == y);
         let (diag_marker, diag_style) = match line_diag.map(|d| d.severity) {
             Some(1) => ("", Style::default().fg(Color::Rgb(240, 90, 90))),
-            Some(2) => ("", Style::default().fg(Color::Rgb(240, 180, 70))),
+            Some(2) => ("", Style::default().fg(Color::Rgb(245, 185, 60))),
             Some(_) => ("󰌵", Style::default().fg(Color::Rgb(100, 180, 255))),
             None => (" ", Style::default()),
         };
 
-        let gutter_style = if is_current {
+        let gutter_style = if is_cursor_line {
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::Rgb(80, 85, 100))
@@ -1548,18 +919,100 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             }
         }
 
-        let scrolled_line: String = line_str.chars().skip(editor.scroll_x).collect();
+        // Tokenize through SyntaxEngine
+        let syntax_spans = editor.syntax.highlight_line(&line_str, y);
+        let mut char_styles: Vec<(char, Style)> = Vec::with_capacity(line_str.len());
+        for span in syntax_spans {
+            let st = span.style;
+            for ch in span.content.chars() {
+                char_styles.push((ch, st));
+            }
+        }
 
-        let mut spans = vec![
-            Span::styled(diag_marker, diag_style),
-            Span::styled(format!("{:>width$} │ ", y + 1, width = line_digits), gutter_style),
-        ];
-        spans.extend(editor.syntax.highlight_line(&scrolled_line, y));
+        if editor.line_wrap && char_styles.len() > text_area_width {
+            let total_chars = char_styles.len();
+            let mut chunk_start = 0;
+            let mut is_first_sub = true;
 
-        visible_lines.push(Line::from(spans));
+            while chunk_start < total_chars && (current_row as usize) < inner_area.height as usize {
+                let chunk_end = (chunk_start + text_area_width).min(total_chars);
+                let (marker, gutter_str, g_style) = if is_first_sub {
+                    (diag_marker, format!("{:>width$} │ ", y + 1, width = line_digits), gutter_style)
+                } else {
+                    (" ", format!("{:>width$} ↳ ", "", width = line_digits), Style::default().fg(Color::Rgb(65, 70, 85)))
+                };
+
+                let mut sub_spans = vec![
+                    Span::styled(marker, if is_first_sub { diag_style } else { Style::default() }),
+                    Span::styled(gutter_str, g_style),
+                ];
+
+                for col_idx in chunk_start..chunk_end {
+                    let (ch, mut st) = char_styles[col_idx];
+                    if editor.is_char_selected(y, col_idx) {
+                        st = st.bg(Color::Rgb(55, 80, 145)).fg(Color::White);
+                    }
+                    sub_spans.push(Span::styled(ch.to_string(), st));
+                }
+
+                let is_last_chunk = chunk_end == total_chars;
+                let in_chunk = if is_last_chunk {
+                    editor.cursor_x >= chunk_start && editor.cursor_x <= chunk_end
+                } else {
+                    editor.cursor_x >= chunk_start && editor.cursor_x < chunk_end
+                };
+
+                if is_cursor_line && in_chunk && cursor_screen_pos.is_none() {
+                    let cx = inner_area.x + gutter_width as u16 + (editor.cursor_x - chunk_start) as u16;
+                    let cy = inner_area.y + current_row;
+                    cursor_screen_pos = Some((cx, cy));
+                }
+
+                visible_lines.push(Line::from(sub_spans));
+                current_row += 1;
+                chunk_start = chunk_end;
+                is_first_sub = false;
+            }
+        } else {
+            let (marker, gutter_str, g_style) = (diag_marker, format!("{:>width$} │ ", y + 1, width = line_digits), gutter_style);
+            let mut row_spans = vec![
+                Span::styled(marker, diag_style),
+                Span::styled(gutter_str, g_style),
+            ];
+
+            if char_styles.is_empty() {
+                if is_cursor_line && cursor_screen_pos.is_none() {
+                    let cx = inner_area.x + gutter_width as u16;
+                    let cy = inner_area.y + current_row;
+                    cursor_screen_pos = Some((cx, cy));
+                }
+            } else {
+                let skip_count = if editor.line_wrap { 0 } else { editor.scroll_x };
+                let take_count = text_area_width;
+
+                for (col_idx, (ch, mut st)) in char_styles.into_iter().enumerate().skip(skip_count).take(take_count) {
+                    if editor.is_char_selected(y, col_idx) {
+                        st = st.bg(Color::Rgb(55, 80, 145)).fg(Color::White);
+                    }
+                    row_spans.push(Span::styled(ch.to_string(), st));
+                }
+
+                if is_cursor_line && cursor_screen_pos.is_none() {
+                    let visible_x = editor.cursor_x.saturating_sub(skip_count);
+                    if visible_x < text_area_width {
+                        let cx = inner_area.x + gutter_width as u16 + visible_x as u16;
+                        let cy = inner_area.y + current_row;
+                        cursor_screen_pos = Some((cx, cy));
+                    }
+                }
+            }
+
+            visible_lines.push(Line::from(row_spans));
+            current_row += 1;
+        }
     }
 
-    for _ in visible_lines.len()..inner_area.height as usize {
+    for _ in (current_row as usize)..inner_area.height as usize {
         visible_lines.push(Line::from(vec![
             Span::raw(" "),
             Span::styled(
@@ -1571,11 +1024,12 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
     frame.render_widget(Paragraph::new(visible_lines), inner_area);
 
-    // Powerline Statusline
+    // 3. Render Statusline
     let (badge_text, badge_color) = match editor.mode {
         Mode::Normal => (" NORMAL ", Color::Rgb(80, 140, 255)),
         Mode::Insert => (" INSERT ", Color::Rgb(70, 200, 120)),
         Mode::Command => (" COMMAND ", Color::Rgb(220, 100, 240)),
+        Mode::Visual { .. } => (" VISUAL ", Color::Rgb(240, 160, 60)),
     };
 
     let bar_bg = Color::Rgb(20, 22, 28);
@@ -1585,6 +1039,9 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
     let error_count = editor.diagnostics.iter().filter(|d| d.severity == 1).count();
     let warn_count = editor.diagnostics.iter().filter(|d| d.severity == 2).count();
 
+    let sidebar_toggle_badge = if editor.explorer.visible { " 󰉓 Files " } else { " 󰉒 Files " };
+    let wrap_badge = if editor.line_wrap { " 󰖶 Wrap " } else { " 󰖵 NoWrap " };
+
     let status_left = Line::from(vec![
         Span::styled(
             badge_text,
@@ -1592,42 +1049,35 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         ),
         Span::styled("", Style::default().bg(pill_bg).fg(badge_color)),
         Span::styled(
-            format!("  {} ", match editor.syntax.language {
-                SupportedLanguage::Rust => "Rust",
-                SupportedLanguage::Python => "Python",
-                SupportedLanguage::Markdown => "Markdown",
-                SupportedLanguage::Plain => "Text",
-            }),
-            Style::default().bg(pill_bg).fg(bar_fg),
+            sidebar_toggle_badge,
+            Style::default().bg(pill_bg).fg(if editor.explorer.visible { Color::Rgb(100, 180, 255) } else { bar_fg }),
+        ),
+        Span::styled(
+            wrap_badge,
+            Style::default().bg(pill_bg).fg(if editor.line_wrap { Color::Rgb(100, 200, 140) } else { Color::Rgb(140, 145, 160) }),
+        ),
+        Span::styled(
+            " 󰍉 Cmd ",
+            Style::default().bg(pill_bg).fg(Color::Rgb(240, 180, 80)),
         ),
         Span::styled("", Style::default().bg(bar_bg).fg(pill_bg)),
     ]);
 
-    let lsp_badge = match &editor.lsp_status {
-        LspStatus::Ready(name) => {
-            if error_count > 0 || warn_count > 0 {
-                Span::styled(
-                    format!("  {}  {} ", error_count, warn_count),
-                    Style::default().bg(bar_bg).fg(Color::Rgb(240, 90, 90)),
-                )
-            } else {
-                Span::styled(format!(" 󰄬 {} ", name), Style::default().bg(bar_bg).fg(Color::Rgb(100, 180, 120)))
-            }
+    let mut diag_indicators = Vec::new();
+    if error_count > 0 {
+        diag_indicators.push(Span::styled(format!("  {} ", error_count), Style::default().bg(bar_bg).fg(Color::Rgb(240, 90, 90))));
+    }
+    if warn_count > 0 {
+        diag_indicators.push(Span::styled(format!(" {} ", warn_count), Style::default().bg(bar_bg).fg(Color::Rgb(245, 185, 60))));
+    }
+    if error_count == 0 && warn_count == 0 {
+        if let LspStatus::Ready(name) = &editor.lsp_status {
+            diag_indicators.push(Span::styled(format!(" 󰄬 {} ", name), Style::default().bg(bar_bg).fg(Color::Rgb(100, 180, 120))));
         }
-        LspStatus::Starting(name) => Span::styled(
-            format!(" 󰑮 {} init... ", name),
-            Style::default().bg(bar_bg).fg(Color::Rgb(100, 180, 240)),
-        ),
-        LspStatus::NotFound(name) => Span::styled(
-            format!(" 󰅚 {} not found ", name),
-            Style::default().bg(bar_bg).fg(Color::Rgb(240, 140, 60)),
-        ),
-        LspStatus::Error(_) => Span::styled(" 󰅚 LSP err ", Style::default().bg(bar_bg).fg(Color::Rgb(240, 90, 90))),
-        LspStatus::Disabled => Span::styled(" 󰌵 plain ", Style::default().bg(bar_bg).fg(Color::Rgb(100, 105, 120))),
-    };
+    }
 
-    let status_right = Line::from(vec![
-        lsp_badge,
+    let mut status_right_spans = diag_indicators;
+    status_right_spans.extend(vec![
         Span::styled("", Style::default().bg(bar_bg).fg(pill_bg)),
         Span::styled(
             format!("  {}L ", total_lines),
@@ -1643,11 +1093,11 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
     frame.render_widget(Block::default().style(Style::default().bg(bar_bg)), main_chunks[1]);
     frame.render_widget(Paragraph::new(status_left), main_chunks[1]);
     frame.render_widget(
-        Paragraph::new(status_right).alignment(ratatui::layout::Alignment::Right),
+        Paragraph::new(Line::from(status_right_spans)).alignment(ratatui::layout::Alignment::Right),
         main_chunks[1],
     );
 
-    // Diagnostics / Bottom Command Area
+    // 4. Notification / Command Bar
     if editor.mode == Mode::Command {
         let prompt_line = Line::from(vec![
             Span::styled(" :", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
@@ -1661,8 +1111,13 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
     } else {
         let active_diag = editor.diagnostics.iter().find(|d| d.line == editor.cursor_y);
         let msg_line = if let Some(diag) = active_diag {
+            let (d_icon, icon_style) = match diag.severity {
+                1 => ("  ", Style::default().fg(Color::Rgb(240, 90, 90))),
+                2 => ("  ", Style::default().fg(Color::Rgb(245, 185, 60))),
+                _ => (" 󰌵 ", Style::default().fg(Color::Rgb(100, 180, 255))),
+            };
             Line::from(vec![
-                Span::styled("  ", Style::default().fg(Color::Rgb(240, 90, 90))),
+                Span::styled(d_icon, icon_style),
                 Span::styled(&diag.message, Style::default().fg(Color::Rgb(230, 235, 245)).add_modifier(Modifier::ITALIC)),
             ])
         } else {
@@ -1674,79 +1129,85 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
         frame.render_widget(Paragraph::new(msg_line), main_chunks[2]);
 
-        let screen_x = inner_area.x + gutter_width as u16 + (editor.cursor_x.saturating_sub(editor.scroll_x)) as u16;
-        let screen_y = inner_area.y + (editor.cursor_y.saturating_sub(editor.scroll_y)) as u16;
-
-        // Floating Auto-Complete Popup with Windowed Scroll Viewport
-        if editor.mode == Mode::Insert && editor.completion_visible && !editor.completions.is_empty() {
-            let max_visible_items = 6usize;
-            let total_items = editor.completions.len();
-            let count = total_items.min(max_visible_items);
-            let popup_height = (count as u16) + 2;
-            let popup_width = 38u16.min(frame.area().width.saturating_sub(screen_x).max(22));
-
-            let mut popup_x = screen_x;
-            if popup_x + popup_width > frame.area().width {
-                popup_x = frame.area().width.saturating_sub(popup_width);
+        if editor.focus == Focus::Editor {
+            if let Some((cx, cy)) = cursor_screen_pos {
+                if cx < inner_area.right() && cy < inner_area.bottom() {
+                    frame.set_cursor_position(Position::new(cx, cy));
+                }
             }
+        }
+    }
 
-            let popup_y = if screen_y + 1 + popup_height < frame.area().bottom() {
-                screen_y + 1
+    // 5. Render Command Palette Modal (Helix Space-Menu)
+    if editor.palette.visible {
+        let width = 50u16.min(size.width.saturating_sub(4));
+        let height = 14u16.min(size.height.saturating_sub(4));
+        let x = (size.width.saturating_sub(width)) / 2;
+        let y = 2u16;
+
+        let palette_rect = Rect::new(x, y, width, height);
+        frame.render_widget(Clear, palette_rect);
+
+        let filtered = editor.palette.filtered_commands();
+        let max_visible = (height.saturating_sub(4)) as usize;
+
+        if editor.palette.selected_idx < editor.palette.scroll {
+            editor.palette.scroll = editor.palette.selected_idx;
+        } else if editor.palette.selected_idx >= editor.palette.scroll + max_visible {
+            editor.palette.scroll = editor.palette.selected_idx + 1 - max_visible;
+        }
+
+        let mut palette_lines = Vec::new();
+        palette_lines.push(Line::from(vec![
+            Span::styled(" 󰍉 > ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(&editor.palette.query, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled("█", Style::default().fg(Color::Rgb(100, 180, 255))),
+        ]));
+        palette_lines.push(Line::from(Span::styled(
+            "─".repeat((width as usize).saturating_sub(2)),
+            Style::default().fg(Color::Rgb(60, 65, 80)),
+        )));
+
+        let scroll_start = editor.palette.scroll;
+        let scroll_end = (scroll_start + max_visible).min(filtered.len());
+
+        for i in scroll_start..scroll_end {
+            let cmd = filtered[i];
+            let is_sel = i == editor.palette.selected_idx;
+
+            let row_bg = if is_sel { Color::Rgb(40, 75, 145) } else { Color::Rgb(25, 27, 34) };
+            let title_style = if is_sel {
+                Style::default().bg(row_bg).fg(Color::White).add_modifier(Modifier::BOLD)
             } else {
-                screen_y.saturating_sub(popup_height)
+                Style::default().bg(row_bg).fg(Color::Rgb(215, 220, 230))
             };
 
-            let popup_rect = Rect::new(popup_x, popup_y, popup_width, popup_height);
-            frame.render_widget(Clear, popup_rect);
+            let avail_title_width = (width as usize).saturating_sub(cmd.shortcut.len() + 8);
+            let display_title = if cmd.title.len() > avail_title_width {
+                format!("{}…", &cmd.title[..avail_title_width.saturating_sub(1)])
+            } else {
+                cmd.title.to_string()
+            };
 
-            let scroll_start = editor.completion_scroll;
-            let scroll_end = (scroll_start + max_visible_items).min(total_items);
+            let padding = avail_title_width.saturating_sub(display_title.chars().count());
 
-            let mut list_lines = Vec::new();
-            for i in scroll_start..scroll_end {
-                let item = &editor.completions[i];
-                let is_sel = i == editor.completion_idx;
-
-                let (kind_icon, kind_color) = completion_kind_icon(item.kind);
-
-                let item_bg = if is_sel { Color::Rgb(40, 75, 145) } else { Color::Rgb(25, 27, 34) };
-                let text_style = if is_sel {
-                    Style::default().bg(item_bg).fg(Color::White).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().bg(item_bg).fg(Color::Rgb(215, 220, 230))
-                };
-
-                let avail_width = (popup_width as usize).saturating_sub(6);
-                let label_text = if item.label.len() > avail_width {
-                    format!("{}…", &item.label[..avail_width.saturating_sub(1)])
-                } else {
-                    item.label.clone()
-                };
-
-                let padding = avail_width.saturating_sub(label_text.chars().count());
-
-                list_lines.push(Line::from(vec![
-                    Span::styled(" ", Style::default().bg(item_bg)),
-                    Span::styled(kind_icon, Style::default().bg(item_bg).fg(kind_color)),
-                    Span::styled(" ", Style::default().bg(item_bg)),
-                    Span::styled(label_text, text_style),
-                    Span::styled(" ".repeat(padding), Style::default().bg(item_bg)),
-                ]));
-            }
-
-            let title_info = format!(" {}/{} ", editor.completion_idx + 1, total_items);
-            let comp_block = Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::Rgb(80, 140, 255)))
-                .style(Style::default().bg(Color::Rgb(25, 27, 34)))
-                .title(Line::from(Span::styled(title_info, Style::default().fg(Color::Rgb(140, 160, 200)))));
-
-            frame.render_widget(Paragraph::new(list_lines).block(comp_block), popup_rect);
+            palette_lines.push(Line::from(vec![
+                Span::styled(" ", Style::default().bg(row_bg)),
+                Span::styled(cmd.icon, Style::default().bg(row_bg).fg(Color::Rgb(100, 180, 255))),
+                Span::styled(" ", Style::default().bg(row_bg)),
+                Span::styled(display_title, title_style),
+                Span::styled(" ".repeat(padding), Style::default().bg(row_bg)),
+                Span::styled(format!(" {} ", cmd.shortcut), Style::default().bg(row_bg).fg(Color::Rgb(140, 145, 160))),
+            ]));
         }
 
-        if screen_x < inner_area.right() && screen_y < inner_area.bottom() {
-            frame.set_cursor_position(Position::new(screen_x, screen_y));
-        }
+        let p_block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Rgb(80, 140, 255)))
+            .style(Style::default().bg(Color::Rgb(25, 27, 34)))
+            .title(Line::from(Span::styled(" 󰍉 Command Palette (Esc to close) ", Style::default().fg(Color::Rgb(180, 200, 240)).add_modifier(Modifier::BOLD))));
+
+        frame.render_widget(Paragraph::new(palette_lines).block(p_block), palette_rect);
     }
 }
