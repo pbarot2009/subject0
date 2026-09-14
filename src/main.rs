@@ -1,4 +1,5 @@
 use std::{
+    cmp::Ordering,
     env,
     fs::File,
     io::{stdout, BufWriter, Write},
@@ -50,6 +51,7 @@ pub struct SuggestionItem {
     pub label: String,
     pub insert_text: String,
     pub detail: Option<String>,
+    pub kind: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,7 +112,7 @@ async fn read_lsp_message<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> Result<
         line.clear();
         let bytes_read = reader.read_line(&mut line).await?;
         if bytes_read == 0 {
-            return Err(anyhow!("LSP stream terminated"));
+            return Err(anyhow!("LSP stream closed"));
         }
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -180,7 +182,6 @@ async fn run_lsp_actor(
     };
     let file_uri = file_to_uri(&file_path);
 
-    // Initialize Request
     let init_req = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -197,7 +198,8 @@ async fn run_lsp_actor(
                     },
                     "completion": {
                         "completionItem": {
-                            "snippetSupport": false
+                            "snippetSupport": false,
+                            "documentationFormat": ["plaintext"]
                         }
                     },
                     "publishDiagnostics": {
@@ -212,11 +214,10 @@ async fn run_lsp_actor(
     });
 
     if send_lsp_message(&mut stdin, &init_req).await.is_err() {
-        let _ = tx.send(LspOutbound::Status(LspStatus::Error("Init failed".into())));
+        let _ = tx.send(LspOutbound::Status(LspStatus::Error("Init request failed".into())));
         return;
     }
 
-    // Await Initialize Response
     loop {
         match read_lsp_message(&mut stdout).await {
             Ok(msg) => {
@@ -231,7 +232,6 @@ async fn run_lsp_actor(
         }
     }
 
-    // Initialized Notification
     let initialized = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "initialized",
@@ -239,7 +239,6 @@ async fn run_lsp_actor(
     });
     let _ = send_lsp_message(&mut stdin, &initialized).await;
 
-    // Open Document
     let did_open = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "textDocument/didOpen",
@@ -255,7 +254,6 @@ async fn run_lsp_actor(
     let _ = send_lsp_message(&mut stdin, &did_open).await;
     let _ = tx.send(LspOutbound::Status(LspStatus::Ready(server_cmd)));
 
-    // Event Loop
     loop {
         tokio::select! {
             cmd = rx.recv() => {
@@ -297,7 +295,6 @@ async fn run_lsp_actor(
             msg = read_lsp_message(&mut stdout) => {
                 match msg {
                     Ok(json) => {
-                        // Diagnostics
                         if json.get("method").and_then(|m| m.as_str()) == Some("textDocument/publishDiagnostics") {
                             if let Some(params) = json.get("params") {
                                 let mut items = Vec::new();
@@ -313,7 +310,6 @@ async fn run_lsp_actor(
                                 let _ = tx.send(LspOutbound::Diagnostics(items));
                             }
                         } else if let Some(resp_id) = json.get("id").and_then(|id| id.as_i64()) {
-                            // Completion response
                             let mut results = Vec::new();
                             let result_val = json.get("result");
 
@@ -337,11 +333,13 @@ async fn run_lsp_actor(
                                             .get("detail")
                                             .and_then(|d| d.as_str())
                                             .map(|s| s.to_string());
+                                        let kind = item.get("kind").and_then(|k| k.as_u64()).unwrap_or(0);
 
                                         results.push(SuggestionItem {
                                             label: label.to_string(),
                                             insert_text,
                                             detail,
+                                            kind,
                                         });
                                     }
                                 }
@@ -464,7 +462,6 @@ impl SyntaxEngine {
         let len = chars.len();
 
         while idx < len {
-            // Comments
             if (lang == SupportedLanguage::Rust && idx + 1 < len && chars[idx] == '/' && chars[idx + 1] == '/')
                 || (lang == SupportedLanguage::Python && chars[idx] == '#')
             {
@@ -476,7 +473,6 @@ impl SyntaxEngine {
                 break;
             }
 
-            // String literals
             if chars[idx] == '"' || chars[idx] == '\'' {
                 let quote = chars[idx];
                 let mut end = idx + 1;
@@ -497,7 +493,6 @@ impl SyntaxEngine {
                 continue;
             }
 
-            // Numeric literals
             if chars[idx].is_ascii_digit() {
                 let mut end = idx;
                 while end < len && (chars[end].is_ascii_alphanumeric() || chars[end] == '.') {
@@ -509,7 +504,6 @@ impl SyntaxEngine {
                 continue;
             }
 
-            // Identifiers & Keywords
             if chars[idx].is_alphabetic() || chars[idx] == '_' {
                 let mut end = idx;
                 while end < len && (chars[end].is_alphanumeric() || chars[end] == '_') {
@@ -563,7 +557,6 @@ impl SyntaxEngine {
                 continue;
             }
 
-            // Punctuation
             spans.push(Span::styled(
                 chars[idx].to_string(),
                 Style::default().fg(Color::Rgb(140, 150, 170)),
@@ -605,9 +598,11 @@ pub struct Editor {
     pub lsp_tx: Option<mpsc::UnboundedSender<LspInbound>>,
     pub lsp_req_id: i64,
     pub doc_version: i64,
+
     // Completions State
     pub completions: Vec<SuggestionItem>,
     pub completion_idx: usize,
+    pub completion_scroll: usize,
     pub completion_visible: bool,
     pub should_quit: bool,
 }
@@ -648,6 +643,7 @@ impl Editor {
             doc_version: 1,
             completions: Vec::new(),
             completion_idx: 0,
+            completion_scroll: 0,
             completion_visible: false,
             should_quit: false,
         })
@@ -753,9 +749,34 @@ impl Editor {
 
     pub fn insert_newline(&mut self) {
         let idx = self.char_index();
-        self.rope.insert_char(idx, '\n');
-        self.cursor_y += 1;
-        self.cursor_x = 0;
+        let current_line = if self.cursor_y < self.rope.len_lines() {
+            self.rope.line(self.cursor_y).to_string()
+        } else {
+            String::new()
+        };
+
+        let indent: String = current_line
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .collect();
+
+        let char_before = if idx > 0 { Some(self.rope.char(idx - 1)) } else { None };
+        let char_after = if idx < self.rope.len_chars() { Some(self.rope.char(idx)) } else { None };
+
+        // Smart expand: enter between {} creates clean indentation block
+        if char_before == Some('{') && char_after == Some('}') {
+            let inner_indent = format!("{}    ", indent);
+            let to_insert = format!("\n{}\n{}", inner_indent, indent);
+            self.rope.insert(idx, &to_insert);
+            self.cursor_y += 1;
+            self.cursor_x = inner_indent.chars().count();
+        } else {
+            let to_insert = format!("\n{}", indent);
+            self.rope.insert(idx, &to_insert);
+            self.cursor_y += 1;
+            self.cursor_x = indent.chars().count();
+        }
+
         self.modified = true;
         self.completion_visible = false;
         self.on_buffer_modified();
@@ -771,7 +792,6 @@ impl Editor {
                 None
             };
 
-            // Smart pair deletion: removes both matching brackets/quotes
             let is_pair = match (char_before, char_after) {
                 ('(', Some(')')) => true,
                 ('[', Some(']')) => true,
@@ -804,6 +824,14 @@ impl Editor {
             self.on_buffer_modified();
         }
         self.completion_visible = false;
+    }
+
+    pub fn update_completion_scroll(&mut self, max_visible: usize) {
+        if self.completion_idx < self.completion_scroll {
+            self.completion_scroll = self.completion_idx;
+        } else if self.completion_idx >= self.completion_scroll + max_visible {
+            self.completion_scroll = self.completion_idx + 1 - max_visible;
+        }
     }
 
     pub fn accept_completion(&mut self) {
@@ -967,6 +995,18 @@ fn file_icon_and_color(path: Option<&PathBuf>) -> (&'static str, Color) {
     }
 }
 
+fn completion_kind_icon(kind: u64) -> (&'static str, Color) {
+    match kind {
+        2 | 3 => ("󰊕", Color::Rgb(80, 200, 240)),  // Method / Function
+        4 => ("󰌗", Color::Rgb(240, 180, 70)),       // Constructor
+        5 | 6 => ("󰫧", Color::Rgb(250, 210, 90)),   // Field / Variable
+        7 | 8 => ("󱡠", Color::Rgb(120, 160, 255)),  // Class / Struct / Interface
+        9 => ("󰏗", Color::Rgb(140, 220, 120)),      // Module
+        14 => ("󰌆", Color::Rgb(220, 110, 240)),     // Keyword
+        _ => ("󰈚", Color::Rgb(170, 175, 190)),       // Text / Other
+    }
+}
+
 fn set_terminal_cursor_style(mode: Mode) {
     let mut stdout = stdout();
     match mode {
@@ -1042,20 +1082,48 @@ async fn main() -> Result<()> {
                 LspOutbound::Diagnostics(d) => editor.diagnostics = d,
                 LspOutbound::Completions { req_id, items } => {
                     if req_id == editor.lsp_req_id && !items.is_empty() {
-                        let prefix = editor.current_word_prefix().to_lowercase();
-                        let filtered: Vec<SuggestionItem> = items
+                        let prefix = editor.current_word_prefix();
+                        let prefix_lower = prefix.to_lowercase();
+
+                        let mut filtered: Vec<SuggestionItem> = items
                             .into_iter()
                             .filter(|it| {
-                                prefix.is_empty()
-                                    || it.label.to_lowercase().starts_with(&prefix)
-                                    || it.label.to_lowercase().contains(&prefix)
+                                prefix_lower.is_empty()
+                                    || it.label.to_lowercase().contains(&prefix_lower)
                             })
-                            .take(12)
                             .collect();
+
+                        // Intelligent ranking: exact -> prefix -> substring
+                        filtered.sort_by(|a, b| {
+                            let a_lbl = &a.label;
+                            let b_lbl = &b.label;
+                            let a_exact = a_lbl == &prefix;
+                            let b_exact = b_lbl == &prefix;
+                            if a_exact && !b_exact {
+                                return Ordering::Less;
+                            }
+                            if !a_exact && b_exact {
+                                return Ordering::Greater;
+                            }
+
+                            let a_starts = a_lbl.to_lowercase().starts_with(&prefix_lower);
+                            let b_starts = b_lbl.to_lowercase().starts_with(&prefix_lower);
+                            if a_starts && !b_starts {
+                                return Ordering::Less;
+                            }
+                            if !a_starts && b_starts {
+                                return Ordering::Greater;
+                            }
+
+                            a_lbl.len().cmp(&b_lbl.len())
+                        });
+
+                        filtered.truncate(100);
 
                         if !filtered.is_empty() {
                             editor.completions = filtered;
                             editor.completion_idx = 0;
+                            editor.completion_scroll = 0;
                             editor.completion_visible = true;
                         } else {
                             editor.completion_visible = false;
@@ -1094,6 +1162,41 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
     let viewport_top = 1u16;
     let viewport_bottom = size.height.saturating_sub(3);
     let content_left = 1u16 + gutter_width as u16;
+
+    // Handle mouse events on the open completion popup
+    if editor.completion_visible && !editor.completions.is_empty() {
+        let max_visible = 6usize;
+        match mouse.kind {
+            MouseEventKind::ScrollDown => {
+                if editor.completion_idx + 1 < editor.completions.len() {
+                    editor.completion_idx += 1;
+                    editor.update_completion_scroll(max_visible);
+                    return;
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                if editor.completion_idx > 0 {
+                    editor.completion_idx -= 1;
+                    editor.update_completion_scroll(max_visible);
+                    return;
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                // If user taps on the status mode pill, toggle mode
+                if mouse.row == size.height.saturating_sub(2) && mouse.column <= 12 {
+                    editor.mode = match editor.mode {
+                        Mode::Normal => Mode::Insert,
+                        Mode::Insert => Mode::Normal,
+                        Mode::Command => Mode::Normal,
+                    };
+                    set_terminal_cursor_style(editor.mode);
+                    editor.completion_visible = false;
+                    return;
+                }
+            }
+            _ => {}
+        }
+    }
 
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {
@@ -1144,6 +1247,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
 
 fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
     let prev_mode = editor.mode;
+    let max_visible = 6usize;
 
     match editor.mode {
         Mode::Normal => {
@@ -1213,11 +1317,11 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
             }
         }
         Mode::Insert => {
-            // Handle active completion dropdown navigation
-            if editor.completion_visible {
+            if editor.completion_visible && !editor.completions.is_empty() {
                 match key.code {
                     KeyCode::Down => {
                         editor.completion_idx = (editor.completion_idx + 1) % editor.completions.len();
+                        editor.update_completion_scroll(max_visible);
                         return;
                     }
                     KeyCode::Up => {
@@ -1226,6 +1330,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                         } else {
                             editor.completion_idx - 1
                         };
+                        editor.update_completion_scroll(max_visible);
                         return;
                     }
                     KeyCode::Tab | KeyCode::Enter => {
@@ -1252,10 +1357,10 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                 KeyCode::Enter => editor.insert_newline(),
                 KeyCode::Backspace => editor.backspace(),
                 KeyCode::Tab => {
-                    // Trigger completion menu or insert spaces
                     if !editor.completions.is_empty() {
                         editor.completion_visible = true;
                         editor.completion_idx = 0;
+                        editor.completion_scroll = 0;
                     } else {
                         for _ in 0..4 {
                             editor.insert_char(' ');
@@ -1265,7 +1370,6 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                 KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     editor.request_completions();
                 }
-                // Auto-closing brackets and quotes
                 KeyCode::Char('(') => {
                     editor.insert_pair('(', ')');
                     editor.request_completions();
@@ -1292,7 +1396,6 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                         editor.insert_pair('\'', '\'');
                     }
                 }
-                // Skip overtyping existing closing brackets
                 KeyCode::Char(')') if editor.char_under_cursor() == Some(')') => {
                     editor.cursor_x += 1;
                 }
@@ -1544,7 +1647,7 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         main_chunks[1],
     );
 
-    // Diagnostics / Notifications Bar
+    // Diagnostics / Bottom Command Area
     if editor.mode == Mode::Command {
         let prompt_line = Line::from(vec![
             Span::styled(" :", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
@@ -1574,12 +1677,13 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         let screen_x = inner_area.x + gutter_width as u16 + (editor.cursor_x.saturating_sub(editor.scroll_x)) as u16;
         let screen_y = inner_area.y + (editor.cursor_y.saturating_sub(editor.scroll_y)) as u16;
 
-        // Floating Auto-Complete Popup
+        // Floating Auto-Complete Popup with Windowed Scroll Viewport
         if editor.mode == Mode::Insert && editor.completion_visible && !editor.completions.is_empty() {
-            let popup_width = 30u16.min(frame.area().width.saturating_sub(screen_x).max(18));
             let max_visible_items = 6usize;
-            let count = editor.completions.len().min(max_visible_items);
+            let total_items = editor.completions.len();
+            let count = total_items.min(max_visible_items);
             let popup_height = (count as u16) + 2;
+            let popup_width = 38u16.min(frame.area().width.saturating_sub(screen_x).max(22));
 
             let mut popup_x = screen_x;
             if popup_x + popup_width > frame.area().width {
@@ -1593,42 +1697,50 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             };
 
             let popup_rect = Rect::new(popup_x, popup_y, popup_width, popup_height);
-
-            // Wipe area behind popup
             frame.render_widget(Clear, popup_rect);
 
+            let scroll_start = editor.completion_scroll;
+            let scroll_end = (scroll_start + max_visible_items).min(total_items);
+
             let mut list_lines = Vec::new();
-            for (i, item) in editor.completions.iter().take(max_visible_items).enumerate() {
+            for i in scroll_start..scroll_end {
+                let item = &editor.completions[i];
                 let is_sel = i == editor.completion_idx;
-                let (prefix_icon, style) = if is_sel {
-                    (
-                        " 󰄬 ",
-                        Style::default()
-                            .bg(Color::Rgb(40, 80, 160))
-                            .fg(Color::White)
-                            .add_modifier(Modifier::BOLD),
-                    )
+
+                let (kind_icon, kind_color) = completion_kind_icon(item.kind);
+
+                let item_bg = if is_sel { Color::Rgb(40, 75, 145) } else { Color::Rgb(25, 27, 34) };
+                let text_style = if is_sel {
+                    Style::default().bg(item_bg).fg(Color::White).add_modifier(Modifier::BOLD)
                 } else {
-                    (" 󰊕 ", Style::default().bg(Color::Rgb(28, 30, 38)).fg(Color::Rgb(210, 215, 225)))
+                    Style::default().bg(item_bg).fg(Color::Rgb(215, 220, 230))
                 };
 
-                let display_label = if item.label.len() > (popup_width as usize).saturating_sub(6) {
-                    format!("{}…", &item.label[..(popup_width as usize).saturating_sub(7)])
+                let avail_width = (popup_width as usize).saturating_sub(6);
+                let label_text = if item.label.len() > avail_width {
+                    format!("{}…", &item.label[..avail_width.saturating_sub(1)])
                 } else {
                     item.label.clone()
                 };
 
+                let padding = avail_width.saturating_sub(label_text.chars().count());
+
                 list_lines.push(Line::from(vec![
-                    Span::styled(prefix_icon, style),
-                    Span::styled(display_label, style),
+                    Span::styled(" ", Style::default().bg(item_bg)),
+                    Span::styled(kind_icon, Style::default().bg(item_bg).fg(kind_color)),
+                    Span::styled(" ", Style::default().bg(item_bg)),
+                    Span::styled(label_text, text_style),
+                    Span::styled(" ".repeat(padding), Style::default().bg(item_bg)),
                 ]));
             }
 
+            let title_info = format!(" {}/{} ", editor.completion_idx + 1, total_items);
             let comp_block = Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(Color::Rgb(80, 140, 255)))
-                .style(Style::default().bg(Color::Rgb(28, 30, 38)));
+                .style(Style::default().bg(Color::Rgb(25, 27, 34)))
+                .title(Line::from(Span::styled(title_info, Style::default().fg(Color::Rgb(140, 160, 200)))));
 
             frame.render_widget(Paragraph::new(list_lines).block(comp_block), popup_rect);
         }
