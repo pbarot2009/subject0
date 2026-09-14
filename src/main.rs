@@ -12,8 +12,8 @@ use std::{
 use anyhow::Result;
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-        MouseButton, MouseEvent, MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -28,10 +28,10 @@ use ratatui::{
 };
 use tokio::sync::mpsc;
 
-use editor::{Editor, Focus, Mode};
+use editor::{line_len, Editor, Focus, Mode};
 use lsp::{
     completion_kind_icon, file_icon_and_color, run_lsp_actor, LspInbound, LspOutbound, LspStatus,
-    SuggestionItem, SupportedLanguage,
+    SuggestionItem,
 };
 
 fn set_terminal_cursor_style(mode: Mode) {
@@ -190,20 +190,20 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
     // 1. Command Palette Touch Events
     if editor.palette.visible {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-            let width = 50u16.min(size.width.saturating_sub(4));
-            let height = 14u16.min(size.height.saturating_sub(4));
+            let width = 46u16.min(size.width.saturating_sub(2));
+            let height = 12u16.min(size.height.saturating_sub(2));
             let x = (size.width.saturating_sub(width)) / 2;
-            let y = 2u16;
+            let y = 1u16;
 
-            if mouse.column >= x && mouse.column < x + width && mouse.row >= y + 3 && mouse.row < y + height - 1 {
-                let clicked_row = (mouse.row - (y + 3)) as usize;
+            if mouse.column >= x && mouse.column < x + width && mouse.row >= y + 2 && mouse.row < y + height - 1 {
+                let clicked_row = (mouse.row - (y + 2)) as usize;
                 let cmds = editor.palette.filtered_commands();
                 let actual_idx = editor.palette.scroll + clicked_row;
                 if actual_idx < cmds.len() {
                     let cmd_id = cmds[actual_idx].id;
                     editor.execute_palette_command(cmd_id);
-                    return;
                 }
+                return;
             } else if mouse.column < x || mouse.column >= x + width || mouse.row < y || mouse.row >= y + height {
                 editor.palette.visible = false;
                 return;
@@ -212,10 +212,10 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         return;
     }
 
-    // 2. Statusline Taps (Strict Non-Overlapping Hitboxes)
+    // 2. Statusline Taps
     if mouse.row == status_row {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-            if mouse.column <= 10 {
+            if mouse.column <= 9 {
                 editor.mode = match editor.mode {
                     Mode::Normal => Mode::Insert,
                     Mode::Insert => Mode::Normal,
@@ -223,7 +223,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
                 };
                 set_terminal_cursor_style(editor.mode);
                 editor.completion_visible = false;
-            } else if mouse.column <= 21 {
+            } else if mouse.column <= 18 {
                 // Sidebar Toggle
                 editor.explorer.visible = !editor.explorer.visible;
                 if editor.explorer.visible {
@@ -232,15 +232,16 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
                 } else {
                     editor.focus = Focus::Editor;
                 }
-            } else if mouse.column <= 33 {
+            } else if mouse.column <= 27 {
                 // Line Wrap Toggle
                 editor.line_wrap = !editor.line_wrap;
                 editor.status_msg = format!("Line Wrap: {}", if editor.line_wrap { "ON" } else { "OFF" });
-            } else if mouse.column <= 44 {
+            } else if mouse.column <= 36 {
                 // Command Palette
                 editor.palette.visible = true;
                 editor.palette.query.clear();
                 editor.palette.selected_idx = 0;
+                editor.palette.scroll = 0;
             }
         }
         return;
@@ -317,33 +318,67 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
                     return;
                 }
             }
+            MouseEventKind::Down(MouseButton::Left) => {
+                editor.accept_completion();
+                return;
+            }
             _ => {}
         }
     }
 
-    // 5. Document Viewport Interactions
+    // 5. Document Viewport Buffer Interactions (Reliable line & sub-row mapping)
     let gutter_digits = editor.rope.len_lines().max(1).to_string().len().max(2);
     let gutter_width = gutter_digits + 4;
     let content_left = explorer_width + 1u16 + gutter_width as u16;
+    let text_area_width = (size.width as usize).saturating_sub(content_left as usize).max(1);
 
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {
             if mouse.row >= viewport_top && mouse.row < viewport_bottom {
-                let target_line = editor.scroll_y + (mouse.row - viewport_top) as usize;
-                if target_line < editor.rope.len_lines() {
+                let clicked_screen_row = (mouse.row - viewport_top) as usize;
+
+                if !editor.line_wrap {
+                    let target_line = (editor.scroll_y + clicked_screen_row).min(editor.rope.len_lines().saturating_sub(1));
                     editor.cursor_y = target_line;
                     if mouse.column >= content_left {
                         editor.cursor_x = editor.scroll_x + (mouse.column - content_left) as usize;
                     } else {
                         editor.cursor_x = 0;
                     }
-                    editor.clamp_cursor();
-                    editor.completion_visible = false;
-                    editor.focus = Focus::Editor;
+                } else {
+                    // Walk wrapped rows to find exact line and column
+                    let mut accumulated_rows = 0;
+                    let mut found_line = editor.rope.len_lines().saturating_sub(1);
+                    let mut found_col = 0;
 
-                    if size.width < 70 && editor.explorer.visible {
-                        editor.explorer.visible = false;
+                    for y in editor.scroll_y..editor.rope.len_lines() {
+                        let l_len = line_len(&editor.rope, y);
+                        let sub_rows = if l_len == 0 { 1 } else { (l_len + text_area_width - 1) / text_area_width };
+
+                        if clicked_screen_row < accumulated_rows + sub_rows {
+                            found_line = y;
+                            let sub_idx = clicked_screen_row - accumulated_rows;
+                            let sub_col = if mouse.column >= content_left {
+                                (mouse.column - content_left) as usize
+                            } else {
+                                0
+                            };
+                            found_col = (sub_idx * text_area_width + sub_col).min(l_len);
+                            break;
+                        }
+                        accumulated_rows += sub_rows;
                     }
+
+                    editor.cursor_y = found_line;
+                    editor.cursor_x = found_col;
+                }
+
+                editor.clamp_cursor();
+                editor.completion_visible = false;
+                editor.focus = Focus::Editor;
+
+                if size.width < 70 && editor.explorer.visible {
+                    editor.explorer.visible = false;
                 }
             }
         }
@@ -368,10 +403,15 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
 // -----------------------------------------------------------------------------
 
 fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
+    // Filter release events to prevent double-firing in terminals reporting key releases
+    if key.kind == KeyEventKind::Release {
+        return;
+    }
+
     let prev_mode = editor.mode;
     let max_visible = 6usize;
 
-    // Intercept Command Palette Events
+    // 1. Intercept Command Palette Key Events
     if editor.palette.visible {
         let cmds = editor.palette.filtered_commands();
         match key.code {
@@ -481,10 +521,11 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
 
             match key.code {
                 KeyCode::Char(' ') => {
-                    // Helix Space Menu -> Command Palette
+                    // Open Helix Space Menu / Command Palette
                     editor.palette.visible = true;
                     editor.palette.query.clear();
                     editor.palette.selected_idx = 0;
+                    editor.palette.scroll = 0;
                 }
                 KeyCode::Char('v') => {
                     editor.mode = Mode::Visual {
@@ -880,7 +921,7 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
     editor.update_scroll(text_area_width, inner_area.height as usize);
 
-    // Build visible lines: Decompose into syntax-styled characters
+    // Build visible lines: Syntax-highlighted character arrays
     let mut visible_lines = Vec::new();
     let mut cursor_screen_pos: Option<(u16, u16)> = None;
 
@@ -919,7 +960,7 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             }
         }
 
-        // Tokenize through SyntaxEngine
+        // Tokenize through SyntaxEngine preserving Tree-sitter colors
         let syntax_spans = editor.syntax.highlight_line(&line_str, y);
         let mut char_styles: Vec<(char, Style)> = Vec::with_capacity(line_str.len());
         for span in syntax_spans {
@@ -1097,7 +1138,7 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         main_chunks[1],
     );
 
-    // 4. Notification / Command Bar
+    // 4. Diagnostics / Bottom Notification Area
     if editor.mode == Mode::Command {
         let prompt_line = Line::from(vec![
             Span::styled(" :", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
@@ -1129,6 +1170,77 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
         frame.render_widget(Paragraph::new(msg_line), main_chunks[2]);
 
+        // Place terminal cursor
+        let screen_x = inner_area.x + gutter_width as u16 + (editor.cursor_x.saturating_sub(editor.scroll_x)) as u16;
+        let screen_y = inner_area.y + (editor.cursor_y.saturating_sub(editor.scroll_y)) as u16;
+
+        // Floating Auto-Complete Dropdown
+        if editor.mode == Mode::Insert && editor.completion_visible && !editor.completions.is_empty() {
+            let max_visible_items = 6usize;
+            let total_items = editor.completions.len();
+            let count = total_items.min(max_visible_items);
+            let popup_height = (count as u16) + 2;
+            let popup_width = 38u16.min(frame.area().width.saturating_sub(screen_x).max(22));
+
+            let mut popup_x = screen_x;
+            if popup_x + popup_width > frame.area().width {
+                popup_x = frame.area().width.saturating_sub(popup_width);
+            }
+
+            let popup_y = if screen_y + 1 + popup_height < frame.area().bottom() {
+                screen_y + 1
+            } else {
+                screen_y.saturating_sub(popup_height)
+            };
+
+            let popup_rect = Rect::new(popup_x, popup_y, popup_width, popup_height);
+            frame.render_widget(Clear, popup_rect);
+
+            let scroll_start = editor.completion_scroll;
+            let scroll_end = (scroll_start + max_visible_items).min(total_items);
+
+            let mut list_lines = Vec::new();
+            for i in scroll_start..scroll_end {
+                let item = &editor.completions[i];
+                let is_sel = i == editor.completion_idx;
+
+                let (kind_icon, kind_color) = completion_kind_icon(item.kind);
+                let item_bg = if is_sel { Color::Rgb(40, 75, 145) } else { Color::Rgb(25, 27, 34) };
+                let text_style = if is_sel {
+                    Style::default().bg(item_bg).fg(Color::White).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().bg(item_bg).fg(Color::Rgb(215, 220, 230))
+                };
+
+                let avail_width = (popup_width as usize).saturating_sub(6);
+                let label_text = if item.label.len() > avail_width {
+                    format!("{}…", &item.label[..avail_width.saturating_sub(1)])
+                } else {
+                    item.label.clone()
+                };
+
+                let padding = avail_width.saturating_sub(label_text.chars().count());
+
+                list_lines.push(Line::from(vec![
+                    Span::styled(" ", Style::default().bg(item_bg)),
+                    Span::styled(kind_icon, Style::default().bg(item_bg).fg(kind_color)),
+                    Span::styled(" ", Style::default().bg(item_bg)),
+                    Span::styled(label_text, text_style),
+                    Span::styled(" ".repeat(padding), Style::default().bg(item_bg)),
+                ]));
+            }
+
+            let title_info = format!(" {}/{} ", editor.completion_idx + 1, total_items);
+            let comp_block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Rgb(80, 140, 255)))
+                .style(Style::default().bg(Color::Rgb(25, 27, 34)))
+                .title(Line::from(Span::styled(title_info, Style::default().fg(Color::Rgb(140, 160, 200)))));
+
+            frame.render_widget(Paragraph::new(list_lines).block(comp_block), popup_rect);
+        }
+
         if editor.focus == Focus::Editor {
             if let Some((cx, cy)) = cursor_screen_pos {
                 if cx < inner_area.right() && cy < inner_area.bottom() {
@@ -1138,12 +1250,12 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         }
     }
 
-    // 5. Render Command Palette Modal (Helix Space-Menu)
+    // 5. Render Command Palette Modal
     if editor.palette.visible {
-        let width = 50u16.min(size.width.saturating_sub(4));
-        let height = 14u16.min(size.height.saturating_sub(4));
+        let width = 46u16.min(size.width.saturating_sub(2));
+        let height = 12u16.min(size.height.saturating_sub(2));
         let x = (size.width.saturating_sub(width)) / 2;
-        let y = 2u16;
+        let y = 1u16;
 
         let palette_rect = Rect::new(x, y, width, height);
         frame.render_widget(Clear, palette_rect);

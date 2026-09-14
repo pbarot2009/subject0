@@ -24,6 +24,7 @@ use tree_sitter::{Parser, Tree};
 #[derive(Debug, Clone)]
 pub struct DiagnosticItem {
     pub line: usize,
+    #[allow(dead_code)]
     pub col: usize,
     pub message: String,
     pub severity: u8, // 1: Error, 2: Warning, 3: Info, 4: Hint
@@ -421,7 +422,7 @@ impl SyntaxEngine {
             SupportedLanguage::Rust | SupportedLanguage::Python => {
                 Self::highlight_code(line_text, self.language)
             }
-            SupportedLanguage::Plain => vec![Span::raw(line_text.to_string())],
+            SupportedLanguage::Plain => vec![Span::styled(line_text.to_string(), Style::default().fg(Color::Rgb(215, 220, 230)))],
         }
     }
 
@@ -515,10 +516,9 @@ impl SyntaxEngine {
                 }
                 let word: String = chars[idx..end].iter().collect();
 
-                // Check for Rust Macro: e.g. println!
-                let is_macro = lang == SupportedLanguage::Rust && end < len && chars[end] == '!';
-                if is_macro {
-                    end += 1; // Include '!' in macro token
+                // Rust macro check: println!
+                if lang == SupportedLanguage::Rust && end < len && chars[end] == '!' {
+                    end += 1;
                     let macro_word: String = chars[idx..end].iter().collect();
                     spans.push(Span::styled(
                         macro_word,
@@ -528,12 +528,12 @@ impl SyntaxEngine {
                     continue;
                 }
 
-                // Check for Function Call: e.g. foo(...)
+                // Function call lookahead
                 let mut lookahead = end;
                 while lookahead < len && chars[lookahead].is_whitespace() {
                     lookahead += 1;
                 }
-                let is_func_call = lookahead < len && chars[lookahead] == '(';
+                let is_func = lookahead < len && chars[lookahead] == '(';
 
                 let style = match lang {
                     SupportedLanguage::Rust => match word.as_str() {
@@ -550,10 +550,10 @@ impl SyntaxEngine {
                             Style::default().fg(Color::Rgb(240, 200, 90))
                         }
                         _ => {
-                            if is_func_call {
+                            if is_func {
                                 Style::default().fg(Color::Rgb(100, 175, 255))
                             } else if word.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
-                                Style::default().fg(Color::Rgb(240, 200, 90)) // Custom types
+                                Style::default().fg(Color::Rgb(240, 200, 90))
                             } else {
                                 Style::default().fg(Color::Rgb(220, 225, 235))
                             }
@@ -571,7 +571,7 @@ impl SyntaxEngine {
                             Style::default().fg(Color::Rgb(240, 200, 90))
                         }
                         _ => {
-                            if is_func_call {
+                            if is_func {
                                 Style::default().fg(Color::Rgb(100, 175, 255))
                             } else if word.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
                                 Style::default().fg(Color::Rgb(240, 200, 90))
@@ -589,8 +589,7 @@ impl SyntaxEngine {
             }
 
             // Operators & Punctuation
-            let op_style = Style::default().fg(Color::Rgb(140, 150, 170));
-            spans.push(Span::styled(chars[idx].to_string(), op_style));
+            spans.push(Span::styled(chars[idx].to_string(), Style::default().fg(Color::Rgb(140, 150, 170))));
             idx += 1;
         }
 

@@ -381,7 +381,7 @@ impl Editor {
             cursor_y: 0,
             scroll_x: 0,
             scroll_y: 0,
-            line_wrap: true, // Default enabled for mobile terminals
+            line_wrap: true,
             clipboard: String::new(),
             modified: false,
             status_msg,
@@ -524,15 +524,8 @@ impl Editor {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Visual Selection Helpers
-    // -------------------------------------------------------------------------
-
     pub fn selection_range(&self) -> Option<(usize, usize)> {
         if let Mode::Visual { anchor_x, anchor_y } = self.mode {
-            let start_line = anchor_y.min(self.cursor_y);
-            let end_line = anchor_y.max(self.cursor_y);
-
             let (start_idx, end_idx) = if anchor_y < self.cursor_y {
                 let start = self.rope.line_to_char(anchor_y) + anchor_x;
                 let end = self.rope.line_to_char(self.cursor_y) + self.cursor_x;
@@ -544,7 +537,7 @@ impl Editor {
             } else {
                 let sx = anchor_x.min(self.cursor_x);
                 let ex = anchor_x.max(self.cursor_x);
-                let base = self.rope.line_to_char(start_line);
+                let base = self.rope.line_to_char(anchor_y);
                 (base + sx, base + ex)
             };
 
@@ -602,7 +595,6 @@ impl Editor {
                 self.status_msg = format!("Yanked {} chars", self.clipboard.len());
             }
         } else {
-            // Yank current line in Normal mode
             let line = self.rope.line(self.cursor_y);
             self.clipboard = line.to_string();
             self.status_msg = "Yanked line".to_string();
@@ -696,9 +688,8 @@ impl Editor {
 
         self.snapshot();
         let line_end = self.rope.line_to_char(self.cursor_y + 1) - 1;
-        self.rope.remove(line_end..line_end + 1); // remove newline
+        self.rope.remove(line_end..line_end + 1);
 
-        // Replace leading whitespace of joined line with single space
         let next_line_start = line_end;
         let mut ws_len = 0;
         while next_line_start + ws_len < self.rope.len_chars()
@@ -733,10 +724,6 @@ impl Editor {
         self.mode = Mode::Insert;
         self.on_buffer_modified();
     }
-
-    // -------------------------------------------------------------------------
-    // Primitive Editing Operations
-    // -------------------------------------------------------------------------
 
     pub fn insert_char(&mut self, c: char) {
         let idx = self.char_index();
@@ -1007,10 +994,11 @@ impl Editor {
             } else {
                 self.focus = Focus::Editor;
             }
-        } else if cmd == "p" || cmd == "menu" || cmd == "commands" {
+        } else if cmd == "p" || cmd == "menu" || cmd == "commands" || cmd == "pal" {
             self.palette.visible = true;
             self.palette.query.clear();
             self.palette.selected_idx = 0;
+            self.palette.scroll = 0;
         } else if !cmd.is_empty() {
             self.status_msg = format!("Unknown command: :{}", cmd);
         }
