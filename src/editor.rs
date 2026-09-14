@@ -1,3 +1,34 @@
+//! # Editor Buffer Model & Application State Engine
+//!
+//! This module forms the central operational core of `subject0`. It manages:
+//!
+//! 1. **Text Storage & Mutability ([`ropey::Rope`])**:
+//!    Buffer contents are stored as a chunked, reference-counted B-tree rope. Modifications,
+//!    insertions, and deletions execute in $O(\log N)$ time, and document snapshots for undo
+//!    history leverage copy-on-write structural sharing, making state capture $O(1)$ in time
+//!    and minimal in memory overhead.
+//!
+//! 2. **Modal Editing State Machine ([`Mode`])**:
+//!    Implements modal key semantics across four distinct states:
+//!    - [`Mode::Normal`]: Motion, operational commands, and dispatch. Cursor clamps to `line_len - 1`.
+//!    - [`Mode::Insert`]: Direct character streaming, pair-matching, and auto-indentation. Cursor clamps to `line_len`.
+//!    - [`Mode::Command`]: Ex-style command-line input buffer (e.g., `:w`, `:q`, `:explore`).
+//!    - [`Mode::Visual`]: 2D anchor-to-cursor selection highlighting and bulk manipulation.
+//!
+//! 3. **Undo History Stack**:
+//!    Maintains a ring-bounded history of historical [`Rope`] states (capped at 64 entries).
+//!    Because `Rope` clones share immutable internal B-tree nodes, pushing snapshots avoids
+//!    deep string allocations.
+//!
+//! 4. **Document & LSP Synchronization**:
+//!    Every buffer mutation increments `doc_version`, synchronizes AST highlights via
+//!    [`SyntaxEngine::reparse`], and dispatches full-text LSP change notifications
+//!    (`textDocument/didChange`) through an unbounded Tokio channel.
+//!
+//! 5. **Subsystem Overlays**:
+//!    Coordinates the built-in tree-structured file explorer ([`FileExplorer`]) and fuzzy-filtered
+//!    command palette ([`CommandPalette`]).
+
 use std::{
     env,
     fs::{self, File},
@@ -11,17 +42,30 @@ use tokio::sync::mpsc;
 
 use crate::lsp::{DiagnosticItem, LspInbound, LspStatus, SuggestionItem, SyntaxEngine};
 
+/// Active input mode governing key event interpretation and cursor boundary constraints.
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum Mode {
+    /// Navigation and command execution mode. Cursor rests on existing glyphs (`x <= len - 1`).
     Normal,
+    /// Direct text insertion mode. Cursor may advance past the final glyph (`x <= len`).
     Insert,
+    /// Ex-style command input mode active on the bottom status line.
     Command,
-    Visual { anchor_x: usize, anchor_y: usize },
+    /// Text selection mode active between a fixed anchor coordinate and the moving cursor coordinate.
+    Visual {
+        /// Zero-based character/column offset where the selection originated.
+        anchor_x: usize,
+        /// Zero-based line index where the selection originated.
+        anchor_y: usize,
+    },
 }
 
+/// Identifies which viewport element currently holds keyboard input focus.
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum Focus {
+    /// Main code buffer viewport.
     Editor,
+    /// Side-panel file tree explorer viewport.
     Explorer,
 }
 
@@ -29,35 +73,59 @@ pub enum Focus {
 // Command Palette Definitions
 // -----------------------------------------------------------------------------
 
+/// Enumeration of all discrete operations dispatchable via the interactive command palette.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CommandId {
+    /// Selects the entire text document buffer into a visual range.
     SelectAll,
+    /// Toggles visibility of the sidebar file browser.
     ToggleExplorer,
+    /// Toggles viewport soft line-wrapping on or off.
     ToggleWrap,
+    /// Writes modified buffer state to the underlying filesystem path.
     Save,
+    /// Writes modified buffer state and flags the editor to exit.
     SaveQuit,
+    /// Terminates the editor process immediately, discarding unstaged modifications.
     QuitForce,
+    /// Switches the buffer mode to visual selection at the current cursor coordinate.
     EnterVisual,
+    /// Inserts a newline beneath the current cursor line and switches to insert mode.
     InsertBelow,
+    /// Inserts a newline above the current cursor line and switches to insert mode.
     InsertAbove,
+    /// Joins the subsequent line onto the current line, collapsing whitespace.
     JoinLines,
+    /// Reverts the document rope to the most recent undo snapshot.
     Undo,
+    /// Copies the active visual selection or current line to the internal clipboard.
     Yank,
-    Paste,
+    /// Pastes text from the internal clipboard at the current cursor offset.
     ToggleCase,
+    /// Swaps character casing (uppercase <-> lowercase) over selection or character.
+    Paste,
+    /// Relocates the cursor to the first character of the first line.
     JumpTop,
+    /// Relocates the cursor to the first character of the final line.
     JumpBottom,
+    /// Dispatches an asynchronous LSP completion request at the current cursor position.
     TriggerCompletion,
 }
 
+/// Static descriptor defining metadata for a searchable command palette entry.
 #[derive(Clone)]
 pub struct PaletteCommand {
+    /// Human-readable title displayed in the palette candidate list.
     pub title: &'static str,
+    /// Suggested keyboard shortcut or ex-command displayed as secondary UI hint.
     pub shortcut: &'static str,
+    /// Nerd Font icon glyph prefixed to the title.
     pub icon: &'static str,
+    /// Target command ID executed when this palette entry is activated.
     pub id: CommandId,
 }
 
+/// Static registry of available editor commands exposed through the command palette.
 pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand {
         title: "Select All Buffer",
@@ -163,14 +231,20 @@ pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
     },
 ];
 
+/// Transient UI state for the fuzzy-filtered command palette overlay.
 pub struct CommandPalette {
+    /// Indicates whether the palette popup overlay is currently rendered.
     pub visible: bool,
+    /// User query string used to filter commands.
     pub query: String,
+    /// Index of the currently highlighted candidate within the filtered results.
     pub selected_idx: usize,
+    /// Vertical viewport scroll offset for the rendered candidate list.
     pub scroll: usize,
 }
 
 impl CommandPalette {
+    /// Creates a closed, empty command palette instance.
     pub fn new() -> Self {
         Self {
             visible: false,
@@ -180,6 +254,10 @@ impl CommandPalette {
         }
     }
 
+    /// Evaluates `self.query` against [`PALETTE_COMMANDS`] and returns matching candidates.
+    ///
+    /// Matches case-insensitively against both command titles and shortcut strings.
+    /// Returns the complete registry if the query buffer is empty.
     pub fn filtered_commands(&self) -> Vec<&'static PaletteCommand> {
         let q = self.query.to_lowercase();
         PALETTE_COMMANDS
@@ -197,24 +275,37 @@ impl CommandPalette {
 // File Explorer
 // -----------------------------------------------------------------------------
 
+/// Represents a single node (file or directory) within the hierarchical file tree.
 #[derive(Clone, Debug)]
 pub struct FileEntry {
+    /// Full filesystem path to the target node.
     pub path: PathBuf,
+    /// Terminal display name (filename or directory name).
     pub name: String,
+    /// True if the entry represents a directory; false for regular files and symlinks.
     pub is_dir: bool,
+    /// Indentation depth relative to the root directory (0 = root level children).
     pub depth: usize,
+    /// If `is_dir` is true, tracks whether sub-entries are currently materialized.
     pub expanded: bool,
 }
 
+/// Sidebar file tree model supporting dynamic directory expansion and navigation.
 pub struct FileExplorer {
+    /// Base directory path serving as the hierarchy root.
     pub root: PathBuf,
+    /// Flattened display list containing all visible nodes, including expanded subtrees.
     pub entries: Vec<FileEntry>,
+    /// Index within `entries` representing the currently focused row.
     pub selected_idx: usize,
+    /// Vertical viewport scroll offset for the explorer sidebar.
     pub scroll: usize,
+    /// Controls whether the file explorer sidebar is visible.
     pub visible: bool,
 }
 
 impl FileExplorer {
+    /// Constructs a file explorer rooted at the provided filesystem path and reads top-level entries.
     pub fn new<P: AsRef<Path>>(root: P) -> Self {
         let root_buf = root.as_ref().to_path_buf();
         let mut explorer = Self {
@@ -228,10 +319,16 @@ impl FileExplorer {
         explorer
     }
 
+    /// Rescans the root directory, collapsing expanded subtrees and resetting `entries`.
     pub fn refresh(&mut self) {
         self.entries = Self::read_directory(&self.root, 0);
     }
 
+    /// Reads immediate children of `dir`, sorting directories before files, and ignores noise.
+    ///
+    /// Filters out:
+    /// - Hidden files and directories starting with `.` (e.g., `.git`)
+    /// - Build artifact directories (`target`, `node_modules`)
     fn read_directory(dir: &Path, depth: usize) -> Vec<FileEntry> {
         let mut entries = Vec::new();
         if let Ok(read_dir) = fs::read_dir(dir) {
@@ -243,6 +340,7 @@ impl FileExplorer {
                 })
                 .collect();
 
+            // Sort directories before files, then sort alphabetically by filename.
             paths.sort_by(|a, b| {
                 let a_is_dir = a.is_dir();
                 let b_is_dir = b.is_dir();
@@ -275,6 +373,12 @@ impl FileExplorer {
         entries
     }
 
+    /// Toggles the expansion state of a directory entry at `idx`.
+    ///
+    /// - If currently expanded: Traverses forward, counting all descendants with
+    ///   `depth > current_depth`, and removes them from the flattened vector via [`Vec::drain`].
+    /// - If collapsed: Reads the directory contents from disk at `current_depth + 1` and
+    ///   splices them directly following `idx`.
     pub fn toggle_expand(&mut self, idx: usize) {
         if idx >= self.entries.len() || !self.entries[idx].is_dir {
             return;
@@ -306,6 +410,7 @@ impl FileExplorer {
         }
     }
 
+    /// Adjusts `self.scroll` to keep `self.selected_idx` within the visible vertical window.
     pub fn update_scroll(&mut self, viewport_height: usize) {
         if self.selected_idx < self.scroll {
             self.scroll = self.selected_idx;
@@ -319,42 +424,77 @@ impl FileExplorer {
 // Editor Buffer Model
 // -----------------------------------------------------------------------------
 
+/// Primary application state model encapsulating buffer data, UI state, and subsystems.
 pub struct Editor {
+    /// B-tree rope storing the buffer text contents.
     pub rope: Rope,
+    /// Absolute or relative path to the currently open file on disk (`None` for scratch buffers).
     pub path: Option<PathBuf>,
+    /// Active modal editing mode.
     pub mode: Mode,
+    /// Current input focus target (main editor viewport or sidebar explorer).
     pub focus: Focus,
+    /// Zero-based character/column offset of the cursor on the current line.
     pub cursor_x: usize,
+    /// Zero-based line index of the cursor within the rope.
     pub cursor_y: usize,
+    /// Horizontal scroll offset (used when line wrapping is disabled).
     pub scroll_x: usize,
+    /// Vertical scroll offset representing the top visible line index.
     pub scroll_y: usize,
+    /// Determines whether lines wider than the viewport wrap or scroll horizontally.
     pub line_wrap: bool,
+    /// Internal yank/cut buffer used for clipboard operations.
     pub clipboard: String,
+    /// Dirty flag tracking whether the rope contents diverge from disk storage.
     pub modified: bool,
+    /// Informational string rendered on the bottom status line.
     pub status_msg: String,
+    /// Accumulator for commands typed while in [`Mode::Command`].
     pub command_buffer: String,
+    /// Buffered multi-key sequence prefix (e.g., initial `'g'` in a `"gg"` motion).
     pub pending_key: Option<char>,
+    /// Undo history ring storing previous [`Rope`] states (bounded to 64 snapshots).
     pub undo_stack: Vec<Rope>,
+    /// Syntax engine instance driving AST parsing and lexical syntax highlighting.
     pub syntax: SyntaxEngine,
+    /// Diagnostics received from the background LSP server mapped to the active document.
     pub diagnostics: Vec<DiagnosticItem>,
+    /// Process lifecycle status of the associated LSP server.
     pub lsp_status: LspStatus,
+    /// Transmission channel dispatching requests to the background LSP actor.
     pub lsp_tx: Option<mpsc::UnboundedSender<LspInbound>>,
+    /// Monotonically increasing request ID counter for correlating LSP responses.
     pub lsp_req_id: i64,
+    /// Monotonically increasing document version counter sent in LSP change events.
     pub doc_version: i64,
 
     // Completions State
+    /// Active list of completion suggestions returned by the LSP.
     pub completions: Vec<SuggestionItem>,
+    /// Index of the highlighted completion item in [`Self::completions`].
     pub completion_idx: usize,
+    /// Scroll offset of the completion popup list.
     pub completion_scroll: usize,
+    /// Controls whether the completion popup window is visible.
     pub completion_visible: bool,
 
     // File Tree & Command Palette
+    /// File tree explorer state machine.
     pub explorer: FileExplorer,
+    /// Interactive command palette state machine.
     pub palette: CommandPalette,
+    /// Flag signaling the main application event loop to shut down.
     pub should_quit: bool,
 }
 
 impl Editor {
+    /// Instantiates a new editor buffer.
+    ///
+    /// If `path` is provided and points to an existing file, its contents are ingested into
+    /// the [`Rope`] via buffered I/O. Otherwise, an empty rope is initialized. Also sets up
+    /// the syntax engine, initializes the file explorer from the current working directory,
+    /// and resets cursor coordinates.
     pub fn new(path: Option<PathBuf>) -> Result<Self> {
         let (rope, status_msg) = match &path {
             Some(p) if p.exists() => {
@@ -404,6 +544,11 @@ impl Editor {
         })
     }
 
+    /// Loads a new file from disk into the current editor buffer.
+    ///
+    /// Replaces the underlying [`Rope`], resets cursor and scroll coordinates, clears the
+    /// undo stack and diagnostics, reconfigures the [`SyntaxEngine`], and sends a
+    /// `textDocument/didOpen` notification over `lsp_tx` if a language server is connected.
     pub fn open_file<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
         let path_buf = path.as_ref().to_path_buf();
         let file = File::open(&path_buf)?;
@@ -443,6 +588,11 @@ impl Editor {
         Ok(())
     }
 
+    /// Pushes a snapshot of the current [`Rope`] onto `undo_stack`.
+    ///
+    /// History depth is bounded to 64 entries. When capacity is exceeded, the oldest
+    /// snapshot is dropped. Clones of [`Rope`] are cheap $O(1)$ operations due to internal
+    /// structural sharing.
     pub fn snapshot(&mut self) {
         if self.undo_stack.len() >= 64 {
             self.undo_stack.remove(0);
@@ -450,6 +600,10 @@ impl Editor {
         self.undo_stack.push(self.rope.clone());
     }
 
+    /// Reverts the document rope to the most recent checkpoint on `undo_stack`.
+    ///
+    /// Clamps cursor coordinates to the reverted buffer boundaries and triggers
+    /// re-parsing and LSP change notifications via [`Self::on_buffer_modified`].
     pub fn undo(&mut self) {
         if let Some(prev) = self.undo_stack.pop() {
             self.rope = prev;
@@ -460,6 +614,11 @@ impl Editor {
         }
     }
 
+    /// Synchronizes external subsystems following a buffer mutation.
+    ///
+    /// 1. Regenerates AST highlighting caches via [`SyntaxEngine::reparse`].
+    /// 2. Increments [`Self::doc_version`].
+    /// 3. Emits an [`LspInbound::Change`] event to the background LSP actor.
     pub fn on_buffer_modified(&mut self) {
         let text = self.rope.to_string();
         self.syntax.reparse(&text);
@@ -473,6 +632,8 @@ impl Editor {
         }
     }
 
+    /// Dispatches an asynchronous `textDocument/completion` request to the LSP actor
+    /// corresponding to the current cursor position.
     pub fn request_completions(&mut self) {
         if let Some(tx) = &self.lsp_tx {
             self.lsp_req_id += 1;
@@ -484,15 +645,18 @@ impl Editor {
         }
     }
 
+    /// Returns the character count of the line at [`Self::cursor_y`], excluding newline delimiters.
     pub fn current_line_len(&self) -> usize {
         line_len(&self.rope, self.cursor_y)
     }
 
+    /// Translates 2D cursor coordinates `(cursor_x, cursor_y)` into a linear 1D character offset.
     pub fn char_index(&self) -> usize {
         let line_start = self.rope.line_to_char(self.cursor_y);
         line_start + self.cursor_x
     }
 
+    /// Returns the unicode `char` currently situated directly under the cursor.
     pub fn char_under_cursor(&self) -> Option<char> {
         let idx = self.char_index();
         if idx < self.rope.len_chars() {
@@ -502,6 +666,9 @@ impl Editor {
         }
     }
 
+    /// Scans backward from `cursor_x` on the current line to extract the active identifier prefix.
+    ///
+    /// Used to compute the text slice to be replaced when accepting an autocomplete candidate.
     pub fn current_word_prefix(&self) -> String {
         if self.cursor_y >= self.rope.len_lines() {
             return String::new();
@@ -524,6 +691,9 @@ impl Editor {
         }
     }
 
+    /// Calculates the half-open linear character range `[start, end)` representing the active visual selection.
+    ///
+    /// Returns `None` if the editor is not in [`Mode::Visual`].
     pub fn selection_range(&self) -> Option<(usize, usize)> {
         if let Mode::Visual { anchor_x, anchor_y } = self.mode {
             let (start_idx, end_idx) = if anchor_y < self.cursor_y {
@@ -547,6 +717,7 @@ impl Editor {
         }
     }
 
+    /// Queries whether the character at buffer coordinate `(line, col)` falls within the active visual selection.
     pub fn is_char_selected(&self, line: usize, col: usize) -> bool {
         if let Mode::Visual { anchor_x, anchor_y } = self.mode {
             let (a_l, a_c) = (anchor_y, anchor_x);
@@ -574,6 +745,7 @@ impl Editor {
         }
     }
 
+    /// Enters [`Mode::Visual`] spanning the entirety of the buffer from `(0, 0)` to the final character.
     pub fn select_all(&mut self) {
         if self.rope.len_chars() == 0 {
             return;
@@ -587,6 +759,9 @@ impl Editor {
         self.status_msg = "Selected all".to_string();
     }
 
+    /// Copies selected text (or the entire current line if no selection is active) into [`Self::clipboard`].
+    ///
+    /// Reverts mode to [`Mode::Normal`].
     pub fn yank_selection(&mut self) {
         if let Some((start, end)) = self.selection_range() {
             if start < end {
@@ -602,6 +777,9 @@ impl Editor {
         self.mode = Mode::Normal;
     }
 
+    /// Deletes characters encompassed by the active visual selection, storing them in [`Self::clipboard`].
+    ///
+    /// Records an undo snapshot, repositions the cursor to the deletion origin, and returns to [`Mode::Normal`].
     pub fn delete_selection(&mut self) {
         if let Some((start, end)) = self.selection_range() {
             if start < end {
@@ -623,6 +801,7 @@ impl Editor {
         }
     }
 
+    /// Inserts the contents of [`Self::clipboard`] into the buffer at the current cursor index.
     pub fn paste(&mut self) {
         if self.clipboard.is_empty() {
             self.status_msg = "Clipboard is empty".to_string();
@@ -639,6 +818,7 @@ impl Editor {
         self.status_msg = "Pasted from clipboard".to_string();
     }
 
+    /// Toggles the case of selected characters or the character directly beneath the cursor.
     pub fn toggle_case(&mut self) {
         if let Some((start, end)) = self.selection_range() {
             if start < end {
@@ -681,6 +861,10 @@ impl Editor {
         }
     }
 
+    /// Merges the line below the current cursor line onto the current line.
+    ///
+    /// Replaces the newline delimiter and any leading indentation on the next line
+    /// with a single whitespace character.
     pub fn join_lines(&mut self) {
         if self.cursor_y + 1 >= self.rope.len_lines() {
             return;
@@ -708,6 +892,7 @@ impl Editor {
         self.status_msg = "Joined lines".to_string();
     }
 
+    /// Creates an empty line beneath the current line and switches into [`Mode::Insert`].
     pub fn insert_line_below(&mut self) {
         self.snapshot();
         self.cursor_x = self.current_line_len();
@@ -715,6 +900,7 @@ impl Editor {
         self.mode = Mode::Insert;
     }
 
+    /// Creates an empty line above the current line and switches into [`Mode::Insert`].
     pub fn insert_line_above(&mut self) {
         self.snapshot();
         self.cursor_x = 0;
@@ -725,6 +911,7 @@ impl Editor {
         self.on_buffer_modified();
     }
 
+    /// Inserts a single unicode character at the current cursor offset and advances the cursor.
     pub fn insert_char(&mut self, c: char) {
         let idx = self.char_index();
         self.rope.insert_char(idx, c);
@@ -733,6 +920,7 @@ impl Editor {
         self.on_buffer_modified();
     }
 
+    /// Inserts an opening and closing delimiter pair, placing the cursor between them.
     pub fn insert_pair(&mut self, open: char, close: char) {
         let idx = self.char_index();
         self.rope.insert_char(idx, open);
@@ -742,6 +930,11 @@ impl Editor {
         self.on_buffer_modified();
     }
 
+    /// Inserts a newline character with automatic indentation preservation.
+    ///
+    /// Detects leading whitespace on the active line and replicates it onto the new line.
+    /// If the cursor is positioned directly between `{` and `}`, it expands the block
+    /// across three lines with an additional four spaces of nested indentation.
     pub fn insert_newline(&mut self) {
         let idx = self.char_index();
         let current_line = if self.cursor_y < self.rope.len_lines() {
@@ -784,6 +977,10 @@ impl Editor {
         self.on_buffer_modified();
     }
 
+    /// Deletes the character before the cursor or handles multi-character boundary conditions.
+    ///
+    /// - If the cursor is between an auto-closed pair (e.g., `()` or `{}`), both are removed.
+    /// - If at the start of a line (`cursor_x == 0`), joins the current line with the previous line.
     pub fn backspace(&mut self) {
         if self.cursor_x > 0 {
             let idx = self.char_index();
@@ -828,6 +1025,7 @@ impl Editor {
         self.completion_visible = false;
     }
 
+    /// Updates `completion_scroll` to keep `completion_idx` inside the visible completion popup.
     pub fn update_completion_scroll(&mut self, max_visible: usize) {
         if self.completion_idx < self.completion_scroll {
             self.completion_scroll = self.completion_idx;
@@ -836,6 +1034,10 @@ impl Editor {
         }
     }
 
+    /// Applies the selected completion candidate into the buffer.
+    ///
+    /// Replaces the current typed identifier prefix with the candidate's `insert_text`,
+    /// repositions the cursor at the end of the insertion, and dismisses the popup.
     pub fn accept_completion(&mut self) {
         if !self.completion_visible || self.completions.is_empty() {
             return;
@@ -858,6 +1060,7 @@ impl Editor {
         self.on_buffer_modified();
     }
 
+    /// Deletes a single character situated directly under the cursor without modifying the clipboard.
     pub fn delete_under_cursor(&mut self) {
         let line_len = self.current_line_len();
         if self.cursor_x < line_len {
@@ -869,6 +1072,7 @@ impl Editor {
         }
     }
 
+    /// Deletes the entire active line including its trailing newline delimiter.
     pub fn delete_current_line(&mut self) {
         if self.rope.len_lines() == 0 {
             return;
@@ -893,6 +1097,9 @@ impl Editor {
         self.clamp_cursor();
     }
 
+    /// Flushes the rope buffer out to the underlying file path using buffered I/O.
+    ///
+    /// Clears `modified`, updates `status_msg`, and notifies the LSP actor via [`LspInbound::Save`].
     pub fn save(&mut self) -> Result<()> {
         if let Some(path) = &self.path {
             let file = File::create(path)?;
@@ -913,6 +1120,7 @@ impl Editor {
         Ok(())
     }
 
+    /// Executes an action selected from the command palette overlay.
     pub fn execute_palette_command(&mut self, id: CommandId) {
         self.palette.visible = false;
         match id {
@@ -965,6 +1173,16 @@ impl Editor {
         }
     }
 
+    /// Evaluates and executes the ex-command string buffered in `command_buffer`.
+    ///
+    /// Supported commands:
+    /// - `:q` - Quit (fails if unsaved changes exist)
+    /// - `:q!` - Force quit discarding changes
+    /// - `:w` - Save buffer
+    /// - `:wq` - Save buffer and quit
+    /// - `:wrap` - Toggle line wrapping
+    /// - `:e`, `:explore` - Toggle sidebar file explorer
+    /// - `:p`, `:menu`, `:commands`, `:pal` - Open interactive command palette
     pub fn execute_command(&mut self) {
         let cmd = self.command_buffer.trim().to_string();
         self.command_buffer.clear();
@@ -1004,6 +1222,11 @@ impl Editor {
         }
     }
 
+    /// Enforces modal cursor constraints against buffer boundaries.
+    ///
+    /// - Restricts `cursor_y` to `[0, len_lines - 1]`.
+    /// - In [`Mode::Insert`], restricts `cursor_x` to `[0, line_len]`.
+    /// - In non-insert modes, restricts `cursor_x` to `[0, line_len - 1]`.
     pub fn clamp_cursor(&mut self) {
         let max_lines = self.rope.len_lines().max(1);
         if self.cursor_y >= max_lines {
@@ -1021,6 +1244,7 @@ impl Editor {
         }
     }
 
+    /// Recalculates horizontal and vertical scroll offsets so the cursor remains visible.
     pub fn update_scroll(&mut self, width: usize, height: usize) {
         if self.cursor_y < self.scroll_y {
             self.scroll_y = self.cursor_y;
@@ -1040,6 +1264,7 @@ impl Editor {
     }
 }
 
+/// Calculates the printable character count of a rope line, stripping trailing `\r` and `\n`.
 pub fn line_len(rope: &Rope, line_idx: usize) -> usize {
     if line_idx >= rope.len_lines() {
         return 0;
