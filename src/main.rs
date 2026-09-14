@@ -247,7 +247,11 @@ async fn main() -> Result<()> {
     let mut out = std::io::stdout();
     let _ = out.write_all(b"\x1b[0 q");
     let _ = disable_raw_mode();
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     Ok(())
 }
 
@@ -279,7 +283,11 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
             let y = 1u16;
 
             // Check if click occurred within the list region of the palette window.
-            if mouse.column >= x && mouse.column < x + width && mouse.row >= y + 2 && mouse.row < y + height - 1 {
+            if mouse.column >= x
+                && mouse.column < x + width
+                && mouse.row >= y + 2
+                && mouse.row < y + height - 1
+            {
                 let clicked_row = (mouse.row - (y + 2)) as usize;
                 let cmds = editor.palette.filtered_commands();
                 let actual_idx = editor.palette.scroll + clicked_row;
@@ -288,7 +296,11 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
                     editor.execute_palette_command(cmd_id);
                 }
                 return;
-            } else if mouse.column < x || mouse.column >= x + width || mouse.row < y || mouse.row >= y + height {
+            } else if mouse.column < x
+                || mouse.column >= x + width
+                || mouse.row < y
+                || mouse.row >= y + height
+            {
                 // Click occurred outside modal boundary; dismiss palette.
                 editor.palette.visible = false;
                 return;
@@ -321,7 +333,8 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
             } else if mouse.column <= 27 {
                 // Line Wrap Toggle Button Tap
                 editor.line_wrap = !editor.line_wrap;
-                editor.status_msg = format!("Line Wrap: {}", if editor.line_wrap { "ON" } else { "OFF" });
+                editor.status_msg =
+                    format!("Line Wrap: {}", if editor.line_wrap { "ON" } else { "OFF" });
             } else if mouse.column <= 36 {
                 // Command Palette Shortcut Tap
                 editor.palette.visible = true;
@@ -417,7 +430,9 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
     let gutter_digits = editor.rope.len_lines().max(1).to_string().len().max(2);
     let gutter_width = gutter_digits + 4;
     let content_left = explorer_width + 1u16 + gutter_width as u16;
-    let text_area_width = (size.width as usize).saturating_sub(content_left as usize).max(1);
+    let text_area_width = (size.width as usize)
+        .saturating_sub(content_left as usize)
+        .max(1);
 
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {
@@ -426,7 +441,8 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
 
                 if !editor.line_wrap {
                     // When wrapping is disabled, 1 terminal row == 1 buffer line.
-                    let target_line = (editor.scroll_y + clicked_screen_row).min(editor.rope.len_lines().saturating_sub(1));
+                    let target_line = (editor.scroll_y + clicked_screen_row)
+                        .min(editor.rope.len_lines().saturating_sub(1));
                     editor.cursor_y = target_line;
                     if mouse.column >= content_left {
                         editor.cursor_x = editor.scroll_x + (mouse.column - content_left) as usize;
@@ -441,7 +457,11 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
 
                     for y in editor.scroll_y..editor.rope.len_lines() {
                         let l_len = line_len(&editor.rope, y);
-                        let sub_rows = if l_len == 0 { 1 } else { (l_len + text_area_width - 1) / text_area_width };
+                        let sub_rows = if l_len == 0 {
+                            1
+                        } else {
+                            (l_len + text_area_width - 1) / text_area_width
+                        };
 
                         if clicked_screen_row < accumulated_rows + sub_rows {
                             found_line = y;
@@ -478,7 +498,8 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         MouseEventKind::ScrollDown => {
             if editor.scroll_y + 3 < editor.rope.len_lines() {
                 editor.scroll_y += 3;
-                editor.cursor_y = (editor.cursor_y + 3).min(editor.rope.len_lines().saturating_sub(1));
+                editor.cursor_y =
+                    (editor.cursor_y + 3).min(editor.rope.len_lines().saturating_sub(1));
                 editor.clamp_cursor();
             }
         }
@@ -611,7 +632,9 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                         editor.cursor_x = 0;
                     }
                     ('g', KeyCode::Char('h')) => editor.cursor_x = 0,
-                    ('g', KeyCode::Char('l')) => editor.cursor_x = editor.current_line_len().saturating_sub(1),
+                    ('g', KeyCode::Char('l')) => {
+                        editor.cursor_x = editor.current_line_len().saturating_sub(1)
+                    }
                     ('g', KeyCode::Char('e')) => {
                         editor.cursor_y = editor.rope.len_lines().saturating_sub(1);
                         editor.cursor_x = 0;
@@ -699,53 +722,52 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                 _ => {}
             }
         }
-        Mode::Visual { .. } => {
-            match key.code {
-                KeyCode::Esc => {
-                    editor.mode = Mode::Normal;
-                }
-                KeyCode::Char('d') | KeyCode::Char('x') => {
-                    editor.delete_selection();
-                }
-                KeyCode::Char('c') => {
-                    editor.delete_selection();
-                    editor.mode = Mode::Insert;
-                }
-                KeyCode::Char('y') => {
-                    editor.yank_selection();
-                }
-                KeyCode::Char('~') => {
-                    editor.toggle_case();
-                }
-                KeyCode::Char('%') => {
-                    editor.select_all();
-                }
-                KeyCode::Char('h') | KeyCode::Left => {
-                    editor.cursor_x = editor.cursor_x.saturating_sub(1);
-                }
-                KeyCode::Char('l') | KeyCode::Right => {
-                    let max = editor.current_line_len().saturating_sub(1);
-                    if editor.cursor_x < max {
-                        editor.cursor_x += 1;
-                    }
-                }
-                KeyCode::Char('k') | KeyCode::Up => {
-                    editor.cursor_y = editor.cursor_y.saturating_sub(1);
-                }
-                KeyCode::Char('j') | KeyCode::Down => {
-                    if editor.cursor_y + 1 < editor.rope.len_lines() {
-                        editor.cursor_y += 1;
-                    }
-                }
-                _ => {}
+        Mode::Visual { .. } => match key.code {
+            KeyCode::Esc => {
+                editor.mode = Mode::Normal;
             }
-        }
+            KeyCode::Char('d') | KeyCode::Char('x') => {
+                editor.delete_selection();
+            }
+            KeyCode::Char('c') => {
+                editor.delete_selection();
+                editor.mode = Mode::Insert;
+            }
+            KeyCode::Char('y') => {
+                editor.yank_selection();
+            }
+            KeyCode::Char('~') => {
+                editor.toggle_case();
+            }
+            KeyCode::Char('%') => {
+                editor.select_all();
+            }
+            KeyCode::Char('h') | KeyCode::Left => {
+                editor.cursor_x = editor.cursor_x.saturating_sub(1);
+            }
+            KeyCode::Char('l') | KeyCode::Right => {
+                let max = editor.current_line_len().saturating_sub(1);
+                if editor.cursor_x < max {
+                    editor.cursor_x += 1;
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                editor.cursor_y = editor.cursor_y.saturating_sub(1);
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if editor.cursor_y + 1 < editor.rope.len_lines() {
+                    editor.cursor_y += 1;
+                }
+            }
+            _ => {}
+        },
         Mode::Insert => {
             // Priority handling for active autocomplete menu navigation.
             if editor.completion_visible && !editor.completions.is_empty() {
                 match key.code {
                     KeyCode::Down => {
-                        editor.completion_idx = (editor.completion_idx + 1) % editor.completions.len();
+                        editor.completion_idx =
+                            (editor.completion_idx + 1) % editor.completions.len();
                         editor.update_completion_scroll(max_visible);
                         return;
                     }
@@ -942,10 +964,7 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
         let h_chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(sidebar_width),
-                Constraint::Min(10),
-            ])
+            .constraints([Constraint::Length(sidebar_width), Constraint::Min(10)])
             .split(main_chunks[0]);
 
         (Some(h_chunks[0]), h_chunks[1])
@@ -966,9 +985,12 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(border_color))
-            .title(Line::from(vec![
-                Span::styled(" 󰉓 Files ", Style::default().fg(Color::Rgb(220, 225, 235)).add_modifier(Modifier::BOLD)),
-            ]));
+            .title(Line::from(vec![Span::styled(
+                " 󰉓 Files ",
+                Style::default()
+                    .fg(Color::Rgb(220, 225, 235))
+                    .add_modifier(Modifier::BOLD),
+            )]));
 
         let inner_exp = exp_block.inner(exp_rect);
         frame.render_widget(exp_block, exp_rect);
@@ -977,7 +999,8 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
         let mut tree_lines = Vec::new();
         let scroll_start = editor.explorer.scroll;
-        let scroll_end = (scroll_start + inner_exp.height as usize).min(editor.explorer.entries.len());
+        let scroll_end =
+            (scroll_start + inner_exp.height as usize).min(editor.explorer.entries.len());
 
         for i in scroll_start..scroll_end {
             let entry = &editor.explorer.entries[i];
@@ -1018,13 +1041,23 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
     let file_title = editor
         .path
         .as_ref()
-        .map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string())
+        .map(|p| {
+            p.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string()
+        })
         .unwrap_or_else(|| "unnamed".into());
 
     let window_title = Line::from(vec![
         Span::raw(" "),
         Span::styled(format!("{} ", icon), Style::default().fg(icon_color)),
-        Span::styled(file_title, Style::default().fg(Color::Rgb(220, 225, 235)).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            file_title,
+            Style::default()
+                .fg(Color::Rgb(220, 225, 235))
+                .add_modifier(Modifier::BOLD),
+        ),
         if editor.modified {
             Span::styled(" ●", Style::default().fg(Color::Rgb(240, 100, 100)))
         } else {
@@ -1036,7 +1069,11 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
     let editor_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(if editor.focus == Focus::Editor { Color::Rgb(65, 70, 85) } else { Color::Rgb(45, 50, 60) }))
+        .border_style(Style::default().fg(if editor.focus == Focus::Editor {
+            Color::Rgb(65, 70, 85)
+        } else {
+            Color::Rgb(45, 50, 60)
+        }))
         .title(window_title);
 
     let inner_area = editor_block.inner(editor_area);
@@ -1045,7 +1082,9 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
     let total_lines = editor.rope.len_lines().max(1);
     let line_digits = total_lines.to_string().len().max(2);
     let gutter_width = line_digits + 4;
-    let text_area_width = (inner_area.width as usize).saturating_sub(gutter_width).max(1);
+    let text_area_width = (inner_area.width as usize)
+        .saturating_sub(gutter_width)
+        .max(1);
 
     editor.update_scroll(text_area_width, inner_area.height as usize);
 
@@ -1074,7 +1113,9 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         };
 
         let gutter_style = if is_cursor_line {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::Rgb(80, 85, 100))
         };
@@ -1106,13 +1147,28 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             while chunk_start < total_chars && (current_row as usize) < inner_area.height as usize {
                 let chunk_end = (chunk_start + text_area_width).min(total_chars);
                 let (marker, gutter_str, g_style) = if is_first_sub {
-                    (diag_marker, format!("{:>width$} │ ", y + 1, width = line_digits), gutter_style)
+                    (
+                        diag_marker,
+                        format!("{:>width$} │ ", y + 1, width = line_digits),
+                        gutter_style,
+                    )
                 } else {
-                    (" ", format!("{:>width$} ↳ ", "", width = line_digits), Style::default().fg(Color::Rgb(65, 70, 85)))
+                    (
+                        " ",
+                        format!("{:>width$} ↳ ", "", width = line_digits),
+                        Style::default().fg(Color::Rgb(65, 70, 85)),
+                    )
                 };
 
                 let mut sub_spans = vec![
-                    Span::styled(marker, if is_first_sub { diag_style } else { Style::default() }),
+                    Span::styled(
+                        marker,
+                        if is_first_sub {
+                            diag_style
+                        } else {
+                            Style::default()
+                        },
+                    ),
                     Span::styled(gutter_str, g_style),
                 ];
 
@@ -1132,7 +1188,8 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
                 };
 
                 if is_cursor_line && in_chunk && cursor_screen_pos.is_none() {
-                    let cx = inner_area.x + gutter_width as u16 + (editor.cursor_x - chunk_start) as u16;
+                    let cx =
+                        inner_area.x + gutter_width as u16 + (editor.cursor_x - chunk_start) as u16;
                     let cy = inner_area.y + current_row;
                     cursor_screen_pos = Some((cx, cy));
                 }
@@ -1143,7 +1200,11 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
                 is_first_sub = false;
             }
         } else {
-            let (marker, gutter_str, g_style) = (diag_marker, format!("{:>width$} │ ", y + 1, width = line_digits), gutter_style);
+            let (marker, gutter_str, g_style) = (
+                diag_marker,
+                format!("{:>width$} │ ", y + 1, width = line_digits),
+                gutter_style,
+            );
             let mut row_spans = vec![
                 Span::styled(marker, diag_style),
                 Span::styled(gutter_str, g_style),
@@ -1159,7 +1220,12 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
                 let skip_count = if editor.line_wrap { 0 } else { editor.scroll_x };
                 let take_count = text_area_width;
 
-                for (col_idx, (ch, mut st)) in char_styles.into_iter().enumerate().skip(skip_count).take(take_count) {
+                for (col_idx, (ch, mut st)) in char_styles
+                    .into_iter()
+                    .enumerate()
+                    .skip(skip_count)
+                    .take(take_count)
+                {
                     if editor.is_char_selected(y, col_idx) {
                         st = st.bg(Color::Rgb(55, 80, 145)).fg(Color::White);
                     }
@@ -1206,25 +1272,52 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
     let pill_bg = Color::Rgb(35, 38, 48);
     let bar_fg = Color::Rgb(200, 205, 220);
 
-    let error_count = editor.diagnostics.iter().filter(|d| d.severity == 1).count();
-    let warn_count = editor.diagnostics.iter().filter(|d| d.severity == 2).count();
+    let error_count = editor
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == 1)
+        .count();
+    let warn_count = editor
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == 2)
+        .count();
 
-    let sidebar_toggle_badge = if editor.explorer.visible { " 󰉓 Files " } else { " 󰉒 Files " };
-    let wrap_badge = if editor.line_wrap { " 󰖶 Wrap " } else { " 󰖵 NoWrap " };
+    let sidebar_toggle_badge = if editor.explorer.visible {
+        " 󰉓 Files "
+    } else {
+        " 󰉒 Files "
+    };
+    let wrap_badge = if editor.line_wrap {
+        " 󰖶 Wrap "
+    } else {
+        " 󰖵 NoWrap "
+    };
 
     let status_left = Line::from(vec![
         Span::styled(
             badge_text,
-            Style::default().bg(badge_color).fg(Color::Rgb(15, 17, 22)).add_modifier(Modifier::BOLD),
+            Style::default()
+                .bg(badge_color)
+                .fg(Color::Rgb(15, 17, 22))
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled("", Style::default().bg(pill_bg).fg(badge_color)),
         Span::styled(
             sidebar_toggle_badge,
-            Style::default().bg(pill_bg).fg(if editor.explorer.visible { Color::Rgb(100, 180, 255) } else { bar_fg }),
+            Style::default().bg(pill_bg).fg(if editor.explorer.visible {
+                Color::Rgb(100, 180, 255)
+            } else {
+                bar_fg
+            }),
         ),
         Span::styled(
             wrap_badge,
-            Style::default().bg(pill_bg).fg(if editor.line_wrap { Color::Rgb(100, 200, 140) } else { Color::Rgb(140, 145, 160) }),
+            Style::default().bg(pill_bg).fg(if editor.line_wrap {
+                Color::Rgb(100, 200, 140)
+            } else {
+                Color::Rgb(140, 145, 160)
+            }),
         ),
         Span::styled(
             " 󰍉 Cmd ",
@@ -1235,14 +1328,23 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
     let mut diag_indicators = Vec::new();
     if error_count > 0 {
-        diag_indicators.push(Span::styled(format!("  {} ", error_count), Style::default().bg(bar_bg).fg(Color::Rgb(240, 90, 90))));
+        diag_indicators.push(Span::styled(
+            format!("  {} ", error_count),
+            Style::default().bg(bar_bg).fg(Color::Rgb(240, 90, 90)),
+        ));
     }
     if warn_count > 0 {
-        diag_indicators.push(Span::styled(format!(" {} ", warn_count), Style::default().bg(bar_bg).fg(Color::Rgb(245, 185, 60))));
+        diag_indicators.push(Span::styled(
+            format!(" {} ", warn_count),
+            Style::default().bg(bar_bg).fg(Color::Rgb(245, 185, 60)),
+        ));
     }
     if error_count == 0 && warn_count == 0 {
         if let LspStatus::Ready(name) = &editor.lsp_status {
-            diag_indicators.push(Span::styled(format!(" 󰄬 {} ", name), Style::default().bg(bar_bg).fg(Color::Rgb(100, 180, 120))));
+            diag_indicators.push(Span::styled(
+                format!(" 󰄬 {} ", name),
+                Style::default().bg(bar_bg).fg(Color::Rgb(100, 180, 120)),
+            ));
         }
     }
 
@@ -1256,11 +1358,17 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         Span::styled("", Style::default().bg(pill_bg).fg(badge_color)),
         Span::styled(
             format!(" 󰆤 {}:{} ", editor.cursor_y + 1, editor.cursor_x + 1),
-            Style::default().bg(badge_color).fg(Color::Rgb(15, 17, 22)).add_modifier(Modifier::BOLD),
+            Style::default()
+                .bg(badge_color)
+                .fg(Color::Rgb(15, 17, 22))
+                .add_modifier(Modifier::BOLD),
         ),
     ]);
 
-    frame.render_widget(Block::default().style(Style::default().bg(bar_bg)), main_chunks[1]);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(bar_bg)),
+        main_chunks[1],
+    );
     frame.render_widget(Paragraph::new(status_left), main_chunks[1]);
     frame.render_widget(
         Paragraph::new(Line::from(status_right_spans)).alignment(ratatui::layout::Alignment::Right),
@@ -1270,7 +1378,12 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
     // 4. Diagnostics / Bottom Notification Area
     if editor.mode == Mode::Command {
         let prompt_line = Line::from(vec![
-            Span::styled(" :", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " :",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(&editor.command_buffer),
         ]);
         frame.render_widget(Paragraph::new(prompt_line), main_chunks[2]);
@@ -1279,7 +1392,10 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             main_chunks[2].y,
         ));
     } else {
-        let active_diag = editor.diagnostics.iter().find(|d| d.line == editor.cursor_y);
+        let active_diag = editor
+            .diagnostics
+            .iter()
+            .find(|d| d.line == editor.cursor_y);
         let msg_line = if let Some(diag) = active_diag {
             let (d_icon, icon_style) = match diag.severity {
                 1 => ("  ", Style::default().fg(Color::Rgb(240, 90, 90))),
@@ -1288,23 +1404,36 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             };
             Line::from(vec![
                 Span::styled(d_icon, icon_style),
-                Span::styled(&diag.message, Style::default().fg(Color::Rgb(230, 235, 245)).add_modifier(Modifier::ITALIC)),
+                Span::styled(
+                    &diag.message,
+                    Style::default()
+                        .fg(Color::Rgb(230, 235, 245))
+                        .add_modifier(Modifier::ITALIC),
+                ),
             ])
         } else {
             Line::from(vec![
                 Span::styled(" 󰅂 ", Style::default().fg(Color::DarkGray)),
-                Span::styled(&editor.status_msg, Style::default().fg(Color::Rgb(170, 175, 190))),
+                Span::styled(
+                    &editor.status_msg,
+                    Style::default().fg(Color::Rgb(170, 175, 190)),
+                ),
             ])
         };
 
         frame.render_widget(Paragraph::new(msg_line), main_chunks[2]);
 
         // Place terminal cursor
-        let screen_x = inner_area.x + gutter_width as u16 + (editor.cursor_x.saturating_sub(editor.scroll_x)) as u16;
+        let screen_x = inner_area.x
+            + gutter_width as u16
+            + (editor.cursor_x.saturating_sub(editor.scroll_x)) as u16;
         let screen_y = inner_area.y + (editor.cursor_y.saturating_sub(editor.scroll_y)) as u16;
 
         // Floating Auto-Complete Dropdown
-        if editor.mode == Mode::Insert && editor.completion_visible && !editor.completions.is_empty() {
+        if editor.mode == Mode::Insert
+            && editor.completion_visible
+            && !editor.completions.is_empty()
+        {
             let max_visible_items = 6usize;
             let total_items = editor.completions.len();
             let count = total_items.min(max_visible_items);
@@ -1334,9 +1463,16 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
                 let is_sel = i == editor.completion_idx;
 
                 let (kind_icon, kind_color) = completion_kind_icon(item.kind);
-                let item_bg = if is_sel { Color::Rgb(40, 75, 145) } else { Color::Rgb(25, 27, 34) };
+                let item_bg = if is_sel {
+                    Color::Rgb(40, 75, 145)
+                } else {
+                    Color::Rgb(25, 27, 34)
+                };
                 let text_style = if is_sel {
-                    Style::default().bg(item_bg).fg(Color::White).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .bg(item_bg)
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().bg(item_bg).fg(Color::Rgb(215, 220, 230))
                 };
@@ -1365,7 +1501,10 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(Color::Rgb(80, 140, 255)))
                 .style(Style::default().bg(Color::Rgb(25, 27, 34)))
-                .title(Line::from(Span::styled(title_info, Style::default().fg(Color::Rgb(140, 160, 200)))));
+                .title(Line::from(Span::styled(
+                    title_info,
+                    Style::default().fg(Color::Rgb(140, 160, 200)),
+                )));
 
             frame.render_widget(Paragraph::new(list_lines).block(comp_block), popup_rect);
         }
@@ -1400,8 +1539,18 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
         let mut palette_lines = Vec::new();
         palette_lines.push(Line::from(vec![
-            Span::styled(" 󰍉 > ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled(&editor.palette.query, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " 󰍉 > ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                &editor.palette.query,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled("█", Style::default().fg(Color::Rgb(100, 180, 255))),
         ]));
         palette_lines.push(Line::from(Span::styled(
@@ -1416,9 +1565,16 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             let cmd = filtered[i];
             let is_sel = i == editor.palette.selected_idx;
 
-            let row_bg = if is_sel { Color::Rgb(40, 75, 145) } else { Color::Rgb(25, 27, 34) };
+            let row_bg = if is_sel {
+                Color::Rgb(40, 75, 145)
+            } else {
+                Color::Rgb(25, 27, 34)
+            };
             let title_style = if is_sel {
-                Style::default().bg(row_bg).fg(Color::White).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .bg(row_bg)
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().bg(row_bg).fg(Color::Rgb(215, 220, 230))
             };
@@ -1434,11 +1590,17 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
             palette_lines.push(Line::from(vec![
                 Span::styled(" ", Style::default().bg(row_bg)),
-                Span::styled(cmd.icon, Style::default().bg(row_bg).fg(Color::Rgb(100, 180, 255))),
+                Span::styled(
+                    cmd.icon,
+                    Style::default().bg(row_bg).fg(Color::Rgb(100, 180, 255)),
+                ),
                 Span::styled(" ", Style::default().bg(row_bg)),
                 Span::styled(display_title, title_style),
                 Span::styled(" ".repeat(padding), Style::default().bg(row_bg)),
-                Span::styled(format!(" {} ", cmd.shortcut), Style::default().bg(row_bg).fg(Color::Rgb(140, 145, 160))),
+                Span::styled(
+                    format!(" {} ", cmd.shortcut),
+                    Style::default().bg(row_bg).fg(Color::Rgb(140, 145, 160)),
+                ),
             ]));
         }
 
@@ -1447,7 +1609,12 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(Color::Rgb(80, 140, 255)))
             .style(Style::default().bg(Color::Rgb(25, 27, 34)))
-            .title(Line::from(Span::styled(" 󰍉 Command Palette (Esc to close) ", Style::default().fg(Color::Rgb(180, 200, 240)).add_modifier(Modifier::BOLD))));
+            .title(Line::from(Span::styled(
+                " 󰍉 Command Palette (Esc to close) ",
+                Style::default()
+                    .fg(Color::Rgb(180, 200, 240))
+                    .add_modifier(Modifier::BOLD),
+            )));
 
         frame.render_widget(Paragraph::new(palette_lines).block(p_block), palette_rect);
     }

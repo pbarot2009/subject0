@@ -1,0 +1,21 @@
+# clippy.toml
+
+# Allowed technical identifiers and names in doc comments
+doc-valid-idents = [
+    "subject0",
+    "Ratatui",
+    "Crossterm",
+    "Tree-sitter",
+    "Ropey",
+    "Tokio",
+    "JSON-RPC",
+    "DECSCUSR",
+    "stdout",
+    "stdin",
+]
+
+# Cyclomatic complexity threshold for triggering clippy warnings
+cognitive-complexity-threshold = 35
+
+# Warn if any enum has large variant size discrepancies
+enum-variant-size-threshold = 256

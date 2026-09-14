@@ -2,6 +2,13 @@
 name = "subject0"
 version = "0.1.0"
 edition = "2021"
+authors = ["pbarot2009"]
+description = "Modal terminal code editor with LSP client and Tree-sitter highlighting."
+repository = "https://github.com/pbarot2009/subject0"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+keywords = ["editor", "terminal", "tui", "lsp", "modal"]
+categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "s0"
@@ -15,8 +22,15 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 # Text buffer data structure
 ropey = "1.6"
 
-# Asynchronous runtime for LSP and streaming
-tokio = { version = "1.38", features = ["full"] }
+# Asynchronous runtime for LSP communication
+tokio = { version = "1.38", features = [
+    "rt-multi-thread",
+    "process",
+    "sync",
+    "io-util",
+    "macros",
+    "time",
+] }
 
 # Tree-sitter parser and language grammars
 tree-sitter = "0.22"
@@ -29,3 +43,26 @@ serde_json = "1.0"
 
 # Error handling
 anyhow = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[lints.rust]
+unused_must_use = "warn"
+unused_qualifications = "warn"
+
+[lints.clippy]
+# Enable pedantic lints as warnings, allowing specific UI/text-editing edge cases
+pedantic = { level = "warn", priority = -1 }
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+too_many_lines = "allow"
+module_name_repetitions = "allow"
+doc_markdown = "warn"
+manual_string_new = "warn"
+semicolon_if_nothing_returned = "warn"

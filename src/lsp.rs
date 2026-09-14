@@ -17,17 +17,17 @@
 //!    per-language keyword, literal, comment, and identifier highlighting for Rust, Python,
 //!    and Markdown, as well as glyph and color resolution for file trees and completion menus.
 
-use std::{
-    env,
-    path::{Path, PathBuf},
-    process::Stdio,
-};
 use anyhow::{anyhow, Result};
 use ratatui::{
     style::{Color, Modifier, Style},
     text::Span,
 };
 use serde_json::Value;
+use std::{
+    env,
+    path::{Path, PathBuf},
+    process::Stdio,
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{ChildStdin, Command as TokioCommand},
@@ -233,7 +233,10 @@ pub async fn read_lsp_message<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> Res
 ///
 /// # Errors
 /// Returns an error if JSON serialization fails or an I/O write error occurs on `writer`.
-pub async fn send_lsp_message<W: AsyncWriteExt + Unpin>(writer: &mut W, value: &Value) -> Result<()> {
+pub async fn send_lsp_message<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    value: &Value,
+) -> Result<()> {
     let body = serde_json::to_string(value)?;
     let header = format!("Content-Length: {}\r\n\r\n", body.len());
     writer.write_all(header.as_bytes()).await?;
@@ -331,7 +334,9 @@ pub async fn run_lsp_actor(
     });
 
     if send_lsp_message(&mut stdin, &init_req).await.is_err() {
-        let _ = tx.send(LspOutbound::Status(LspStatus::Error("Init request failed".into())));
+        let _ = tx.send(LspOutbound::Status(LspStatus::Error(
+            "Init request failed".into(),
+        )));
         return;
     }
 
@@ -344,7 +349,9 @@ pub async fn run_lsp_actor(
                 }
             }
             Err(_) => {
-                let _ = tx.send(LspOutbound::Status(LspStatus::Error("Init rejected".into())));
+                let _ = tx.send(LspOutbound::Status(LspStatus::Error(
+                    "Init rejected".into(),
+                )));
                 return;
             }
         }
@@ -597,17 +604,23 @@ impl SyntaxEngine {
         if trimmed.starts_with("# ") {
             vec![Span::styled(
                 line_text.to_string(),
-                Style::default().fg(Color::Rgb(80, 200, 240)).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Rgb(80, 200, 240))
+                    .add_modifier(Modifier::BOLD),
             )]
         } else if trimmed.starts_with("## ") {
             vec![Span::styled(
                 line_text.to_string(),
-                Style::default().fg(Color::Rgb(120, 180, 255)).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Rgb(120, 180, 255))
+                    .add_modifier(Modifier::BOLD),
             )]
         } else if trimmed.starts_with("### ") {
             vec![Span::styled(
                 line_text.to_string(),
-                Style::default().fg(Color::Rgb(180, 160, 240)).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Rgb(180, 160, 240))
+                    .add_modifier(Modifier::BOLD),
             )]
         } else if trimmed.starts_with("```") {
             vec![Span::styled(
@@ -640,13 +653,18 @@ impl SyntaxEngine {
 
         while idx < len {
             // Line Comments
-            if (lang == SupportedLanguage::Rust && idx + 1 < len && chars[idx] == '/' && chars[idx + 1] == '/')
+            if (lang == SupportedLanguage::Rust
+                && idx + 1 < len
+                && chars[idx] == '/'
+                && chars[idx + 1] == '/')
                 || (lang == SupportedLanguage::Python && chars[idx] == '#')
             {
                 let rest: String = chars[idx..].iter().collect();
                 spans.push(Span::styled(
                     rest,
-                    Style::default().fg(Color::Rgb(115, 125, 140)).add_modifier(Modifier::ITALIC),
+                    Style::default()
+                        .fg(Color::Rgb(115, 125, 140))
+                        .add_modifier(Modifier::ITALIC),
                 ));
                 break;
             }
@@ -667,7 +685,10 @@ impl SyntaxEngine {
                     end += 1;
                 }
                 let token: String = chars[idx..end].iter().collect();
-                spans.push(Span::styled(token, Style::default().fg(Color::Rgb(150, 215, 120))));
+                spans.push(Span::styled(
+                    token,
+                    Style::default().fg(Color::Rgb(150, 215, 120)),
+                ));
                 idx = end;
                 continue;
             }
@@ -679,7 +700,10 @@ impl SyntaxEngine {
                     end += 1;
                 }
                 let num: String = chars[idx..end].iter().collect();
-                spans.push(Span::styled(num, Style::default().fg(Color::Rgb(250, 175, 95))));
+                spans.push(Span::styled(
+                    num,
+                    Style::default().fg(Color::Rgb(250, 175, 95)),
+                ));
                 idx = end;
                 continue;
             }
@@ -698,7 +722,9 @@ impl SyntaxEngine {
                     let macro_word: String = chars[idx..end].iter().collect();
                     spans.push(Span::styled(
                         macro_word,
-                        Style::default().fg(Color::Rgb(80, 210, 240)).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(Color::Rgb(80, 210, 240))
+                            .add_modifier(Modifier::BOLD),
                     ));
                     idx = end;
                     continue;
@@ -717,18 +743,25 @@ impl SyntaxEngine {
                         | "else" | "impl" | "for" | "in" | "while" | "return" | "use" | "mod"
                         | "async" | "await" | "trait" | "type" | "where" | "loop" | "as"
                         | "break" | "continue" | "const" | "static" | "ref" | "move" => {
-                            Style::default().fg(Color::Rgb(220, 110, 240)).add_modifier(Modifier::BOLD)
+                            Style::default()
+                                .fg(Color::Rgb(220, 110, 240))
+                                .add_modifier(Modifier::BOLD)
                         }
-                        "i8" | "i16" | "i32" | "i64" | "i128" | "u8" | "u16" | "u32" | "u64" | "u128"
-                        | "usize" | "isize" | "f32" | "f64" | "bool" | "char" | "str" | "String"
-                        | "Option" | "Result" | "Some" | "None" | "Ok" | "Err" | "Self" | "self"
-                        | "Vec" | "Box" | "Rc" | "Arc" => {
+                        "i8" | "i16" | "i32" | "i64" | "i128" | "u8" | "u16" | "u32" | "u64"
+                        | "u128" | "usize" | "isize" | "f32" | "f64" | "bool" | "char" | "str"
+                        | "String" | "Option" | "Result" | "Some" | "None" | "Ok" | "Err"
+                        | "Self" | "self" | "Vec" | "Box" | "Rc" | "Arc" => {
                             Style::default().fg(Color::Rgb(240, 200, 90))
                         }
                         _ => {
                             if is_func {
                                 Style::default().fg(Color::Rgb(100, 175, 255))
-                            } else if word.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                            } else if word
+                                .chars()
+                                .next()
+                                .map(|c| c.is_uppercase())
+                                .unwrap_or(false)
+                            {
                                 Style::default().fg(Color::Rgb(240, 200, 90))
                             } else {
                                 Style::default().fg(Color::Rgb(220, 225, 235))
@@ -740,7 +773,9 @@ impl SyntaxEngine {
                         | "import" | "from" | "as" | "with" | "try" | "except" | "finally"
                         | "lambda" | "yield" | "pass" | "break" | "continue" | "in" | "is"
                         | "not" | "and" | "or" | "global" | "nonlocal" | "assert" => {
-                            Style::default().fg(Color::Rgb(220, 110, 240)).add_modifier(Modifier::BOLD)
+                            Style::default()
+                                .fg(Color::Rgb(220, 110, 240))
+                                .add_modifier(Modifier::BOLD)
                         }
                         "True" | "False" | "None" | "self" | "int" | "str" | "list" | "dict"
                         | "set" | "tuple" | "bool" | "float" => {
@@ -749,7 +784,12 @@ impl SyntaxEngine {
                         _ => {
                             if is_func {
                                 Style::default().fg(Color::Rgb(100, 175, 255))
-                            } else if word.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                            } else if word
+                                .chars()
+                                .next()
+                                .map(|c| c.is_uppercase())
+                                .unwrap_or(false)
+                            {
                                 Style::default().fg(Color::Rgb(240, 200, 90))
                             } else {
                                 Style::default().fg(Color::Rgb(220, 225, 235))
@@ -812,12 +852,12 @@ pub fn file_icon_and_color(path: Option<&PathBuf>) -> (&'static str, Color) {
 /// - Other: Text / Default (`"󰈚"`)
 pub fn completion_kind_icon(kind: u64) -> (&'static str, Color) {
     match kind {
-        2 | 3 => ("󰊕", Color::Rgb(80, 200, 240)),  // Method / Function
-        4 => ("󰌗", Color::Rgb(240, 180, 70)),       // Constructor
-        5 | 6 => ("󰫧", Color::Rgb(250, 210, 90)),   // Field / Variable
-        7 | 8 => ("󱡠", Color::Rgb(120, 160, 255)),  // Class / Struct
-        9 => ("󰏗", Color::Rgb(140, 220, 120)),      // Module
-        14 => ("󰌆", Color::Rgb(220, 110, 240)),     // Keyword
-        _ => ("󰈚", Color::Rgb(170, 175, 190)),       // Text
+        2 | 3 => ("󰊕", Color::Rgb(80, 200, 240)), // Method / Function
+        4 => ("󰌗", Color::Rgb(240, 180, 70)),     // Constructor
+        5 | 6 => ("󰫧", Color::Rgb(250, 210, 90)), // Field / Variable
+        7 | 8 => ("󱡠", Color::Rgb(120, 160, 255)), // Class / Struct
+        9 => ("󰏗", Color::Rgb(140, 220, 120)),    // Module
+        14 => ("󰌆", Color::Rgb(220, 110, 240)),   // Keyword
+        _ => ("󰈚", Color::Rgb(170, 175, 190)),    // Text
     }
 }
