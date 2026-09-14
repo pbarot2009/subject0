@@ -72,6 +72,7 @@ pub struct SuggestionItem {
     /// Defaults to [`Self::label`] when the server does not specify an explicit `insertText`.
     pub insert_text: String,
     /// Optional auxiliary information (such as function signature or containing module).
+    #[allow(dead_code)]
     pub detail: Option<String>,
     /// Numeric LSP `CompletionItemKind` discriminant (e.g., `2` for Method, `3` for Function).
     /// Used by [`completion_kind_icon`] to render appropriate UI glyphs.
@@ -269,10 +270,7 @@ pub async fn run_lsp_actor(
     tx: mpsc::UnboundedSender<LspOutbound>,
     initial_text: String,
 ) {
-    let bin_path = if let Some(p) = resolve_binary_path(&server_cmd) { p } else {
-        let _ = tx.send(LspOutbound::Status(LspStatus::NotFound(server_cmd)));
-        return;
-    };
+    let Some(bin_path) = resolve_binary_path(&server_cmd) else { let _ = tx.send(LspOutbound::Status(LspStatus::NotFound(server_cmd))); return; };
 
     let _ = tx.send(LspOutbound::Status(LspStatus::Starting(server_cmd.clone())));
 
@@ -747,11 +745,7 @@ impl SyntaxEngine {
                         _ => {
                             if is_func {
                                 Style::default().fg(Color::Rgb(100, 175, 255))
-                            } else if word
-                                .chars()
-                                .next()
-                                .is_some_and(char::is_uppercase)
-                            {
+                            } else if word.chars().next().is_some_and(char::is_uppercase) {
                                 Style::default().fg(Color::Rgb(240, 200, 90))
                             } else {
                                 Style::default().fg(Color::Rgb(220, 225, 235))
@@ -774,11 +768,7 @@ impl SyntaxEngine {
                         _ => {
                             if is_func {
                                 Style::default().fg(Color::Rgb(100, 175, 255))
-                            } else if word
-                                .chars()
-                                .next()
-                                .is_some_and(char::is_uppercase)
-                            {
+                            } else if word.chars().next().is_some_and(char::is_uppercase) {
                                 Style::default().fg(Color::Rgb(240, 200, 90))
                             } else {
                                 Style::default().fg(Color::Rgb(220, 225, 235))

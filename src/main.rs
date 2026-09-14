@@ -316,8 +316,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
                 // Mode Badge Tap: Toggle between Normal and Insert modes.
                 editor.mode = match editor.mode {
                     Mode::Normal => Mode::Insert,
-                    Mode::Insert => Mode::Normal,
-                    Mode::Command | Mode::Visual { .. } => Mode::Normal,
+                    Mode::Insert | Mode::Command | Mode::Visual { .. } => Mode::Normal,
                 };
                 set_terminal_cursor_style(editor.mode);
                 editor.completion_visible = false;
@@ -389,11 +388,10 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
                     editor.explorer.update_scroll(max_visible);
                 }
             }
-            MouseEventKind::ScrollUp
-                if editor.explorer.selected_idx > 0 => {
-                    editor.explorer.selected_idx -= 1;
-                    editor.explorer.update_scroll(max_visible);
-                }
+            MouseEventKind::ScrollUp if editor.explorer.selected_idx > 0 => {
+                editor.explorer.selected_idx -= 1;
+                editor.explorer.update_scroll(max_visible);
+            }
             _ => {}
         }
         return;
@@ -494,13 +492,11 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
             editor.cursor_y = editor.cursor_y.saturating_sub(3);
             editor.clamp_cursor();
         }
-        MouseEventKind::ScrollDown
-            if editor.scroll_y + 3 < editor.rope.len_lines() => {
-                editor.scroll_y += 3;
-                editor.cursor_y =
-                    (editor.cursor_y + 3).min(editor.rope.len_lines().saturating_sub(1));
-                editor.clamp_cursor();
-            }
+        MouseEventKind::ScrollDown if editor.scroll_y + 3 < editor.rope.len_lines() => {
+            editor.scroll_y += 3;
+            editor.cursor_y = (editor.cursor_y + 3).min(editor.rope.len_lines().saturating_sub(1));
+            editor.clamp_cursor();
+        }
         _ => {}
     }
 }
@@ -752,10 +748,9 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
             KeyCode::Char('k') | KeyCode::Up => {
                 editor.cursor_y = editor.cursor_y.saturating_sub(1);
             }
-            KeyCode::Char('j') | KeyCode::Down
-                if editor.cursor_y + 1 < editor.rope.len_lines() => {
-                    editor.cursor_y += 1;
-                }
+            KeyCode::Char('j') | KeyCode::Down if editor.cursor_y + 1 < editor.rope.len_lines() => {
+                editor.cursor_y += 1;
+            }
             _ => {}
         },
         Mode::Insert => {
@@ -937,6 +932,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
 /// 6. **Popup Overlays**:
 ///    - Floating autocomplete dropdown anchored beside the editing cursor.
 ///    - Centered command palette modal.
+#[allow(clippy::needless_range_loop)]
 fn render_ui(frame: &mut Frame, editor: &mut Editor) {
     let size = frame.area();
 
@@ -1035,14 +1031,15 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
     // 2. Render Document Editor Viewport
     let (icon, icon_color) = file_icon_and_color(editor.path.as_ref());
-    let file_title = editor
-        .path
-        .as_ref().map_or_else(|| "unnamed".into(), |p| {
+    let file_title = editor.path.as_ref().map_or_else(
+        || "unnamed".into(),
+        |p| {
             p.file_name()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string()
-        });
+        },
+    );
 
     let window_title = Line::from(vec![
         Span::raw(" "),
@@ -1265,7 +1262,7 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
     let bar_bg = Color::Rgb(20, 22, 28);
     let pill_bg = Color::Rgb(35, 38, 48);
-    let bar_fg = Color::Rgb(200, 205, 220);
+    let bar_foreground = Color::Rgb(200, 205, 220);
 
     let error_count = editor
         .diagnostics
@@ -1303,7 +1300,7 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             Style::default().bg(pill_bg).fg(if editor.explorer.visible {
                 Color::Rgb(100, 180, 255)
             } else {
-                bar_fg
+                bar_foreground
             }),
         ),
         Span::styled(

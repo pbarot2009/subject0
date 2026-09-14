@@ -402,11 +402,7 @@ impl FileExplorer {
             let dir_path = self.entries[idx].path.clone();
             let children = Self::read_directory(&dir_path, current_depth + 1);
 
-            let mut insert_pos = idx + 1;
-            for child in children {
-                self.entries.insert(insert_pos, child);
-                insert_pos += 1;
-            }
+            let insert_pos = idx + 1; self.entries.splice(insert_pos..insert_pos, children);
         }
     }
 
@@ -425,6 +421,7 @@ impl FileExplorer {
 // -----------------------------------------------------------------------------
 
 /// Primary application state model encapsulating buffer data, UI state, and subsystems.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Editor {
     /// B-tree rope storing the buffer text contents.
     pub rope: Rope,
@@ -694,6 +691,7 @@ impl Editor {
     /// Calculates the half-open linear character range `[start, end)` representing the active visual selection.
     ///
     /// Returns `None` if the editor is not in [`Mode::Visual`].
+    #[allow(clippy::comparison_chain)]
     pub fn selection_range(&self) -> Option<(usize, usize)> {
         if let Mode::Visual { anchor_x, anchor_y } = self.mode {
             let (start_idx, end_idx) = if anchor_y < self.cursor_y {
@@ -991,6 +989,7 @@ impl Editor {
                 None
             };
 
+            #[allow(clippy::match_like_matches_macro)]
             let is_pair = match (char_before, char_after) {
                 ('(', Some(')')) => true,
                 ('[', Some(']')) => true,
