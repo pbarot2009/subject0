@@ -269,12 +269,9 @@ pub async fn run_lsp_actor(
     tx: mpsc::UnboundedSender<LspOutbound>,
     initial_text: String,
 ) {
-    let bin_path = match resolve_binary_path(&server_cmd) {
-        Some(p) => p,
-        None => {
-            let _ = tx.send(LspOutbound::Status(LspStatus::NotFound(server_cmd)));
-            return;
-        }
+    let bin_path = if let Some(p) = resolve_binary_path(&server_cmd) { p } else {
+        let _ = tx.send(LspOutbound::Status(LspStatus::NotFound(server_cmd)));
+        return;
     };
 
     let _ = tx.send(LspOutbound::Status(LspStatus::Starting(server_cmd.clone())));
@@ -342,18 +339,15 @@ pub async fn run_lsp_actor(
 
     // Await response to initialization request (id == 1) before proceeding.
     loop {
-        match read_lsp_message(&mut stdout).await {
-            Ok(msg) => {
-                if msg.get("id").and_then(|v| v.as_i64()) == Some(1) {
-                    break;
-                }
+        if let Ok(msg) = read_lsp_message(&mut stdout).await {
+            if msg.get("id").and_then(Value::as_i64) == Some(1) {
+                break;
             }
-            Err(_) => {
-                let _ = tx.send(LspOutbound::Status(LspStatus::Error(
-                    "Init rejected".into(),
-                )));
-                return;
-            }
+        } else {
+            let _ = tx.send(LspOutbound::Status(LspStatus::Error(
+                "Init rejected".into(),
+            )));
+            return;
         }
     }
 
@@ -437,68 +431,65 @@ pub async fn run_lsp_actor(
                 }
             }
             msg = read_lsp_message(&mut stdout) => {
-                match msg {
-                    Ok(json) => {
-                        // Handle diagnostics notifications published by the server.
-                        if json.get("method").and_then(|m| m.as_str()) == Some("textDocument/publishDiagnostics") {
-                            if let Some(params) = json.get("params") {
-                                let mut items = Vec::new();
-                                if let Some(diag_array) = params.get("diagnostics").and_then(|d| d.as_array()) {
-                                    for d in diag_array {
-                                        let line = d["range"]["start"]["line"].as_u64().unwrap_or(0) as usize;
-                                        let col = d["range"]["start"]["character"].as_u64().unwrap_or(0) as usize;
-                                        let message = d["message"].as_str().unwrap_or("").to_string();
-                                        let severity = d["severity"].as_u64().unwrap_or(1) as u8;
-                                        items.push(DiagnosticItem { line, col, message, severity });
-                                    }
-                                }
-                                let _ = tx.send(LspOutbound::Diagnostics(items));
-                            }
-                        // Handle completion responses matching a previously sent request ID.
-                        } else if let Some(resp_id) = json.get("id").and_then(|id| id.as_i64()) {
-                            let mut results = Vec::new();
-                            let result_val = json.get("result");
-
-                            // LSP completion responses may return either `CompletionItem[]` or `CompletionList { items: [...] }`.
-                            let items_array = result_val.and_then(|r| {
-                                if r.is_array() {
-                                    Some(r.as_array().unwrap())
-                                } else {
-                                    r.get("items").and_then(|it| it.as_array())
-                                }
-                            });
-
-                            if let Some(arr) = items_array {
-                                for item in arr {
-                                    if let Some(label) = item.get("label").and_then(|l| l.as_str()) {
-                                        let insert_text = item
-                                            .get("insertText")
-                                            .and_then(|it| it.as_str())
-                                            .unwrap_or(label)
-                                            .to_string();
-                                        let detail = item
-                                            .get("detail")
-                                            .and_then(|d| d.as_str())
-                                            .map(|s| s.to_string());
-                                        let kind = item.get("kind").and_then(|k| k.as_u64()).unwrap_or(0);
-
-                                        results.push(SuggestionItem {
-                                            label: label.to_string(),
-                                            insert_text,
-                                            detail,
-                                            kind,
-                                        });
-                                    }
+                if let Ok(json) = msg {
+                    // Handle diagnostics notifications published by the server.
+                    if json.get("method").and_then(|m| m.as_str()) == Some("textDocument/publishDiagnostics") {
+                        if let Some(params) = json.get("params") {
+                            let mut items = Vec::new();
+                            if let Some(diag_array) = params.get("diagnostics").and_then(|d| d.as_array()) {
+                                for d in diag_array {
+                                    let line = d["range"]["start"]["line"].as_u64().unwrap_or(0) as usize;
+                                    let col = d["range"]["start"]["character"].as_u64().unwrap_or(0) as usize;
+                                    let message = d["message"].as_str().unwrap_or("").to_string();
+                                    let severity = d["severity"].as_u64().unwrap_or(1) as u8;
+                                    items.push(DiagnosticItem { line, col, message, severity });
                                 }
                             }
-                            let _ = tx.send(LspOutbound::Completions { req_id: resp_id, items: results });
+                            let _ = tx.send(LspOutbound::Diagnostics(items));
                         }
+                    // Handle completion responses matching a previously sent request ID.
+                    } else if let Some(resp_id) = json.get("id").and_then(Value::as_i64) {
+                        let mut results = Vec::new();
+                        let result_val = json.get("result");
+
+                        // LSP completion responses may return either `CompletionItem[]` or `CompletionList { items: [...] }`.
+                        let items_array = result_val.and_then(|r| {
+                            if r.is_array() {
+                                Some(r.as_array().unwrap())
+                            } else {
+                                r.get("items").and_then(|it| it.as_array())
+                            }
+                        });
+
+                        if let Some(arr) = items_array {
+                            for item in arr {
+                                if let Some(label) = item.get("label").and_then(|l| l.as_str()) {
+                                    let insert_text = item
+                                        .get("insertText")
+                                        .and_then(|it| it.as_str())
+                                        .unwrap_or(label)
+                                        .to_string();
+                                    let detail = item
+                                        .get("detail")
+                                        .and_then(|d| d.as_str())
+                                        .map(ToString::to_string);
+                                    let kind = item.get("kind").and_then(Value::as_u64).unwrap_or(0);
+
+                                    results.push(SuggestionItem {
+                                        label: label.to_string(),
+                                        insert_text,
+                                        detail,
+                                        kind,
+                                    });
+                                }
+                            }
+                        }
+                        let _ = tx.send(LspOutbound::Completions { req_id: resp_id, items: results });
                     }
-                    Err(_) => {
-                        // Stream closed or unreadable; notify UI and terminate actor.
-                        let _ = tx.send(LspOutbound::Status(LspStatus::Error("Terminated".into())));
-                        break;
-                    }
+                } else {
+                    // Stream closed or unreadable; notify UI and terminate actor.
+                    let _ = tx.send(LspOutbound::Status(LspStatus::Error("Terminated".into())));
+                    break;
                 }
             }
         }
@@ -759,8 +750,7 @@ impl SyntaxEngine {
                             } else if word
                                 .chars()
                                 .next()
-                                .map(|c| c.is_uppercase())
-                                .unwrap_or(false)
+                                .is_some_and(char::is_uppercase)
                             {
                                 Style::default().fg(Color::Rgb(240, 200, 90))
                             } else {
@@ -787,8 +777,7 @@ impl SyntaxEngine {
                             } else if word
                                 .chars()
                                 .next()
-                                .map(|c| c.is_uppercase())
-                                .unwrap_or(false)
+                                .is_some_and(char::is_uppercase)
                             {
                                 Style::default().fg(Color::Rgb(240, 200, 90))
                             } else {

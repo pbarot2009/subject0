@@ -217,13 +217,13 @@ async fn main() -> Result<()> {
                         // 3. Limit to the top 100 entries to prevent frame-rendering latency.
                         filtered.truncate(100);
 
-                        if !filtered.is_empty() {
+                        if filtered.is_empty() {
+                            editor.completion_visible = false;
+                        } else {
                             editor.completions = filtered;
                             editor.completion_idx = 0;
                             editor.completion_scroll = 0;
                             editor.completion_visible = true;
-                        } else {
-                            editor.completion_visible = false;
                         }
                     }
                 }
@@ -389,12 +389,11 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
                     editor.explorer.update_scroll(max_visible);
                 }
             }
-            MouseEventKind::ScrollUp => {
-                if editor.explorer.selected_idx > 0 {
+            MouseEventKind::ScrollUp
+                if editor.explorer.selected_idx > 0 => {
                     editor.explorer.selected_idx -= 1;
                     editor.explorer.update_scroll(max_visible);
                 }
-            }
             _ => {}
         }
         return;
@@ -439,17 +438,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
             if mouse.row >= viewport_top && mouse.row < viewport_bottom {
                 let clicked_screen_row = (mouse.row - viewport_top) as usize;
 
-                if !editor.line_wrap {
-                    // When wrapping is disabled, 1 terminal row == 1 buffer line.
-                    let target_line = (editor.scroll_y + clicked_screen_row)
-                        .min(editor.rope.len_lines().saturating_sub(1));
-                    editor.cursor_y = target_line;
-                    if mouse.column >= content_left {
-                        editor.cursor_x = editor.scroll_x + (mouse.column - content_left) as usize;
-                    } else {
-                        editor.cursor_x = 0;
-                    }
-                } else {
+                if editor.line_wrap {
                     // When wrapping is enabled, iterate lines and calculate visual sub-rows.
                     let mut accumulated_rows = 0;
                     let mut found_line = editor.rope.len_lines().saturating_sub(1);
@@ -460,7 +449,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
                         let sub_rows = if l_len == 0 {
                             1
                         } else {
-                            (l_len + text_area_width - 1) / text_area_width
+                            l_len.div_ceil(text_area_width)
                         };
 
                         if clicked_screen_row < accumulated_rows + sub_rows {
@@ -479,6 +468,16 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
 
                     editor.cursor_y = found_line;
                     editor.cursor_x = found_col;
+                } else {
+                    // When wrapping is disabled, 1 terminal row == 1 buffer line.
+                    let target_line = (editor.scroll_y + clicked_screen_row)
+                        .min(editor.rope.len_lines().saturating_sub(1));
+                    editor.cursor_y = target_line;
+                    if mouse.column >= content_left {
+                        editor.cursor_x = editor.scroll_x + (mouse.column - content_left) as usize;
+                    } else {
+                        editor.cursor_x = 0;
+                    }
                 }
 
                 editor.clamp_cursor();
@@ -495,14 +494,13 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
             editor.cursor_y = editor.cursor_y.saturating_sub(3);
             editor.clamp_cursor();
         }
-        MouseEventKind::ScrollDown => {
-            if editor.scroll_y + 3 < editor.rope.len_lines() {
+        MouseEventKind::ScrollDown
+            if editor.scroll_y + 3 < editor.rope.len_lines() => {
                 editor.scroll_y += 3;
                 editor.cursor_y =
                     (editor.cursor_y + 3).min(editor.rope.len_lines().saturating_sub(1));
                 editor.clamp_cursor();
             }
-        }
         _ => {}
     }
 }
@@ -633,7 +631,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                     }
                     ('g', KeyCode::Char('h')) => editor.cursor_x = 0,
                     ('g', KeyCode::Char('l')) => {
-                        editor.cursor_x = editor.current_line_len().saturating_sub(1)
+                        editor.cursor_x = editor.current_line_len().saturating_sub(1);
                     }
                     ('g', KeyCode::Char('e')) => {
                         editor.cursor_y = editor.rope.len_lines().saturating_sub(1);
@@ -726,7 +724,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
             KeyCode::Esc => {
                 editor.mode = Mode::Normal;
             }
-            KeyCode::Char('d') | KeyCode::Char('x') => {
+            KeyCode::Char('d' | 'x') => {
                 editor.delete_selection();
             }
             KeyCode::Char('c') => {
@@ -754,11 +752,10 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
             KeyCode::Char('k') | KeyCode::Up => {
                 editor.cursor_y = editor.cursor_y.saturating_sub(1);
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                if editor.cursor_y + 1 < editor.rope.len_lines() {
+            KeyCode::Char('j') | KeyCode::Down
+                if editor.cursor_y + 1 < editor.rope.len_lines() => {
                     editor.cursor_y += 1;
                 }
-            }
             _ => {}
         },
         Mode::Insert => {
@@ -804,15 +801,15 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                 KeyCode::Enter => editor.insert_newline(),
                 KeyCode::Backspace => editor.backspace(),
                 KeyCode::Tab => {
-                    if !editor.completions.is_empty() {
-                        editor.completion_visible = true;
-                        editor.completion_idx = 0;
-                        editor.completion_scroll = 0;
-                    } else {
+                    if editor.completions.is_empty() {
                         // Soft tabs: 4 spaces.
                         for _ in 0..4 {
                             editor.insert_char(' ');
                         }
+                    } else {
+                        editor.completion_visible = true;
+                        editor.completion_idx = 0;
+                        editor.completion_scroll = 0;
                     }
                 }
                 KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1040,18 +1037,16 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
     let (icon, icon_color) = file_icon_and_color(editor.path.as_ref());
     let file_title = editor
         .path
-        .as_ref()
-        .map(|p| {
+        .as_ref().map_or_else(|| "unnamed".into(), |p| {
             p.file_name()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string()
-        })
-        .unwrap_or_else(|| "unnamed".into());
+        });
 
     let window_title = Line::from(vec![
         Span::raw(" "),
-        Span::styled(format!("{} ", icon), Style::default().fg(icon_color)),
+        Span::styled(format!("{icon} "), Style::default().fg(icon_color)),
         Span::styled(
             file_title,
             Style::default()
@@ -1329,20 +1324,20 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
     let mut diag_indicators = Vec::new();
     if error_count > 0 {
         diag_indicators.push(Span::styled(
-            format!("  {} ", error_count),
+            format!("  {error_count} "),
             Style::default().bg(bar_bg).fg(Color::Rgb(240, 90, 90)),
         ));
     }
     if warn_count > 0 {
         diag_indicators.push(Span::styled(
-            format!(" {} ", warn_count),
+            format!(" {warn_count} "),
             Style::default().bg(bar_bg).fg(Color::Rgb(245, 185, 60)),
         ));
     }
     if error_count == 0 && warn_count == 0 {
         if let LspStatus::Ready(name) = &editor.lsp_status {
             diag_indicators.push(Span::styled(
-                format!(" 󰄬 {} ", name),
+                format!(" 󰄬 {name} "),
                 Style::default().bg(bar_bg).fg(Color::Rgb(100, 180, 120)),
             ));
         }
@@ -1352,7 +1347,7 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
     status_right_spans.extend(vec![
         Span::styled("", Style::default().bg(bar_bg).fg(pill_bg)),
         Span::styled(
-            format!("  {}L ", total_lines),
+            format!("  {total_lines}L "),
             Style::default().bg(pill_bg).fg(Color::Rgb(160, 165, 180)),
         ),
         Span::styled("", Style::default().bg(pill_bg).fg(badge_color)),

@@ -851,7 +851,7 @@ impl Editor {
                 } else {
                     c.to_uppercase().next().unwrap_or(c)
                 };
-                self.rope.remove(idx..idx + 1);
+                self.rope.remove(idx..=idx);
                 self.rope.insert_char(idx, toggled);
                 self.cursor_x += 1;
                 self.modified = true;
@@ -872,7 +872,7 @@ impl Editor {
 
         self.snapshot();
         let line_end = self.rope.line_to_char(self.cursor_y + 1) - 1;
-        self.rope.remove(line_end..line_end + 1);
+        self.rope.remove(line_end..=line_end);
 
         let next_line_start = line_end;
         let mut ws_len = 0;
@@ -960,13 +960,13 @@ impl Editor {
         };
 
         if char_before == Some('{') && char_after == Some('}') {
-            let inner_indent = format!("{}    ", indent);
-            let to_insert = format!("\n{}\n{}", inner_indent, indent);
+            let inner_indent = format!("{indent}    ");
+            let to_insert = format!("\n{inner_indent}\n{indent}");
             self.rope.insert(idx, &to_insert);
             self.cursor_y += 1;
             self.cursor_x = inner_indent.chars().count();
         } else {
-            let to_insert = format!("\n{}", indent);
+            let to_insert = format!("\n{indent}");
             self.rope.insert(idx, &to_insert);
             self.cursor_y += 1;
             self.cursor_x = indent.chars().count();
@@ -1001,7 +1001,7 @@ impl Editor {
             };
 
             if is_pair {
-                self.rope.remove(idx - 1..idx + 1);
+                self.rope.remove((idx - 1)..=idx);
             } else {
                 self.rope.remove(idx - 1..idx);
             }
@@ -1066,7 +1066,7 @@ impl Editor {
         if self.cursor_x < line_len {
             self.snapshot();
             let idx = self.char_index();
-            self.rope.remove(idx..idx + 1);
+            self.rope.remove(idx..=idx);
             self.modified = true;
             self.on_buffer_modified();
         }
@@ -1218,7 +1218,7 @@ impl Editor {
             self.palette.selected_idx = 0;
             self.palette.scroll = 0;
         } else if !cmd.is_empty() {
-            self.status_msg = format!("Unknown command: :{}", cmd);
+            self.status_msg = format!("Unknown command: :{cmd}");
         }
     }
 
@@ -1252,14 +1252,12 @@ impl Editor {
             self.scroll_y = self.cursor_y - height + 1;
         }
 
-        if !self.line_wrap {
-            if self.cursor_x < self.scroll_x {
-                self.scroll_x = self.cursor_x;
-            } else if self.cursor_x >= self.scroll_x + width {
-                self.scroll_x = self.cursor_x - width + 1;
-            }
-        } else {
+        if self.line_wrap {
             self.scroll_x = 0;
+        } else if self.cursor_x < self.scroll_x {
+            self.scroll_x = self.cursor_x;
+        } else if self.cursor_x >= self.scroll_x + width {
+            self.scroll_x = self.cursor_x - width + 1;
         }
     }
 }
