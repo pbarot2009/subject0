@@ -180,8 +180,10 @@ pub enum CommandId {
     TriggerCompletion,
     /// Shows picker to select active LSP server for current file.
     SelectLsp,
-    /// Toggles and saves default line wrap in .subject0.
+    /// Save Config to .subject0
     SaveConfig,
+    /// Displays keybindings and user guide modal.
+    ShowHelp,
 }
 
 /// Static descriptor defining metadata for a searchable command palette entry.
@@ -312,6 +314,12 @@ pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
         shortcut: ":cfg",
         icon: "󰄛",
         id: CommandId::SaveConfig,
+    },
+    PaletteCommand {
+        title: "Show Keybindings & Help",
+        shortcut: "? / :help",
+        icon: "󰋖",
+        id: CommandId::ShowHelp,
     },
 ];
 
@@ -581,8 +589,13 @@ pub struct Editor {
     pub explorer: FileExplorer,
     /// Interactive command palette state machine.
     pub palette: CommandPalette,
+    /// Whether the in-editor keybinding help modal is open.
+    pub show_help: bool,
+    /// Viewport vertical scroll for the help modal.
+    pub help_scroll: usize,
     /// Flag signaling the main application event loop to shut down.
     pub should_quit: bool,
+
     /// Persistent configuration loaded from `.subject0`.
     pub config: AppConfig,
     /// LSP server selection modal state.
@@ -673,6 +686,8 @@ impl Editor {
             completion_visible: false,
             explorer,
             palette: CommandPalette::new(),
+            show_help: false,
+            help_scroll: 0,
             should_quit: false,
         })
     }
@@ -1416,6 +1431,10 @@ impl Editor {
                     self.status_msg = "Failed to write .subject0".to_string();
                 }
             }
+            CommandId::ShowHelp => {
+                self.show_help = true;
+                self.help_scroll = 0;
+            }
         }
     }
 
@@ -1490,6 +1509,11 @@ impl Editor {
                 self.palette.selected_idx = 0;
                 self.palette.scroll = 0;
             }
+            "h" | "help" => {
+                self.show_help = true;
+                self.help_scroll = 0;
+            }
+
             _ if !cmd.is_empty() => {
                 self.status_msg = format!("Unknown command: :{cmd}");
             }

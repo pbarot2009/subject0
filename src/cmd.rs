@@ -64,33 +64,113 @@ impl CliArgs {
     }
 
     fn print_version() {
-        println!("subject0 (s0) v{}", env!("CARGO_PKG_VERSION"));
+        let r = "\x1b[0m";
+        let b = "\x1b[1m";
+        let blue = "\x1b[38;2;100;180;255m";
+        let green = "\x1b[38;2;100;200;140m";
+        let yellow = "\x1b[38;2;240;200;90m";
+        let gray = "\x1b[38;2;140;145;160m";
+        let white = "\x1b[38;2;225;230;240m";
+        let ver = env!("CARGO_PKG_VERSION");
+
+        let lines = vec![
+            format!(" {blue}󰈙{r} {b}{white}subject0{r} {gray}(s0){r}  {green}v{ver}{r}"),
+            format!(" {gray}Modal terminal code editor with LSP intelligence{r}"),
+            String::new(),
+            format!(" {yellow}Author:{r}   {white}Prathmesh S. Barot{r}"),
+            format!(" {yellow}License:{r}  {white}MIT OR Apache-2.0{r}"),
+            format!(" {yellow}Source:{r}   {blue}https://github.com/pbarot2009/subject0{r}"),
+        ];
+
+        Self::print_boxed_card(&lines, 56);
     }
 
     fn print_help() {
+        let r = "\x1b[0m";
+        let b = "\x1b[1m";
+        let blue = "\x1b[38;2;100;180;255m";
+        let green = "\x1b[38;2;100;200;140m";
+        let yellow = "\x1b[38;2;240;200;90m";
+        let magenta = "\x1b[38;2;220;110;240m";
+        let gray = "\x1b[38;2;140;145;160m";
+        let white = "\x1b[38;2;225;230;240m";
+        let ver = env!("CARGO_PKG_VERSION");
+
+        let header = vec![format!(
+            " {blue}󰈙{r} {b}{white}subject0{r} {gray}(s0){r} {green}v{ver}{r} {gray}— Terminal Modal Code Editor{r}"
+        )];
+
+        Self::print_boxed_card(&header, 62);
+
         println!(
-            "subject0 (s0) v{} - Modal terminal code editor with LSP and Tree-sitter
+            "
+  {b}{blue}󰅂 USAGE:{r}
+      {white}s0{r} {yellow}[OPTIONS]{r} {green}[PATH]{r} {magenta}[+LINE]{r}
 
-USAGE:
-    s0 [OPTIONS] [PATH] [+LINE]
+  {b}{blue}󰅂 ARGUMENTS:{r}
+      {green}[PATH]{r}             File or folder path {gray}(opens scratch buffer if empty){r}
+      {magenta}[+LINE]{r}            Jump directly to line number {gray}(e.g. +42){r}
 
-ARGUMENTS:
-    [PATH]         File or directory to open (scratch buffer if omitted)
-    [+LINE]        Jump directly to line number (e.g., +25)
+  {b}{blue}󰅂 OPTIONS:{r}
+      {yellow}-h, --help{r}        Show this formatted help menu and exit
+      {yellow}-v, --version{r}     Print version information and metadata
+      {yellow}-w, --wrap{r}        Force soft line wrapping on
+      {yellow}-nw, --no-wrap{r}    Force line wrapping off (horizontal scroll)
+      {yellow}--clean{r}           Bypass workspace and user {gray}.subject0{r} configs
 
-OPTIONS:
-    -h, --help        Print this help message and exit
-    -v, --version     Print version information and exit
-    -w, --wrap        Force enable viewport line wrapping
-    -nw, --no-wrap    Force disable viewport line wrapping
-    --clean           Ignore local and user .subject0 configuration files
+  {b}{blue}󰅂 EXAMPLES:{r}
+      {gray}# Open a file at line 50:{r}
+      {white}s0 src/main.rs +50{r}
 
-EXAMPLES:
-    s0 src/main.rs          Open src/main.rs
-    s0 src/main.rs +45      Open src/main.rs and jump to line 45
-    s0 .                    Open current directory in file explorer sidebar
-    s0 --clean              Open scratch buffer bypassing saved preferences",
-            env!("CARGO_PKG_VERSION")
+      {gray}# Open project directory in the sidebar explorer:{r}
+      {white}s0 .{r}
+
+      {gray}# Launch scratch buffer with no configuration:{r}
+      {white}s0 --clean{r}"
         );
+    }
+
+    /// Renders a bordered card with dynamic padding, guaranteeing 100% border alignment.
+    fn print_boxed_card(lines: &[String], min_width: usize) {
+        let r = "\x1b[0m";
+        let border = "\x1b[38;2;70;75;95m";
+
+        let max_content_width = lines
+            .iter()
+            .map(|l| Self::visible_width(l))
+            .max()
+            .unwrap_or(0);
+        let inner_width = max_content_width.max(min_width);
+
+        // Top border
+        println!("{border}╭{}╮{r}", "─".repeat(inner_width + 2));
+
+        // Content rows with calculated padding
+        for line in lines {
+            let line_w = Self::visible_width(line);
+            let pad = inner_width.saturating_sub(line_w);
+            println!("{border}│{r} {line}{}{border} │{r}", " ".repeat(pad));
+        }
+
+        // Bottom border
+        println!("{border}╰{}╯{r}", "─".repeat(inner_width + 2));
+    }
+
+    /// Computes printable character width by ignoring non-printing ANSI SGR escape codes.
+    fn visible_width(s: &str) -> usize {
+        let mut width = 0;
+        let mut in_escape = false;
+        for c in s.chars() {
+            if c == '\x1b' {
+                in_escape = true;
+            } else if in_escape {
+                if c.is_ascii_alphabetic() {
+                    in_escape = false;
+                }
+            } else {
+                width += 1;
+            }
+        }
+        width
     }
 }

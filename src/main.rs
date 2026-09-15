@@ -44,9 +44,8 @@ mod lsp;
 
 use std::{
     cmp::Ordering,
-    env,
     io::{stdout, Write},
-    path::{Path, PathBuf},
+    path::Path,
     time::Duration,
 };
 
@@ -319,7 +318,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
     let viewport_top = 1u16;
     let viewport_bottom = size.height.saturating_sub(3);
 
-    // 1. Command Palette Touch Events
+    // 1. Intercept Command Palette Key Events
     if editor.palette.visible {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             let width = 46u16.min(size.width.saturating_sub(2));
@@ -568,6 +567,29 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
+    // Intercept In-Editor Help Modal Navigation
+    if editor.show_help {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q' | '?') => {
+                editor.show_help = false;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                editor.help_scroll = editor.help_scroll.saturating_add(1);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                editor.help_scroll = editor.help_scroll.saturating_sub(1);
+            }
+            KeyCode::PageDown => {
+                editor.help_scroll = editor.help_scroll.saturating_add(8);
+            }
+            KeyCode::PageUp => {
+                editor.help_scroll = editor.help_scroll.saturating_sub(8);
+            }
+            _ => {}
+        }
+        return;
+    }
+
     let prev_mode = editor.mode;
     let max_visible = 6usize;
 
@@ -808,6 +830,10 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                     }
                 }
                 KeyCode::Char('x') => editor.delete_under_cursor(),
+                KeyCode::Char('?') => {
+                    editor.show_help = true;
+                    editor.help_scroll = 0;
+                }
                 _ => {}
             }
         }
@@ -1806,5 +1832,155 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             )));
 
         frame.render_widget(Paragraph::new(lines).block(block), picker_rect);
+    }
+
+    // 7. Render In-Editor Help Modal
+    if editor.show_help {
+        let width = 64u16.min(size.width.saturating_sub(4));
+        let height = 22u16.min(size.height.saturating_sub(2));
+        let x = (size.width.saturating_sub(width)) / 2;
+        let y = (size.height.saturating_sub(height)) / 2;
+
+        let help_rect = Rect::new(x, y, width, height);
+        frame.render_widget(Clear, help_rect);
+
+        let help_block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Rgb(100, 180, 255)))
+            .style(Style::default().bg(Color::Rgb(22, 25, 32)))
+            .title(Line::from(vec![
+                Span::styled(
+                    " 󰋖 subject0 Keybindings & Help ",
+                    Style::default()
+                        .fg(Color::Rgb(240, 200, 90))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "(Esc to close) ",
+                    Style::default().fg(Color::Rgb(140, 145, 160)),
+                ),
+            ]));
+
+        let inner_rect = help_block.inner(help_rect);
+        frame.render_widget(help_block, help_rect);
+
+        let c_sec = Style::default()
+            .fg(Color::Rgb(80, 210, 240))
+            .add_modifier(Modifier::BOLD);
+        let c_key = Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
+        let c_desc = Style::default().fg(Color::Rgb(215, 220, 230));
+
+        let content = vec![
+            Line::from(Span::styled("NORMAL MODE MOTIONS", c_sec)),
+            Line::from(vec![
+                Span::styled("  h, j, k, l     ", c_key),
+                Span::styled("Move cursor left, down, up, right", c_desc),
+            ]),
+            Line::from(vec![
+                Span::styled("  0, $           ", c_key),
+                Span::styled("Move to start / end of line", c_desc),
+            ]),
+            Line::from(vec![
+                Span::styled("  gg, G          ", c_key),
+                Span::styled("Jump to top / bottom of document", c_desc),
+            ]),
+            Line::from(vec![
+                Span::styled("  i, I, a, A     ", c_key),
+                Span::styled("Enter Insert mode (cursor/start/after/end)", c_desc),
+            ]),
+            Line::from(vec![
+                Span::styled("  o, O           ", c_key),
+                Span::styled("Insert new line below / above", c_desc),
+            ]),
+            Line::from(vec![
+                Span::styled("  dd, x          ", c_key),
+                Span::styled("Cut current line / character into clipboard", c_desc),
+            ]),
+            Line::from(vec![
+                Span::styled("  y, p, u        ", c_key),
+                Span::styled("Yank line, Paste clipboard, Undo edit", c_desc),
+            ]),
+            Line::from(vec![
+                Span::styled("  ~, J           ", c_key),
+                Span::styled("Toggle character case, Join lines", c_desc),
+            ]),
+            Line::from(vec![
+                Span::styled("  v, %           ", c_key),
+                Span::styled("Enter Visual mode, Select entire buffer", c_desc),
+            ]),
+            Line::from(vec![
+                Span::styled("  Space          ", c_key),
+                Span::styled("Open Command Palette", c_desc),
+            ]),
+            Line::from(vec![
+                Span::styled("  ?              ", c_key),
+                Span::styled("Open this Keybindings & Help modal", c_desc),
+            ]),
+            Line::from(Span::raw("")),
+            Line::from(Span::styled("INSERT MODE", c_sec)),
+            Line::from(vec![
+                Span::styled("  Esc            ", c_key),
+                Span::styled("Return to Normal mode", c_desc),
+            ]),
+            Line::from(vec![
+                Span::styled("  Tab            ", c_key),
+                Span::styled("Insert 4 soft spaces (or accept completion)", c_desc),
+            ]),
+            Line::from(vec![
+                Span::styled("  Ctrl-Space     ", c_key),
+                Span::styled("Trigger LSP completion popup manually", c_desc),
+            ]),
+            Line::from(vec![
+                Span::styled("  (, [, {, \", '  ", c_key),
+                Span::styled("Auto-closing delimiter pairs", c_desc),
+            ]),
+            Line::from(Span::raw("")),
+            Line::from(Span::styled("COMMAND MODE & SHORTCUTS", c_sec)),
+            Line::from(vec![
+                Span::styled("  :w [file]      ", c_key),
+                Span::styled("Save buffer to disk", c_desc),
+            ]),
+            Line::from(vec![
+                Span::styled("  :q, :q!        ", c_key),
+                Span::styled("Quit editor (force quit without saving)", c_desc),
+            ]),
+            Line::from(vec![
+                Span::styled("  :wq            ", c_key),
+                Span::styled("Save and exit", c_desc),
+            ]),
+            Line::from(vec![
+                Span::styled("  :lsp           ", c_key),
+                Span::styled("Open Language Server picker", c_desc),
+            ]),
+            Line::from(vec![
+                Span::styled("  :cfg           ", c_key),
+                Span::styled("Save configuration to .subject0", c_desc),
+            ]),
+            Line::from(vec![
+                Span::styled("  :wrap          ", c_key),
+                Span::styled("Toggle soft line-wrapping", c_desc),
+            ]),
+            Line::from(vec![
+                Span::styled("  Ctrl-E / :e    ", c_key),
+                Span::styled("Toggle File Explorer sidebar", c_desc),
+            ]),
+        ];
+
+        let total_lines = content.len();
+        let visible_lines = inner_rect.height as usize;
+        let max_scroll = total_lines.saturating_sub(visible_lines);
+        if editor.help_scroll > max_scroll {
+            editor.help_scroll = max_scroll;
+        }
+
+        let slice: Vec<Line> = content
+            .into_iter()
+            .skip(editor.help_scroll)
+            .take(visible_lines)
+            .collect();
+        frame.render_widget(Paragraph::new(slice), inner_rect);
     }
 }
