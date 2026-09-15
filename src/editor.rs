@@ -1240,18 +1240,59 @@ impl Editor {
 
     /// Recalculates horizontal and vertical scroll offsets so the cursor remains visible.
     pub fn update_scroll(&mut self, width: usize, height: usize) {
+        if height == 0 {
+            return;
+        }
+
         if self.cursor_y < self.scroll_y {
             self.scroll_y = self.cursor_y;
-        } else if self.cursor_y >= self.scroll_y + height {
-            self.scroll_y = self.cursor_y - height + 1;
         }
 
         if self.line_wrap {
             self.scroll_x = 0;
-        } else if self.cursor_x < self.scroll_x {
-            self.scroll_x = self.cursor_x;
-        } else if self.cursor_x >= self.scroll_x + width {
-            self.scroll_x = self.cursor_x - width + 1;
+            let effective_width = width.max(1);
+
+            // Calculate the actual visual screen row of the cursor relative to scroll_y
+            let calc_cursor_visual_row =
+                |start_y: usize, cursor_y: usize, cursor_x: usize, rope: &Rope| -> usize {
+                    let mut rows = 0;
+                    for y in start_y..cursor_y {
+                        let len = line_len(rope, y);
+                        let line_rows = if len == 0 {
+                            1
+                        } else {
+                            len.div_ceil(effective_width)
+                        };
+                        rows += line_rows;
+                    }
+                    let cur_len = line_len(rope, cursor_y);
+                    let cur_rows = if cur_len == 0 {
+                        1
+                    } else {
+                        cur_len.div_ceil(effective_width)
+                    };
+                    let cursor_sub_row =
+                        (cursor_x / effective_width).min(cur_rows.saturating_sub(1));
+                    rows + cursor_sub_row
+                };
+
+            // Advance scroll_y as soon as the cursor hits or exceeds the viewport bottom
+            while self.scroll_y < self.cursor_y
+                && calc_cursor_visual_row(self.scroll_y, self.cursor_y, self.cursor_x, &self.rope)
+                    >= height
+            {
+                self.scroll_y += 1;
+            }
+        } else {
+            if self.cursor_y >= self.scroll_y + height {
+                self.scroll_y = self.cursor_y - height + 1;
+            }
+
+            if self.cursor_x < self.scroll_x {
+                self.scroll_x = self.cursor_x;
+            } else if self.cursor_x >= self.scroll_x + width {
+                self.scroll_x = self.cursor_x - width + 1;
+            }
         }
     }
 }
