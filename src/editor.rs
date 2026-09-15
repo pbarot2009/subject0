@@ -717,23 +717,29 @@ impl Editor {
         self.doc_version = 1;
 
         if let Some(tx) = &self.lsp_tx {
-            let ext = path_buf.extension().and_then(|e| e.to_str()).unwrap_or("");
-            let lang_id = match ext {
-                "rs" => "rust",
-                "py" => "python",
-                _ => "",
-            };
-            if !lang_id.is_empty() {
+            let lang_id = self.syntax.language.lsp_id();
+            if !lang_id.is_empty() && lang_id != "plaintext" {
                 let _ = tx.send(LspInbound::OpenFile {
                     path: path_buf.clone(),
                     text,
                     lang_id: lang_id.to_string(),
                 });
+                self.request_semantic_tokens();
             }
         }
 
         self.status_msg = format!("Opened {}", path_buf.display());
         Ok(())
+    }
+
+    /// Dispatches an asynchronous `textDocument/semanticTokens/full` request to the LSP actor.
+    pub fn request_semantic_tokens(&mut self) {
+        if let Some(tx) = &self.lsp_tx {
+            self.lsp_req_id += 1;
+            let _ = tx.send(LspInbound::SemanticTokens {
+                req_id: self.lsp_req_id,
+            });
+        }
     }
 
     /// Pushes a snapshot of the current [`Rope`] onto `undo_stack`.
@@ -1353,6 +1359,7 @@ impl Editor {
 
             if let Some(tx) = &self.lsp_tx {
                 let _ = tx.send(LspInbound::Save);
+                self.request_semantic_tokens();
             }
             Ok(())
         } else {

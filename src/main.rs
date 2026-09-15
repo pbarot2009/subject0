@@ -216,7 +216,16 @@ async fn main() -> Result<()> {
         // Drain incoming messages emitted by the background LSP actor.
         while let Ok(msg) = lsp_out_rx.try_recv() {
             match msg {
-                LspOutbound::Status(s) => editor.lsp_status = s,
+                LspOutbound::Status(s) => {
+                    let was_ready = matches!(s, LspStatus::Ready(_));
+                    editor.lsp_status = s;
+                    if was_ready {
+                        editor.request_semantic_tokens();
+                    }
+                }
+                LspOutbound::SemanticTokens { tokens } => {
+                    editor.syntax.set_semantic_tokens(tokens);
+                }
                 LspOutbound::Diagnostics(d) => editor.diagnostics = d,
                 LspOutbound::Completions { req_id, items } => {
                     // Only process completions corresponding to the latest request sequence.
@@ -1247,13 +1256,35 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
         // Tokenize through SyntaxEngine preserving Tree-sitter colors.
         let syntax_spans = editor.syntax.highlight_line(&line_str, y);
-        let mut char_styles: Vec<(char, Style)> = Vec::with_capacity(line_str.len());
+        let mut char_styles: Vec<(char, Style)> = Vec::with_capacity(line_str.len() * 2);
         for span in syntax_spans {
             let st = span.style;
             for ch in span.content.chars() {
-                char_styles.push((ch, st));
+                if ch == '\t' {
+                    for _ in 0..4 {
+                        char_styles.push((' ', st));
+                    }
+                } else {
+                    char_styles.push((ch, st));
+                }
             }
         }
+
+        // Map buffer cursor_x to visual screen column considering expanded tabs
+        let visual_cursor_x = {
+            let mut vx = 0;
+            for (idx, ch) in line_str.chars().enumerate() {
+                if idx >= editor.cursor_x {
+                    break;
+                }
+                if ch == '\t' {
+                    vx += 4;
+                } else {
+                    vx += 1;
+                }
+            }
+            vx
+        };
 
         if editor.line_wrap && char_styles.len() > text_area_width {
             let total_chars = char_styles.len();
@@ -1298,14 +1329,14 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
                 let is_last_chunk = chunk_end == total_chars;
                 let in_chunk = if is_last_chunk {
-                    editor.cursor_x >= chunk_start && editor.cursor_x <= chunk_end
+                    visual_cursor_x >= chunk_start && visual_cursor_x <= chunk_end
                 } else {
-                    editor.cursor_x >= chunk_start && editor.cursor_x < chunk_end
+                    visual_cursor_x >= chunk_start && visual_cursor_x < chunk_end
                 };
 
                 if is_cursor_line && in_chunk && cursor_screen_pos.is_none() {
                     let cx =
-                        inner_area.x + gutter_width as u16 + (editor.cursor_x - chunk_start) as u16;
+                        inner_area.x + gutter_width as u16 + (visual_cursor_x - chunk_start) as u16;
                     let cy = inner_area.y + current_row;
                     cursor_screen_pos = Some((cx, cy));
                 }
@@ -1349,7 +1380,7 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
                 }
 
                 if is_cursor_line && cursor_screen_pos.is_none() {
-                    let visible_x = editor.cursor_x.saturating_sub(skip_count);
+                    let visible_x = visual_cursor_x.saturating_sub(skip_count);
                     if visible_x < text_area_width {
                         let cx = inner_area.x + gutter_width as u16 + visible_x as u16;
                         let cy = inner_area.y + current_row;
