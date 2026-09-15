@@ -613,24 +613,36 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
             editor.completion_visible = false;
             // Evaluate pending multi-character chords (e.g., 'dd', 'gg').
             if let Some(pending) = editor.pending_key.take() {
-                match (pending, key.code) {
-                    ('d', KeyCode::Char('d')) => editor.delete_current_line(),
+                let handled = match (pending, key.code) {
+                    ('d', KeyCode::Char('d')) => {
+                        editor.delete_current_line();
+                        true
+                    }
                     ('g', KeyCode::Char('g')) => {
                         editor.cursor_y = 0;
                         editor.cursor_x = 0;
+                        true
                     }
-                    ('g', KeyCode::Char('h')) => editor.cursor_x = 0,
+                    ('g', KeyCode::Char('h')) => {
+                        editor.cursor_x = 0;
+                        true
+                    }
                     ('g', KeyCode::Char('l')) => {
                         editor.cursor_x = editor.current_line_len().saturating_sub(1);
+                        true
                     }
                     ('g', KeyCode::Char('e')) => {
                         editor.cursor_y = editor.rope.len_lines().saturating_sub(1);
                         editor.cursor_x = 0;
+                        true
                     }
-                    _ => {}
+                    _ => false,
+                };
+                if handled || key.code == KeyCode::Esc {
+                    editor.clamp_cursor();
+                    return;
                 }
-                editor.clamp_cursor();
-                return;
+                // Unmatched chords fall through to process the incoming key in Normal mode
             }
 
             match key.code {
@@ -1407,11 +1419,9 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
         frame.render_widget(Paragraph::new(msg_line), main_chunks[2]);
 
-        // Place terminal cursor
-        let screen_x = inner_area.x
-            + gutter_width as u16
-            + (editor.cursor_x.saturating_sub(editor.scroll_x)) as u16;
-        let screen_y = inner_area.y + (editor.cursor_y.saturating_sub(editor.scroll_y)) as u16;
+        // Use exact screen coordinates computed during line rendering
+        let (screen_x, screen_y) =
+            cursor_screen_pos.unwrap_or((inner_area.x + gutter_width as u16, inner_area.y));
 
         // Floating Auto-Complete Dropdown
         if editor.mode == Mode::Insert

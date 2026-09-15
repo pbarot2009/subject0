@@ -431,22 +431,28 @@ pub async fn run_lsp_actor(
             }
             msg = read_lsp_message(&mut stdout) => {
                 if let Ok(json) = msg {
-                    // Handle diagnostics notifications published by the server.
+                                        // Handle diagnostics notifications published by the server.
                     if json.get("method").and_then(|m| m.as_str()) == Some("textDocument/publishDiagnostics") {
                         if let Some(params) = json.get("params") {
-                            let mut items = Vec::new();
-                            if let Some(diag_array) = params.get("diagnostics").and_then(|d| d.as_array()) {
-                                for d in diag_array {
-                                    let line = d["range"]["start"]["line"].as_u64().unwrap_or(0) as usize;
-                                    let col = d["range"]["start"]["character"].as_u64().unwrap_or(0) as usize;
-                                    let message = d["message"].as_str().unwrap_or("").to_string();
-                                    let severity = d["severity"].as_u64().unwrap_or(1) as u8;
-                                    items.push(DiagnosticItem { line, col, message, severity });
+                            let diag_uri = params.get("uri").and_then(|u| u.as_str()).unwrap_or("");
+                            if diag_uri == current_file_uri
+                                || diag_uri.trim_end_matches('/') == current_file_uri.trim_end_matches('/')
+                            {
+                                let mut items = Vec::new();
+                                if let Some(diag_array) = params.get("diagnostics").and_then(|d| d.as_array()) {
+                                    for d in diag_array {
+                                        let line = d["range"]["start"]["line"].as_u64().unwrap_or(0) as usize;
+                                        let col = d["range"]["start"]["character"].as_u64().unwrap_or(0) as usize;
+                                        let message = d["message"].as_str().unwrap_or("").to_string();
+                                        let severity = d["severity"].as_u64().unwrap_or(1) as u8;
+                                        items.push(DiagnosticItem { line, col, message, severity });
+                                    }
                                 }
+                                let _ = tx.send(LspOutbound::Diagnostics(items));
                             }
-                            let _ = tx.send(LspOutbound::Diagnostics(items));
                         }
                     // Handle completion responses matching a previously sent request ID.
+
                     } else if let Some(resp_id) = json.get("id").and_then(Value::as_i64) {
                         let mut results = Vec::new();
                         let result_val = json.get("result");
