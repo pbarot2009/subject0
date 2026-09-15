@@ -36,7 +36,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use ropey::Rope;
 use tokio::sync::mpsc;
 
@@ -804,7 +804,11 @@ impl Editor {
         self.snapshot();
         let idx = self.char_index();
         self.rope.insert(idx, &self.clipboard);
-        self.cursor_x += self.clipboard.chars().count();
+        let end_idx = idx + self.clipboard.chars().count();
+        let new_line = self.rope.char_to_line(end_idx);
+        let line_start = self.rope.line_to_char(new_line);
+        self.cursor_y = new_line;
+        self.cursor_x = end_idx.saturating_sub(line_start);
         self.modified = true;
         self.clamp_cursor();
         self.on_buffer_modified();
@@ -1108,10 +1112,11 @@ impl Editor {
             if let Some(tx) = &self.lsp_tx {
                 let _ = tx.send(LspInbound::Save);
             }
+            Ok(())
         } else {
             self.status_msg = "No file name (use :w <name>)".to_string();
+            Err(anyhow!("No file name specified"))
         }
-        Ok(())
     }
 
     /// Executes an action selected from the command palette overlay.
@@ -1181,38 +1186,67 @@ impl Editor {
         let cmd = self.command_buffer.trim().to_string();
         self.command_buffer.clear();
 
-        if cmd == "q" {
-            if self.modified {
-                self.status_msg = "Unsaved changes! Use :q! to force quit".to_string();
-            } else {
+        let mut parts = cmd.split_whitespace();
+        let action = parts.next().unwrap_or("");
+        let arg = parts.next();
+
+        match action {
+            "q" => {
+                if self.modified {
+                    self.status_msg = "Unsaved changes! Use :q! to force quit".to_string();
+                } else {
+                    self.should_quit = true;
+                }
+            }
+            "q!" => {
                 self.should_quit = true;
             }
-        } else if cmd == "q!" {
-            self.should_quit = true;
-        } else if cmd == "w" {
-            let _ = self.save();
-        } else if cmd == "wq" {
-            if self.save().is_ok() {
-                self.should_quit = true;
+            "w" => {
+                if let Some(filename) = arg {
+                    let new_path = PathBuf::from(filename);
+                    self.syntax = SyntaxEngine::new(Some(&new_path));
+                    let text = self.rope.to_string();
+                    self.syntax.reparse(&text);
+                    self.path = Some(new_path);
+                }
+                let _ = self.save();
             }
-        } else if cmd == "wrap" {
-            self.line_wrap = !self.line_wrap;
-            self.status_msg = format!("Line Wrap: {}", if self.line_wrap { "ON" } else { "OFF" });
-        } else if cmd == "e" || cmd == "explore" {
-            self.explorer.visible = !self.explorer.visible;
-            if self.explorer.visible {
-                self.explorer.refresh();
-                self.focus = Focus::Explorer;
-            } else {
-                self.focus = Focus::Editor;
+            "wq" => {
+                if let Some(filename) = arg {
+                    let new_path = PathBuf::from(filename);
+                    self.syntax = SyntaxEngine::new(Some(&new_path));
+                    let text = self.rope.to_string();
+                    self.syntax.reparse(&text);
+                    self.path = Some(new_path);
+                }
+                if self.save().is_ok() {
+                    self.should_quit = true;
+                }
             }
-        } else if cmd == "p" || cmd == "menu" || cmd == "commands" || cmd == "pal" {
-            self.palette.visible = true;
-            self.palette.query.clear();
-            self.palette.selected_idx = 0;
-            self.palette.scroll = 0;
-        } else if !cmd.is_empty() {
-            self.status_msg = format!("Unknown command: :{cmd}");
+            "wrap" => {
+                self.line_wrap = !self.line_wrap;
+                self.status_msg =
+                    format!("Line Wrap: {}", if self.line_wrap { "ON" } else { "OFF" });
+            }
+            "e" | "explore" => {
+                self.explorer.visible = !self.explorer.visible;
+                if self.explorer.visible {
+                    self.explorer.refresh();
+                    self.focus = Focus::Explorer;
+                } else {
+                    self.focus = Focus::Editor;
+                }
+            }
+            "p" | "menu" | "commands" | "pal" => {
+                self.palette.visible = true;
+                self.palette.query.clear();
+                self.palette.selected_idx = 0;
+                self.palette.scroll = 0;
+            }
+            _ if !cmd.is_empty() => {
+                self.status_msg = format!("Unknown command: :{cmd}");
+            }
+            _ => {}
         }
     }
 
