@@ -392,6 +392,20 @@ impl FileExplorer {
                 }
             }
             self.entries.drain(idx + 1..idx + 1 + remove_count);
+
+            // Re-anchor selection if it was pointing to a removed child or downstream entry
+            if self.selected_idx > idx && self.selected_idx <= idx + remove_count {
+                self.selected_idx = idx;
+            } else if self.selected_idx > idx + remove_count {
+                self.selected_idx = self.selected_idx.saturating_sub(remove_count);
+            }
+
+            if !self.entries.is_empty() && self.selected_idx >= self.entries.len() {
+                self.selected_idx = self.entries.len().saturating_sub(1);
+            }
+            if self.scroll >= self.entries.len() {
+                self.scroll = self.entries.len().saturating_sub(1);
+            }
         } else {
             self.entries[idx].expanded = true;
             let current_depth = self.entries[idx].depth;
@@ -1116,6 +1130,7 @@ impl Editor {
             return;
         }
 
+        self.snapshot();
         let item = &self.completions[self.completion_idx];
         let replacement = item.insert_text.clone();
         let prefix = self.current_word_prefix();
@@ -1127,9 +1142,15 @@ impl Editor {
         self.rope.remove(start..idx);
         self.rope.insert(start, &replacement);
 
-        self.cursor_x = self.cursor_x - prefix_len + replacement.chars().count();
+        let end_idx = start + replacement.chars().count();
+        let new_line = self.rope.char_to_line(end_idx);
+        let line_start = self.rope.line_to_char(new_line);
+        self.cursor_y = new_line;
+        self.cursor_x = end_idx.saturating_sub(line_start);
+
         self.modified = true;
         self.completion_visible = false;
+        self.clamp_cursor();
         self.on_buffer_modified();
     }
 
