@@ -24,10 +24,11 @@ use ratatui::{
 };
 use serde_json::Value;
 use std::{
-    env,
+    env, fs,
     path::{Path, PathBuf},
     process::Stdio,
 };
+
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{ChildStdin, Command as TokioCommand},
@@ -112,7 +113,7 @@ pub enum CanonicalTokenType {
 impl CanonicalTokenType {
     pub fn from_name(name: &str) -> Self {
         match name {
-            "keyword" | "boolean" | "conditional" | "repeat" | "modifier" => Self::Keyword,
+            "keyword" | "boolean" | "conditional" | "repeat" => Self::Keyword,
             "type" | "class" | "struct" | "enum" | "union" | "interface" | "typeParameter"
             | "builtinType" => Self::Type,
             "function" | "method" => Self::Function,
@@ -123,9 +124,54 @@ impl CanonicalTokenType {
             "number" | "float" => Self::Number,
             "comment" | "documentation" => Self::Comment,
             "operator" => Self::Operator,
-            "macro" | "attribute" | "decorator" => Self::Macro,
+            "macro" | "attribute" => Self::Macro,
             "namespace" | "module" | "package" => Self::Namespace,
             _ => Self::Other,
+        }
+    }
+
+    /// Maps standard Tree-sitter query capture names into unified theme tokens.
+    pub fn from_query_capture(capture_name: &str) -> Self {
+        if capture_name.starts_with("keyword")
+            || capture_name.starts_with("repeat")
+            || capture_name.starts_with("conditional")
+            || capture_name.starts_with("include")
+        {
+            Self::Keyword
+        } else if capture_name.starts_with("type")
+            || capture_name.starts_with("structure")
+            || capture_name.starts_with("class")
+            || capture_name.starts_with("storageclass")
+        {
+            Self::Type
+        } else if capture_name.starts_with("function")
+            || capture_name.starts_with("method")
+            || capture_name.starts_with("constructor")
+        {
+            Self::Function
+        } else if capture_name.starts_with("variable.parameter") || capture_name == "parameter" {
+            Self::Parameter
+        } else if capture_name.starts_with("variable") {
+            Self::Variable
+        } else if capture_name.starts_with("property") || capture_name.starts_with("field") {
+            Self::Property
+        } else if capture_name.starts_with("string") || capture_name.starts_with("character") {
+            Self::String
+        } else if capture_name.starts_with("number")
+            || capture_name.starts_with("float")
+            || capture_name.starts_with("boolean")
+        {
+            Self::Number
+        } else if capture_name.starts_with("comment") {
+            Self::Comment
+        } else if capture_name.starts_with("operator") {
+            Self::Operator
+        } else if capture_name.starts_with("macro") || capture_name.starts_with("attribute") {
+            Self::Macro
+        } else if capture_name.starts_with("module") || capture_name.starts_with("namespace") {
+            Self::Namespace
+        } else {
+            Self::Other
         }
     }
 }
@@ -705,15 +751,16 @@ pub async fn run_lsp_actor(
 
 // === Dynamic Tree-Sitter Loader via libloading ===
 
-/// Encapsulates a dynamically loaded Tree-sitter parser from a shared object library.
+/// Encapsulates a dynamically loaded Tree-sitter parser and its compiled highlight query.
 pub struct DynamicGrammar {
     pub parser: tree_sitter::Parser,
+    pub query: Option<tree_sitter::Query>,
     _lib: libloading::Library,
 }
 
 impl DynamicGrammar {
     /// Attempts to locate and load a shared grammar library (`.so`, `.dylib`, or `.dll`)
-    /// from standard paths (`~/.local/share/subject0/grammars/` or `~/.config/subject0/grammars/`).
+    /// and its corresponding `highlights.scm` query from standard user paths.
     pub fn load(lang_name: &str) -> Option<Self> {
         if lang_name.is_empty() {
             return None;
@@ -754,7 +801,47 @@ impl DynamicGrammar {
                             let language = unsafe { lang_fn() };
                             let mut parser = tree_sitter::Parser::new();
                             if parser.set_language(&language).is_ok() {
-                                return Some(Self { parser, _lib: lib });
+                                // Load highlights.scm query if present
+                                let mut query = None;
+                                let mut query_paths = Vec::new();
+                                if let Ok(home) = env::var("HOME") {
+                                    query_paths.push(
+                                        PathBuf::from(home.clone())
+                                            .join(".local/share/subject0/queries")
+                                            .join(lang_name)
+                                            .join("highlights.scm"),
+                                    );
+                                    query_paths.push(
+                                        PathBuf::from(home)
+                                            .join(".config/subject0/queries")
+                                            .join(lang_name)
+                                            .join("highlights.scm"),
+                                    );
+                                }
+                                query_paths.push(
+                                    PathBuf::from("./queries")
+                                        .join(lang_name)
+                                        .join("highlights.scm"),
+                                );
+
+                                for qp in query_paths {
+                                    if qp.is_file() {
+                                        if let Ok(content) = fs::read_to_string(&qp) {
+                                            if let Ok(q) =
+                                                tree_sitter::Query::new(&language, &content)
+                                            {
+                                                query = Some(q);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                return Some(Self {
+                                    parser,
+                                    query,
+                                    _lib: lib,
+                                });
                             }
                         }
                     }
@@ -958,6 +1045,8 @@ pub struct SyntaxEngine {
     pub language: SupportedLanguage,
     pub dynamic_grammar: Option<DynamicGrammar>,
     pub tree: Option<tree_sitter::Tree>,
+    /// Spatial lookup of Tree-sitter query tokens: line index -> tokens
+    pub ts_tokens: std::collections::HashMap<usize, Vec<SemanticTokenSpan>>,
     /// Spatial lookup of LSP semantic tokens: line index -> tokens
     pub semantic_tokens: std::collections::HashMap<usize, Vec<SemanticTokenSpan>>,
 }
@@ -971,14 +1060,54 @@ impl SyntaxEngine {
             language,
             dynamic_grammar,
             tree: None,
+            ts_tokens: std::collections::HashMap::new(),
             semantic_tokens: std::collections::HashMap::new(),
         }
     }
 
-    /// Reparses buffer text using dynamic Tree-sitter if grammar is loaded.
+    /// Reparses buffer text using dynamic Tree-sitter and evaluates highlight queries.
     pub fn reparse(&mut self, text: &str) {
         if let Some(dg) = &mut self.dynamic_grammar {
             self.tree = dg.parser.parse(text, None);
+            self.ts_tokens.clear();
+
+            if let (Some(tree), Some(query)) = (&self.tree, &dg.query) {
+                let mut cursor = tree_sitter::QueryCursor::new();
+                let text_bytes = text.as_bytes();
+                let lines: Vec<&str> = text.lines().collect();
+
+                for m in cursor.matches(query, tree.root_node(), text_bytes) {
+                    for capture in m.captures {
+                        let node = capture.node;
+                        let start = node.start_position();
+                        let end = node.end_position();
+                        let capture_name = query.capture_names()[capture.index as usize];
+                        let token_type = CanonicalTokenType::from_query_capture(capture_name);
+
+                        if token_type != CanonicalTokenType::Other {
+                            for row in start.row..=end.row {
+                                let col_start = if row == start.row { start.column } else { 0 };
+                                let col_end = if row == end.row {
+                                    end.column
+                                } else {
+                                    lines.get(row).map_or(0, |l| l.len())
+                                };
+
+                                if col_end > col_start {
+                                    self.ts_tokens.entry(row).or_default().push(
+                                        SemanticTokenSpan {
+                                            line: row,
+                                            start_col: col_start,
+                                            length: col_end - col_start,
+                                            token_type,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -991,17 +1120,31 @@ impl SyntaxEngine {
     }
 
     /// Renders a single row of text into styled Ratatui Spans.
+    ///
+    /// Precedence hierarchy:
+    /// 1. Compiler-accurate LSP semantic tokens (Tier 3)
+    /// 2. Dynamic Tree-sitter Query tokens via `.scm` (Tier 2)
+    /// 3. Instant Universal Lexer (Tier 1)
     pub fn highlight_line(&self, line_text: &str, line_idx: usize) -> Vec<Span<'static>> {
         if line_text.is_empty() {
             return vec![Span::raw("")];
         }
 
+        // Tier 3: LSP Semantic Tokens
         if let Some(tokens) = self.semantic_tokens.get(&line_idx) {
             if !tokens.is_empty() {
                 return self.render_semantic_line(line_text, tokens);
             }
         }
 
+        // Tier 2: Dynamic Tree-sitter Query Highlighting
+        if let Some(tokens) = self.ts_tokens.get(&line_idx) {
+            if !tokens.is_empty() {
+                return self.render_semantic_line(line_text, tokens);
+            }
+        }
+
+        // Tier 1: Universal Lexer
         match self.language {
             SupportedLanguage::Markdown => Self::highlight_markdown(line_text),
             _ => self.highlight_code_universal(line_text),

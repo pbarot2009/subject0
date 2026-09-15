@@ -3,7 +3,11 @@
 //! Handles command-line arguments, flag decoding (`--help`, `--version`, `--clean`),
 //! jump-to-line specifiers (`+<line>`), and directory/file path resolution.
 
-use std::{env, path::PathBuf, process};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::{self, Command},
+};
 
 /// Parsed command-line arguments.
 #[derive(Debug, Default, Clone)]
@@ -27,7 +31,13 @@ impl CliArgs {
         let raw_args: Vec<String> = env::args().skip(1).collect();
         let mut cli = Self::default();
 
-        for arg in raw_args {
+        let force_grammar = raw_args
+            .iter()
+            .any(|a| a == "--force" || a == "--reinstall" || a == "-f");
+
+        let mut idx = 0;
+        while idx < raw_args.len() {
+            let arg = &raw_args[idx];
             match arg.as_str() {
                 "-h" | "--help" => {
                     Self::print_help();
@@ -37,6 +47,22 @@ impl CliArgs {
                     Self::print_version();
                     process::exit(0);
                 }
+                "-g" | "--install-grammar" => {
+                    if idx + 1 < raw_args.len() {
+                        let lang = raw_args[idx + 1].clone();
+                        Self::run_grammar_installer(&lang, force_grammar);
+                        process::exit(0);
+                    } else {
+                        eprintln!("Error: Missing language argument for --install-grammar <lang>");
+                        process::exit(1);
+                    }
+                }
+                s if s.starts_with("--install-grammar=") => {
+                    let lang = s.trim_start_matches("--install-grammar=");
+                    Self::run_grammar_installer(lang, force_grammar);
+                    process::exit(0);
+                }
+
                 "--clean" | "--no-config" => {
                     cli.ignore_config = true;
                 }
@@ -58,6 +84,7 @@ impl CliArgs {
                 }
                 _ => {}
             }
+            idx += 1;
         }
 
         cli
@@ -112,11 +139,13 @@ impl CliArgs {
       {magenta}[+LINE]{r}            Jump directly to line number {gray}(e.g. +42){r}
 
   {b}{blue}󰅂 OPTIONS:{r}
-      {yellow}-h, --help{r}        Show this formatted help menu and exit
-      {yellow}-v, --version{r}     Print version information and metadata
-      {yellow}-w, --wrap{r}        Force soft line wrapping on
-      {yellow}-nw, --no-wrap{r}    Force line wrapping off (horizontal scroll)
-      {yellow}--clean{r}           Bypass workspace and user {gray}.subject0{r} configs
+      {yellow}-h, --help{r}                Show this formatted help menu and exit
+      {yellow}-v, --version{r}             Print version information and metadata
+      {yellow}-g, --install-grammar <L>{r}  Download & compile Tree-sitter grammar (.so & queries)
+      {yellow}--force, --reinstall{r}      Re-download and recompile existing grammar
+      {yellow}-w, --wrap{r}                Force soft line wrapping on
+      {yellow}-nw, --no-wrap{r}            Force line wrapping off (horizontal scroll)
+      {yellow}--clean{r}                   Bypass workspace and user {gray}.subject0{r} configs
 
   {b}{blue}󰅂 EXAMPLES:{r}
       {gray}# Open a file at line 50:{r}
@@ -172,5 +201,217 @@ impl CliArgs {
             }
         }
         width
+    }
+
+    fn shorten_home(path: &Path) -> String {
+        if let Ok(home) = env::var("HOME") {
+            path.to_string_lossy().replacen(&home, "~", 1)
+        } else {
+            path.to_string_lossy().to_string()
+        }
+    }
+
+    /// Downloads, compiles, and installs a Tree-sitter grammar shared library and queries.
+    fn run_grammar_installer(lang: &str, force: bool) {
+        let r = "\x1b[0m";
+        let b = "\x1b[1m";
+        let green = "\x1b[38;2;100;200;140m";
+        let yellow = "\x1b[38;2;240;200;90m";
+        let red = "\x1b[38;2;240;90;90m";
+        let blue = "\x1b[38;2;100;180;255m";
+        let gray = "\x1b[38;2;140;145;160m";
+
+        let home = match env::var("HOME") {
+            Ok(h) => PathBuf::from(h),
+            Err(_) => {
+                eprintln!("{red}Error: Unable to locate $HOME environment variable.{r}");
+                process::exit(1);
+            }
+        };
+
+        let grammars_dir = home.join(".local/share/subject0/grammars");
+        let queries_dir = home.join(".local/share/subject0/queries").join(lang);
+        let target_scm = queries_dir.join("highlights.scm");
+
+        let ext = if cfg!(target_os = "windows") {
+            "dll"
+        } else if cfg!(target_os = "macos") {
+            "dylib"
+        } else {
+            "so"
+        };
+
+        let target_so = grammars_dir.join(format!("{lang}.{ext}"));
+
+        // Cache detection: skip cloning/compilation if already installed
+        if target_so.is_file() && !force {
+            let display_so = Self::shorten_home(&target_so);
+            let query_status = if target_scm.is_file() {
+                format!("{green}Installed (highlights.scm){r}")
+            } else {
+                format!("{yellow}None{r}")
+            };
+
+            let lines = vec![
+                format!(" {green}󰄬 Grammar already installed{r}"),
+                format!(" Language:  {b}{lang}{r}"),
+                format!(" Library:   {blue}{display_so}{r}"),
+                format!(" Queries:   {query_status}"),
+                String::new(),
+                format!(" {gray}Pass {yellow}--force{gray} or {yellow}--reinstall{gray} to recompile{r}"),
+            ];
+
+            Self::print_boxed_card(&lines, 56);
+            process::exit(0);
+        }
+
+        if let Err(e) = fs::create_dir_all(&grammars_dir) {
+            eprintln!("{red}Error creating grammars directory: {e}{r}");
+            process::exit(1);
+        }
+        if let Err(e) = fs::create_dir_all(&queries_dir) {
+            eprintln!("{red}Error creating queries directory: {e}{r}");
+            process::exit(1);
+        }
+
+        let repo_url = match lang {
+            "rust" => "https://github.com/tree-sitter/tree-sitter-rust.git",
+            "python" => "https://github.com/tree-sitter/tree-sitter-python.git",
+            "c" => "https://github.com/tree-sitter/tree-sitter-c.git",
+            "cpp" => "https://github.com/tree-sitter/tree-sitter-cpp.git",
+            "go" => "https://github.com/tree-sitter/tree-sitter-go.git",
+            "zig" => "https://github.com/ziglibs/tree-sitter-zig.git",
+            "javascript" | "js" => "https://github.com/tree-sitter/tree-sitter-javascript.git",
+            "typescript" | "ts" => "https://github.com/tree-sitter/tree-sitter-typescript.git",
+            "bash" | "sh" => "https://github.com/tree-sitter/tree-sitter-bash.git",
+            "lua" => "https://github.com/MunifTanjim/tree-sitter-lua.git",
+            "toml" => "https://github.com/tree-sitter-grammars/tree-sitter-toml.git",
+            "json" => "https://github.com/tree-sitter/tree-sitter-json.git",
+            _ => &format!("https://github.com/tree-sitter/tree-sitter-{lang}.git"),
+        };
+
+        let temp_dir = env::temp_dir().join(format!("s0-grammar-{lang}"));
+        if temp_dir.exists() {
+            let _ = fs::remove_dir_all(&temp_dir);
+        }
+
+        println!("{blue}󰄬 Cloning Tree-sitter grammar for {b}{lang}{r}{blue}...{r}");
+
+        let clone_status = Command::new("git")
+            .args(["clone", "--depth=1", repo_url, temp_dir.to_str().unwrap()])
+            .status();
+
+        match clone_status {
+            Ok(s) if s.success() => {}
+            _ => {
+                eprintln!(
+                    "{red}Failed to clone repository from {repo_url}. Verify git is installed.{r}"
+                );
+                process::exit(1);
+            }
+        }
+
+        // Locate source files
+        let src_dir = if temp_dir.join(lang).join("src").exists() {
+            temp_dir.join(lang).join("src")
+        } else {
+            temp_dir.join("src")
+        };
+
+        let parser_c = src_dir.join("parser.c");
+        if !parser_c.exists() {
+            eprintln!("{red}Invalid grammar repository: missing src/parser.c{r}");
+            let _ = fs::remove_dir_all(&temp_dir);
+            process::exit(1);
+        }
+
+        let scanner_c = src_dir.join("scanner.c");
+        let scanner_cc = src_dir.join("scanner.cc");
+        let scanner_cpp = src_dir.join("scanner.cpp");
+
+        let has_cpp_scanner = scanner_cc.exists() || scanner_cpp.exists();
+        let compiler = if has_cpp_scanner {
+            if Command::new("c++").arg("--version").output().is_ok() {
+                "c++"
+            } else if Command::new("clang++").arg("--version").output().is_ok() {
+                "clang++"
+            } else {
+                "g++"
+            }
+        } else if Command::new("cc").arg("--version").output().is_ok() {
+            "cc"
+        } else if Command::new("clang").arg("--version").output().is_ok() {
+            "clang"
+        } else {
+            "gcc"
+        };
+
+        println!("{yellow}󰑮 Compiling {b}{lang}.{ext}{r}{yellow} with {compiler}...{r}");
+
+        let mut compile_cmd = Command::new(compiler);
+        compile_cmd
+            .arg("-O3")
+            .arg("-fPIC")
+            .arg("-shared")
+            .arg(format!("-I{}", src_dir.display()))
+            .arg(parser_c);
+
+        if scanner_c.exists() {
+            compile_cmd.arg(scanner_c);
+        } else if scanner_cc.exists() {
+            compile_cmd.arg(scanner_cc);
+        } else if scanner_cpp.exists() {
+            compile_cmd.arg(scanner_cpp);
+        }
+
+        compile_cmd.arg("-o").arg(&target_so);
+
+        let compile_status = compile_cmd.status();
+        match compile_status {
+            Ok(s) if s.success() => {}
+            _ => {
+                eprintln!("{red}Compilation failed. Ensure a C/C++ compiler is installed on your host.{r}");
+                let _ = fs::remove_dir_all(&temp_dir);
+                process::exit(1);
+            }
+        }
+
+        // Copy highlights.scm queries if present
+        let query_candidates = [
+            temp_dir.join("queries").join("highlights.scm"),
+            temp_dir.join("queries").join(lang).join("highlights.scm"),
+            temp_dir.join(lang).join("queries").join("highlights.scm"),
+            src_dir.join("highlights.scm"),
+        ];
+
+        let mut query_copied = false;
+        for q in &query_candidates {
+            if q.is_file() {
+                let target_scm = queries_dir.join("highlights.scm");
+                if fs::copy(q, target_scm).is_ok() {
+                    query_copied = true;
+                    break;
+                }
+            }
+        }
+
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        let display_so = Self::shorten_home(&target_so);
+        let lines = vec![
+            format!(" {green}󰄬 Grammar Installed Successfully!{r}"),
+            format!(" Language:  {b}{lang}{r}"),
+            format!(" Library:   {blue}{display_so}{r}"),
+            format!(
+                " Queries:   {}",
+                if query_copied {
+                    format!("{green}Installed (highlights.scm){r}")
+                } else {
+                    format!("{yellow}None found in repo (AST fallback active){r}")
+                }
+            ),
+        ];
+
+        Self::print_boxed_card(&lines, 56);
     }
 }
