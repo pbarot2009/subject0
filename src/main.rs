@@ -163,9 +163,15 @@ async fn main() -> Result<()> {
 
     // Apply CLI flag overrides
     if cli_args.ignore_config {
+        // Reset in-memory preferences, but keep the already-resolved
+        // `source_path` so that if the user later saves config mid-session
+        // (e.g. via the SaveConfig palette command), it still writes to the
+        // correct project-anchored `.subject0` location rather than losing
+        // track of where it should go.
         editor.config = editor::AppConfig {
             preferred_lsps: std::collections::HashMap::new(),
             line_wrap: true,
+            source_path: editor.config.source_path.clone(),
         };
     }
     if let Some(wrap) = cli_args.line_wrap {

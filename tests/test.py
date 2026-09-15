@@ -1,6 +1,4 @@
-import os
-
-os.mkdir("testdir")
-
-def code_make():
-    print("notjing")
+class Person:
+    
+    def __init__(self) -> None:
+        print("")

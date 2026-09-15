@@ -51,13 +51,27 @@ use std::collections::HashMap;
 pub struct AppConfig {
     pub preferred_lsps: HashMap<String, String>,
     pub line_wrap: bool,
+    /// Resolved absolute path to the `.subject0` file this config was loaded
+    /// from (or will be written to). Fixed at load time so that `save()` always
+    /// targets the same file as `load()` did, regardless of the process's
+    /// current working directory at save time.
+    pub source_path: PathBuf,
 }
 
 impl AppConfig {
-    pub fn file_path() -> PathBuf {
-        let cwd_cfg = PathBuf::from(".subject0");
-        if cwd_cfg.exists() {
-            return cwd_cfg;
+    /// Resolves the `.subject0` config path anchored to a specific project
+    /// root, rather than the ambient process working directory. This ensures
+    /// `s0` finds (and later writes back to) the same config file no matter
+    /// which directory the editor happened to be launched from.
+    ///
+    /// Resolution order:
+    /// 1. `<project_root>/.subject0` — if it already exists.
+    /// 2. `$HOME/.subject0` — user-level fallback, if it already exists.
+    /// 3. `<project_root>/.subject0` — default write target for a fresh config.
+    fn resolve_path(project_root: &Path) -> PathBuf {
+        let project_cfg = project_root.join(".subject0");
+        if project_cfg.exists() {
+            return project_cfg;
         }
         if let Ok(home) = env::var("HOME") {
             let home_cfg = PathBuf::from(home).join(".subject0");
@@ -65,15 +79,19 @@ impl AppConfig {
                 return home_cfg;
             }
         }
-        cwd_cfg
+        project_cfg
     }
 
-    pub fn load() -> Self {
-        let path = Self::file_path();
+    /// Loads configuration anchored to `project_root` (the opened file's
+    /// parent directory, or the opened directory itself). Use this instead of
+    /// relying on the process's current working directory so that config
+    /// resolution is stable regardless of where `s0` was launched from.
+    pub fn load_from(project_root: &Path) -> Self {
+        let path = Self::resolve_path(project_root);
         let mut preferred_lsps = HashMap::new();
         let mut line_wrap = true;
 
-        if let Ok(content) = fs::read_to_string(path) {
+        if let Ok(content) = fs::read_to_string(&path) {
             if let Ok(val) = serde_json::from_str::<Value>(&content) {
                 if let Some(obj) = val.get("preferred_lsps").and_then(Value::as_object) {
                     for (k, v) in obj {
@@ -91,16 +109,25 @@ impl AppConfig {
         Self {
             preferred_lsps,
             line_wrap,
+            source_path: path,
         }
     }
 
+    /// Loads configuration using the process's current working directory as
+    /// the project root. Kept for callers that construct a default/empty
+    /// config outside of an opened project (e.g. CLI flag overrides); prefer
+    /// [`AppConfig::load_from`] whenever a project root is known.
+    pub fn load() -> Self {
+        let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        Self::load_from(&cwd)
+    }
+
     pub fn save(&self) -> Result<()> {
-        let path = Self::file_path();
         let val = json!({
             "preferred_lsps": self.preferred_lsps,
             "line_wrap": self.line_wrap,
         });
-        fs::write(path, serde_json::to_string_pretty(&val)?)?;
+        fs::write(&self.source_path, serde_json::to_string_pretty(&val)?)?;
         Ok(())
     }
 }
@@ -640,12 +667,16 @@ impl Editor {
             env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
         };
 
-        let mut explorer = FileExplorer::new(root_dir);
+        let mut explorer = FileExplorer::new(root_dir.clone());
         if is_dir_target {
             explorer.visible = true;
         }
 
-        let config = AppConfig::load();
+        // Anchor config resolution to the project root (the opened file's
+        // parent directory, or the opened directory itself) rather than the
+        // ambient process working directory, so `.subject0` is found and
+        // saved consistently regardless of where `s0` was launched from.
+        let config = AppConfig::load_from(&root_dir);
         let initial_wrap = config.line_wrap;
 
         Ok(Self {

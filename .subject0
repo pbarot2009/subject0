@@ -1,6 +1,7 @@
 {
   "line_wrap": true,
   "preferred_lsps": {
-    "python": "pyright-langserver"
+    "python": "pyright-langserver",
+    "rust": "rust-analyzer"
   }
 }

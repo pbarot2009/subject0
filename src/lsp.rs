@@ -1121,46 +1121,86 @@ impl SyntaxEngine {
 
     /// Renders a single row of text into styled Ratatui Spans.
     ///
-    /// Precedence hierarchy:
-    /// 1. Compiler-accurate LSP semantic tokens (Tier 3)
-    /// 2. Dynamic Tree-sitter Query tokens via `.scm` (Tier 2)
-    /// 3. Instant Universal Lexer (Tier 1)
+    /// Layered composition (each tier only overrides the characters it actually
+    /// classifies; anything a higher tier leaves untagged keeps the styling from
+    /// the tier below it, so highlighting never "falls through" to a flat color):
+    /// 1. Instant Universal Lexer (Tier 1) — always computed first as the base layer.
+    /// 2. Dynamic Tree-sitter Query tokens via `.scm` (Tier 2) — overlaid on top.
+    /// 3. Compiler-accurate LSP semantic tokens (Tier 3) — overlaid last, highest priority.
     pub fn highlight_line(&self, line_text: &str, line_idx: usize) -> Vec<Span<'static>> {
         if line_text.is_empty() {
             return vec![Span::raw("")];
         }
 
-        // Tier 3: LSP Semantic Tokens
-        if let Some(tokens) = self.semantic_tokens.get(&line_idx) {
-            if !tokens.is_empty() {
-                return self.render_semantic_line(line_text, tokens);
-            }
-        }
-
-        // Tier 2: Dynamic Tree-sitter Query Highlighting
-        if let Some(tokens) = self.ts_tokens.get(&line_idx) {
-            if !tokens.is_empty() {
-                return self.render_semantic_line(line_text, tokens);
-            }
-        }
-
-        // Tier 1: Universal Lexer
-        match self.language {
+        // Tier 1: Universal Lexer forms the base layer for every line.
+        let base_spans = match self.language {
             SupportedLanguage::Markdown => Self::highlight_markdown(line_text),
             _ => self.highlight_code_universal(line_text),
+        };
+
+        let ts_tokens = self
+            .ts_tokens
+            .get(&line_idx)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let semantic_tokens = self
+            .semantic_tokens
+            .get(&line_idx)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+
+        if ts_tokens.is_empty() && semantic_tokens.is_empty() {
+            return base_spans;
         }
+
+        self.render_layered_line(line_text, &base_spans, ts_tokens, semantic_tokens)
     }
 
-    fn render_semantic_line(&self, text: &str, tokens: &[SemanticTokenSpan]) -> Vec<Span<'static>> {
+    /// Merges Tier 1 base spans with Tier 2 and Tier 3 token overlays on a
+    /// per-character basis, so gaps left by a higher tier fall back to the next
+    /// tier down instead of a flat default color.
+    fn render_layered_line(
+        &self,
+        text: &str,
+        base_spans: &[Span<'static>],
+        ts_tokens: &[SemanticTokenSpan],
+        semantic_tokens: &[SemanticTokenSpan],
+    ) -> Vec<Span<'static>> {
         let chars: Vec<char> = text.chars().collect();
         if chars.is_empty() {
             return vec![Span::raw("")];
         }
 
+        // Expand the Tier 1 base spans into a per-character style array.
+        let mut styles = Vec::with_capacity(chars.len());
+        for span in base_spans {
+            let span_len = span.content.chars().count();
+            for _ in 0..span_len {
+                styles.push(span.style);
+            }
+        }
+        // Defensive: if base span char count ever drifts from `chars.len()`
+        // (should not happen), pad with the default style rather than panic.
         let default_style = Style::default().fg(Color::Rgb(215, 220, 230));
-        let mut styles = vec![default_style; chars.len()];
+        while styles.len() < chars.len() {
+            styles.push(default_style);
+        }
+        styles.truncate(chars.len());
 
-        for tok in tokens {
+        // Overlay Tier 2 (tree-sitter) on top of the Tier 1 base.
+        for tok in ts_tokens {
+            let start = tok.start_col;
+            let end = (start + tok.length).min(chars.len());
+            if start < chars.len() && end > start {
+                let style = Self::style_for_token_type(tok.token_type);
+                for cell in &mut styles[start..end] {
+                    *cell = style;
+                }
+            }
+        }
+
+        // Overlay Tier 3 (LSP semantic tokens) last, taking final priority.
+        for tok in semantic_tokens {
             let start = tok.start_col;
             let end = (start + tok.length).min(chars.len());
             if start < chars.len() && end > start {
