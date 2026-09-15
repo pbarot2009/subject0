@@ -15,9 +15,14 @@ A modal terminal code editor built in Rust with native Language Server Protocol 
 
 - **Rust**: 1.74 or later (2021 edition).
 - **Nerd Font**: Required to render file icons and completion glyphs properly.
-- **Language Servers** (optional, discovered in `$PATH` or `~/.cargo/bin`):
-  - Rust: `rust-analyzer`
-  - Python: `pylsp`
+- **Language Servers** (optional, auto-detected from `$PATH` and `~/.cargo/bin`):
+  - **Rust**: `rust-analyzer`
+  - **Go**: `gopls`
+  - **Python**: `pyright-langserver`, `pyright`, `pylsp`, `jedi-language-server`
+  - **JavaScript / TypeScript**: `typescript-language-server`, `vtsls`, `quick-lint-js`
+  - **HTML**: `vscode-html-language-server`, `html-languageserver`
+  - **CSS**: `vscode-css-language-server`, `css-languageserver`
+
 
 ## Installation
 
@@ -74,7 +79,7 @@ If no path is provided, an empty scratch buffer opens.
 | Key | Action |
 | --- | --- |
 | `Esc` | Return to Normal mode |
-| `Tab` | Open completions if available, or insert 4 spaces |
+| `Tab` | Insert 4 spaces (or accept completion when popup is open) |
 | `Ctrl-Space` | Trigger LSP completions manually |
 | `Down` / `Up` | Navigate autocomplete suggestions |
 | `Enter` / `Tab` | Accept highlighted completion candidate |
@@ -96,13 +101,32 @@ If no path is provided, an empty scratch buffer opens.
 
 | Command | Action |
 | --- | --- |
-| `:w` | Write buffer to disk |
+| `:w [FILE]` | Write buffer to disk (optional target path for scratch buffers) |
 | `:q` | Quit (aborts if there are unsaved changes) |
 | `:q!` | Force quit, discarding unsaved changes |
-| `:wq` | Write buffer to disk and quit |
+| `:wq [FILE]` | Write buffer to disk and quit |
 | `:wrap` | Toggle viewport soft line wrapping |
+| `:lsp` | Open LSP picker to select or switch the language server |
+| `:cfg` | Save active settings (`line_wrap`, preferred LSPs) to `.subject0` |
 | `:e`, `:explore` | Toggle File Explorer sidebar |
-| `:p`, `:menu` | Open Command Palette |
+| `:p`, `:menu`, `:pal` | Open Command Palette |
+
+## Configuration
+
+`subject0` automatically reads and writes workspace settings to `.subject0` in the current project root, falling back to `~/.subject0`.
+
+```json
+{
+  "line_wrap": true,
+  "preferred_lsps": {
+    "python": "pyright-langserver",
+    "rust": "rust-analyzer"
+  }
+}
+```
+
+- When multiple language servers for a language are detected in `$PATH`, an interactive popup prompts you to choose your preference.
+- Your selection is saved to `.subject0` and used automatically on subsequent sessions.
 
 ## Development
 
