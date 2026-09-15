@@ -32,10 +32,11 @@ tokio = { version = "1.38", features = [
     "time",
 ] }
 
-# Tree-sitter parser and language grammars
+# Dynamic shared library loading for external tree-sitter grammars
+libloading = "0.8"
+
+# Tree-sitter parser core
 tree-sitter = "0.22"
-tree-sitter-rust = "0.21"
-tree-sitter-python = "0.21"
 
 # Serialization for JSON-RPC LSP communication
 serde = { version = "1.0", features = ["derive"] }

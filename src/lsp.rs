@@ -91,13 +91,52 @@ pub enum LspStatus {
     Error(String),
 }
 
+/// Canonical semantic classification mapping server legends into unified editor colors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanonicalTokenType {
+    Keyword,
+    Type,
+    Function,
+    Variable,
+    Parameter,
+    Property,
+    String,
+    Number,
+    Comment,
+    Operator,
+    Macro,
+    Namespace,
+    Other,
+}
+
+impl CanonicalTokenType {
+    pub fn from_name(name: &str) -> Self {
+        match name {
+            "keyword" | "boolean" | "conditional" | "repeat" | "modifier" => Self::Keyword,
+            "type" | "class" | "struct" | "enum" | "union" | "interface" | "typeParameter"
+            | "builtinType" => Self::Type,
+            "function" | "method" => Self::Function,
+            "variable" => Self::Variable,
+            "parameter" => Self::Parameter,
+            "property" | "field" | "enumMember" => Self::Property,
+            "string" | "character" => Self::String,
+            "number" | "float" => Self::Number,
+            "comment" | "documentation" => Self::Comment,
+            "operator" => Self::Operator,
+            "macro" | "attribute" | "decorator" => Self::Macro,
+            "namespace" | "module" | "package" => Self::Namespace,
+            _ => Self::Other,
+        }
+    }
+}
+
 /// A single decoded semantic token span positioned in buffer coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SemanticTokenSpan {
     pub line: usize,
     pub start_col: usize,
     pub length: usize,
-    pub token_type: usize,
+    pub token_type: CanonicalTokenType,
 }
 
 /// Commands and notifications routed from the editor frontend into the background LSP actor.
@@ -274,8 +313,11 @@ pub fn server_cmd_and_args(cmd: &str) -> (String, Vec<&'static str>) {
         | "vscode-html-language-server"
         | "vscode-css-language-server"
         | "vscode-json-language-server"
-        | "yaml-language-server" => (cmd.to_string(), vec!["--stdio"]),
+        | "yaml-language-server"
+        | "intelephense" => (cmd.to_string(), vec!["--stdio"]),
         "taplo" => ("taplo".to_string(), vec!["lsp", "stdio"]),
+        "dart" => ("dart".to_string(), vec!["language-server"]),
+        "omnisharp" => ("omnisharp".to_string(), vec!["-lsp"]),
         _ => (cmd.to_string(), vec![]),
     }
 }
@@ -402,10 +444,26 @@ pub async fn run_lsp_actor(
         return;
     }
 
-    // Await response to initialization request (id == 1) before proceeding.
+    let mut server_legend: Vec<String> = Vec::new();
+
+    // Await response to initialization request (id == 1) and extract server legend.
     loop {
         if let Ok(msg) = read_lsp_message(&mut stdout).await {
             if msg.get("id").and_then(Value::as_i64) == Some(1) {
+                if let Some(types_arr) = msg
+                    .get("result")
+                    .and_then(|r| r.get("capabilities"))
+                    .and_then(|c| c.get("semanticTokensProvider"))
+                    .and_then(|p| p.get("legend"))
+                    .and_then(|l| l.get("tokenTypes"))
+                    .and_then(Value::as_array)
+                {
+                    server_legend = types_arr
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(ToString::to_string)
+                        .collect();
+                }
                 break;
             }
         } else {
@@ -414,6 +472,30 @@ pub async fn run_lsp_actor(
             )));
             return;
         }
+    }
+
+    if server_legend.is_empty() {
+        server_legend = vec![
+            "namespace".into(),
+            "type".into(),
+            "class".into(),
+            "enum".into(),
+            "interface".into(),
+            "struct".into(),
+            "typeParameter".into(),
+            "parameter".into(),
+            "variable".into(),
+            "property".into(),
+            "enumMember".into(),
+            "function".into(),
+            "method".into(),
+            "macro".into(),
+            "keyword".into(),
+            "comment".into(),
+            "string".into(),
+            "number".into(),
+            "operator".into(),
+        ];
     }
 
     // Confirm initialization to server.
@@ -539,11 +621,14 @@ pub async fn run_lsp_actor(
                             let mut cur_line = 0usize;
                             let mut cur_char = 0usize;
 
-                            for chunk in ints.chunks_exact(5) {
+                                                        for chunk in ints.chunks_exact(5) {
                                 let delta_line = chunk[0];
                                 let delta_start = chunk[1];
                                 let length = chunk[2];
-                                let token_type = chunk[3];
+                                let token_type_idx = chunk[3];
+
+                                let token_name = server_legend.get(token_type_idx).map(String::as_str).unwrap_or("");
+                                let token_type = CanonicalTokenType::from_name(token_name);
 
                                 if delta_line > 0 {
                                     cur_line = cur_line.saturating_add(delta_line);
@@ -559,6 +644,7 @@ pub async fn run_lsp_actor(
                                     token_type,
                                 });
                             }
+
 
                             let _ = tx.send(LspOutbound::SemanticTokens { tokens });
                         } else {
@@ -617,9 +703,71 @@ pub async fn run_lsp_actor(
     }
 }
 
+// === Dynamic Tree-Sitter Loader via libloading ===
+
+/// Encapsulates a dynamically loaded Tree-sitter parser from a shared object library.
+pub struct DynamicGrammar {
+    pub parser: tree_sitter::Parser,
+    _lib: libloading::Library,
+}
+
+impl DynamicGrammar {
+    /// Attempts to locate and load a shared grammar library (`.so`, `.dylib`, or `.dll`)
+    /// from standard paths (`~/.local/share/subject0/grammars/` or `~/.config/subject0/grammars/`).
+    pub fn load(lang_name: &str) -> Option<Self> {
+        if lang_name.is_empty() {
+            return None;
+        }
+
+        let ext = if cfg!(target_os = "windows") {
+            "dll"
+        } else if cfg!(target_os = "macos") {
+            "dylib"
+        } else {
+            "so"
+        };
+
+        let file_candidates = [
+            format!("{lang_name}.{ext}"),
+            format!("libtree-sitter-{lang_name}.{ext}"),
+            format!("tree-sitter-{lang_name}.{ext}"),
+        ];
+
+        let mut search_dirs = Vec::new();
+        if let Ok(home) = env::var("HOME") {
+            search_dirs.push(PathBuf::from(home.clone()).join(".local/share/subject0/grammars"));
+            search_dirs.push(PathBuf::from(home).join(".config/subject0/grammars"));
+        }
+        search_dirs.push(PathBuf::from("./grammars"));
+
+        for dir in search_dirs {
+            for name in &file_candidates {
+                let p = dir.join(name);
+                if p.is_file() {
+                    if let Ok(lib) = unsafe { libloading::Library::new(&p) } {
+                        let symbol_name = format!("tree_sitter_{lang_name}");
+                        let constructor: Result<
+                            libloading::Symbol<unsafe extern "C" fn() -> tree_sitter::Language>,
+                            _,
+                        > = unsafe { lib.get(symbol_name.as_bytes()) };
+                        if let Ok(lang_fn) = constructor {
+                            let language = unsafe { lang_fn() };
+                            let mut parser = tree_sitter::Parser::new();
+                            if parser.set_language(&language).is_ok() {
+                                return Some(Self { parser, _lib: lib });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
 // === Syntax Highlighting Engine ===
 
-/// Identifies the source programming language or document format.
+/// Identifies the source programming language across 25+ major languages.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SupportedLanguage {
     Rust,
@@ -638,6 +786,16 @@ pub enum SupportedLanguage {
     Bash,
     Lua,
     Markdown,
+    Java,
+    CSharp,
+    Php,
+    Ruby,
+    Kotlin,
+    Swift,
+    Dart,
+    Sql,
+    Scala,
+    Odin,
     Plain,
 }
 
@@ -654,9 +812,9 @@ impl SupportedLanguage {
             "py" | "pyi" => SupportedLanguage::Python,
             "c" | "h" => SupportedLanguage::C,
             "cpp" | "hpp" | "cc" | "cxx" => SupportedLanguage::Cpp,
-            "zig" => SupportedLanguage::Zig,
+            "zig" | "zon" => SupportedLanguage::Zig,
             "js" | "jsx" | "mjs" | "cjs" => SupportedLanguage::JavaScript,
-            "ts" | "tsx" => SupportedLanguage::TypeScript,
+            "ts" | "tsx" | "mts" | "cts" => SupportedLanguage::TypeScript,
             "html" | "htm" => SupportedLanguage::Html,
             "css" | "scss" | "less" => SupportedLanguage::Css,
             "json" => SupportedLanguage::Json,
@@ -665,7 +823,49 @@ impl SupportedLanguage {
             "sh" | "bash" | "zsh" => SupportedLanguage::Bash,
             "lua" => SupportedLanguage::Lua,
             "md" | "markdown" => SupportedLanguage::Markdown,
+            "java" => SupportedLanguage::Java,
+            "cs" => SupportedLanguage::CSharp,
+            "php" => SupportedLanguage::Php,
+            "rb" | "rake" => SupportedLanguage::Ruby,
+            "kt" | "kts" => SupportedLanguage::Kotlin,
+            "swift" => SupportedLanguage::Swift,
+            "dart" => SupportedLanguage::Dart,
+            "sql" => SupportedLanguage::Sql,
+            "scala" | "sc" => SupportedLanguage::Scala,
+            "odin" => SupportedLanguage::Odin,
             _ => SupportedLanguage::Plain,
+        }
+    }
+
+    pub fn grammar_name(self) -> &'static str {
+        match self {
+            SupportedLanguage::Rust => "rust",
+            SupportedLanguage::Go => "go",
+            SupportedLanguage::Python => "python",
+            SupportedLanguage::C => "c",
+            SupportedLanguage::Cpp => "cpp",
+            SupportedLanguage::Zig => "zig",
+            SupportedLanguage::JavaScript => "javascript",
+            SupportedLanguage::TypeScript => "typescript",
+            SupportedLanguage::Html => "html",
+            SupportedLanguage::Css => "css",
+            SupportedLanguage::Json => "json",
+            SupportedLanguage::Toml => "toml",
+            SupportedLanguage::Yaml => "yaml",
+            SupportedLanguage::Bash => "bash",
+            SupportedLanguage::Lua => "lua",
+            SupportedLanguage::Markdown => "markdown",
+            SupportedLanguage::Java => "java",
+            SupportedLanguage::CSharp => "c_sharp",
+            SupportedLanguage::Php => "php",
+            SupportedLanguage::Ruby => "ruby",
+            SupportedLanguage::Kotlin => "kotlin",
+            SupportedLanguage::Swift => "swift",
+            SupportedLanguage::Dart => "dart",
+            SupportedLanguage::Sql => "sql",
+            SupportedLanguage::Scala => "scala",
+            SupportedLanguage::Odin => "odin",
+            SupportedLanguage::Plain => "",
         }
     }
 
@@ -687,6 +887,16 @@ impl SupportedLanguage {
             SupportedLanguage::Bash => "shellscript",
             SupportedLanguage::Lua => "lua",
             SupportedLanguage::Markdown => "markdown",
+            SupportedLanguage::Java => "java",
+            SupportedLanguage::CSharp => "csharp",
+            SupportedLanguage::Php => "php",
+            SupportedLanguage::Ruby => "ruby",
+            SupportedLanguage::Kotlin => "kotlin",
+            SupportedLanguage::Swift => "swift",
+            SupportedLanguage::Dart => "dart",
+            SupportedLanguage::Sql => "sql",
+            SupportedLanguage::Scala => "scala",
+            SupportedLanguage::Odin => "odin",
             SupportedLanguage::Plain => "plaintext",
         }
     }
@@ -704,9 +914,12 @@ impl SupportedLanguage {
             ],
             SupportedLanguage::C | SupportedLanguage::Cpp => &["clangd", "ccls"],
             SupportedLanguage::Zig => &["zls"],
-            SupportedLanguage::JavaScript | SupportedLanguage::TypeScript => {
-                &["typescript-language-server", "vtsls", "quick-lint-js"]
-            }
+            SupportedLanguage::JavaScript | SupportedLanguage::TypeScript => &[
+                "typescript-language-server",
+                "vtsls",
+                "quick-lint-js",
+                "biome",
+            ],
             SupportedLanguage::Html => &["vscode-html-language-server", "html-languageserver"],
             SupportedLanguage::Css => &["vscode-css-language-server", "css-languageserver"],
             SupportedLanguage::Json => &["vscode-json-language-server"],
@@ -715,6 +928,16 @@ impl SupportedLanguage {
             SupportedLanguage::Bash => &["bash-language-server"],
             SupportedLanguage::Lua => &["lua-language-server"],
             SupportedLanguage::Markdown => &["marksman"],
+            SupportedLanguage::Java => &["jdtls"],
+            SupportedLanguage::CSharp => &["omnisharp", "csharp-ls"],
+            SupportedLanguage::Php => &["intelephense", "phpactor"],
+            SupportedLanguage::Ruby => &["solargraph", "ruby-lsp"],
+            SupportedLanguage::Kotlin => &["kotlin-language-server"],
+            SupportedLanguage::Swift => &["sourcekit-lsp"],
+            SupportedLanguage::Dart => &["dart"],
+            SupportedLanguage::Sql => &["sqls", "sql-language-server"],
+            SupportedLanguage::Scala => &["metals"],
+            SupportedLanguage::Odin => &["ols"],
             SupportedLanguage::Plain => &[],
         }
     }
@@ -729,9 +952,12 @@ impl SupportedLanguage {
     }
 }
 
-/// Core syntax engine coordinating instant lexical highlighting and LSP semantic token overlays.
+/// Core syntax engine coordinating instant lexical highlighting, dynamic tree-sitter AST,
+/// and compiler-grade LSP semantic token overlays.
 pub struct SyntaxEngine {
     pub language: SupportedLanguage,
+    pub dynamic_grammar: Option<DynamicGrammar>,
+    pub tree: Option<tree_sitter::Tree>,
     /// Spatial lookup of LSP semantic tokens: line index -> tokens
     pub semantic_tokens: std::collections::HashMap<usize, Vec<SemanticTokenSpan>>,
 }
@@ -739,14 +965,22 @@ pub struct SyntaxEngine {
 impl SyntaxEngine {
     pub fn new(path: Option<&PathBuf>) -> Self {
         let language = SupportedLanguage::from_path(path);
+        let dynamic_grammar = DynamicGrammar::load(language.grammar_name());
+
         Self {
             language,
+            dynamic_grammar,
+            tree: None,
             semantic_tokens: std::collections::HashMap::new(),
         }
     }
 
-    /// Retained for call-site compatibility.
-    pub fn reparse(&mut self, _text: &str) {}
+    /// Reparses buffer text using dynamic Tree-sitter if grammar is loaded.
+    pub fn reparse(&mut self, text: &str) {
+        if let Some(dg) = &mut self.dynamic_grammar {
+            self.tree = dg.parser.parse(text, None);
+        }
+    }
 
     /// Ingests and indexes decoded LSP semantic tokens by line row.
     pub fn set_semantic_tokens(&mut self, tokens: Vec<SemanticTokenSpan>) {
@@ -756,10 +990,7 @@ impl SyntaxEngine {
         }
     }
 
-    /// Renders a single row of text into a sequence of styled Ratatui [`Span`] elements.
-    ///
-    /// Prioritizes compiler-grade LSP semantic tokens when available, falling back to
-    /// the lightweight universal lexical scanner.
+    /// Renders a single row of text into styled Ratatui Spans.
     pub fn highlight_line(&self, line_text: &str, line_idx: usize) -> Vec<Span<'static>> {
         if line_text.is_empty() {
             return vec![Span::raw("")];
@@ -783,11 +1014,9 @@ impl SyntaxEngine {
             return vec![Span::raw("")];
         }
 
-        // Start with default foreground color for every character cell
         let default_style = Style::default().fg(Color::Rgb(215, 220, 230));
         let mut styles = vec![default_style; chars.len()];
 
-        // Overwrite cell styles directly: overlapping tokens will never duplicate text
         for tok in tokens {
             let start = tok.start_col;
             let end = (start + tok.length).min(chars.len());
@@ -799,7 +1028,6 @@ impl SyntaxEngine {
             }
         }
 
-        // Consolidate adjacent characters sharing identical styles into Spans
         let mut spans = Vec::new();
         let mut chunk = String::new();
         let mut current_style = styles[0];
@@ -821,162 +1049,30 @@ impl SyntaxEngine {
         spans
     }
 
-    fn style_for_token_type(token_type: usize) -> Style {
+    fn style_for_token_type(token_type: CanonicalTokenType) -> Style {
         match token_type {
-            0 => Style::default().fg(Color::Rgb(140, 180, 240)), // namespace
-            1 | 2 | 3 | 4 | 5 => Style::default().fg(Color::Rgb(240, 200, 100)), // type, class, enum, struct
-            7 | 8 => Style::default().fg(Color::Rgb(220, 225, 235)), // parameter, variable
-            9 => Style::default().fg(Color::Rgb(120, 215, 235)),     // property
-            11 | 12 => Style::default()
-                .fg(Color::Rgb(130, 200, 255))
-                .add_modifier(Modifier::BOLD), // function, method
-            13 => Style::default().fg(Color::Rgb(210, 140, 240)),    // macro
-            14 => Style::default()
-                .fg(Color::Rgb(240, 110, 140))
-                .add_modifier(Modifier::BOLD), // keyword
-            15 => Style::default()
-                .fg(Color::Rgb(110, 120, 140))
-                .add_modifier(Modifier::ITALIC), // comment
-            16 => Style::default().fg(Color::Rgb(150, 215, 140)),    // string
-            17 => Style::default().fg(Color::Rgb(230, 160, 100)),    // number
-            18 => Style::default().fg(Color::Rgb(180, 190, 210)),    // operator
-            _ => Style::default().fg(Color::Rgb(215, 220, 230)),
+            CanonicalTokenType::Keyword => Style::default()
+                .fg(Color::Rgb(220, 110, 240))
+                .add_modifier(Modifier::BOLD),
+            CanonicalTokenType::Type => Style::default().fg(Color::Rgb(240, 200, 90)),
+            CanonicalTokenType::Function => Style::default().fg(Color::Rgb(100, 175, 255)),
+            CanonicalTokenType::String => Style::default().fg(Color::Rgb(150, 215, 120)),
+            CanonicalTokenType::Number => Style::default().fg(Color::Rgb(250, 175, 95)),
+            CanonicalTokenType::Comment => Style::default()
+                .fg(Color::Rgb(115, 125, 140))
+                .add_modifier(Modifier::ITALIC),
+            CanonicalTokenType::Macro => Style::default()
+                .fg(Color::Rgb(80, 210, 240))
+                .add_modifier(Modifier::BOLD),
+            CanonicalTokenType::Operator => Style::default().fg(Color::Rgb(140, 150, 170)),
+            CanonicalTokenType::Namespace => Style::default().fg(Color::Rgb(140, 180, 240)),
+            CanonicalTokenType::Variable
+            | CanonicalTokenType::Parameter
+            | CanonicalTokenType::Property
+            | CanonicalTokenType::Other => Style::default().fg(Color::Rgb(220, 225, 235)),
         }
     }
 
-    fn highlight_code_universal(&self, line_text: &str) -> Vec<Span<'static>> {
-        let mut spans = Vec::new();
-        let chars: Vec<char> = line_text.chars().collect();
-        let len = chars.len();
-        let mut idx = 0;
-
-        let comment_prefix = match self.language {
-            SupportedLanguage::Python
-            | SupportedLanguage::Bash
-            | SupportedLanguage::Yaml
-            | SupportedLanguage::Toml => Some("#"),
-            SupportedLanguage::Lua => Some("--"),
-            _ => Some("//"),
-        };
-
-        while idx < len {
-            if let Some(prefix) = comment_prefix {
-                let rest: String = chars[idx..].iter().collect();
-                if rest.starts_with(prefix) {
-                    spans.push(Span::styled(
-                        rest,
-                        Style::default()
-                            .fg(Color::Rgb(115, 125, 140))
-                            .add_modifier(Modifier::ITALIC),
-                    ));
-                    break;
-                }
-            }
-
-            if chars[idx] == '"' || chars[idx] == '\'' || chars[idx] == '`' {
-                let quote = chars[idx];
-                let mut end = idx + 1;
-                while end < len {
-                    if chars[end] == '\\' && end + 1 < len {
-                        end += 2;
-                        continue;
-                    }
-                    if chars[end] == quote {
-                        end += 1;
-                        break;
-                    }
-                    end += 1;
-                }
-                let token: String = chars[idx..end].iter().collect();
-                spans.push(Span::styled(
-                    token,
-                    Style::default().fg(Color::Rgb(150, 215, 120)),
-                ));
-                idx = end;
-                continue;
-            }
-
-            if chars[idx].is_ascii_digit() {
-                let mut end = idx;
-                while end < len && (chars[end].is_ascii_alphanumeric() || chars[end] == '.') {
-                    end += 1;
-                }
-                let num: String = chars[idx..end].iter().collect();
-                spans.push(Span::styled(
-                    num,
-                    Style::default().fg(Color::Rgb(250, 175, 95)),
-                ));
-                idx = end;
-                continue;
-            }
-
-            if chars[idx].is_alphabetic() || chars[idx] == '_' {
-                let mut end = idx;
-                while end < len && (chars[end].is_alphanumeric() || chars[end] == '_') {
-                    end += 1;
-                }
-                let word: String = chars[idx..end].iter().collect();
-
-                let mut lookahead = end;
-                while lookahead < len && chars[lookahead].is_whitespace() {
-                    lookahead += 1;
-                }
-                let is_func = lookahead < len && chars[lookahead] == '(';
-
-                let style = match word.as_str() {
-                    "fn" | "func" | "def" | "function" | "let" | "mut" | "const" | "var" | "if"
-                    | "else" | "match" | "switch" | "case" | "for" | "while" | "loop"
-                    | "return" | "break" | "continue" | "import" | "from" | "pub" | "struct"
-                    | "enum" | "class" | "interface" | "impl" | "trait" | "type" | "package"
-                    | "chan" | "select" | "defer" | "go" | "range" | "map" => Style::default()
-                        .fg(Color::Rgb(220, 110, 240))
-                        .add_modifier(Modifier::BOLD),
-                    "true" | "false" | "None" | "null" | "nil" | "iota" | "Some" | "Ok" | "Err" => {
-                        Style::default().fg(Color::Rgb(240, 200, 90))
-                    }
-                    "u8" | "u16" | "u32" | "u64" | "usize" | "i8" | "i16" | "i32" | "i64"
-                    | "isize" | "f32" | "f64" | "bool" | "char" | "str" | "String" | "Vec"
-                    | "int" | "int8" | "int16" | "int32" | "int64" | "uint" | "uint8"
-                    | "uint16" | "uint32" | "uint64" | "uintptr" | "float32" | "float64"
-                    | "string" | "byte" | "rune" | "error" | "boolean" | "void" => {
-                        Style::default().fg(Color::Rgb(240, 200, 100))
-                    }
-                    "make" | "new" | "len" | "cap" | "append" | "copy" | "delete" | "close"
-                    | "panic" | "recover" | "print" | "println" => {
-                        Style::default().fg(Color::Rgb(100, 175, 255))
-                    }
-
-                    _ => {
-                        if is_func {
-                            Style::default().fg(Color::Rgb(100, 175, 255))
-                        } else if word.chars().next().is_some_and(char::is_uppercase) {
-                            Style::default().fg(Color::Rgb(240, 200, 90))
-                        } else {
-                            Style::default().fg(Color::Rgb(220, 225, 235))
-                        }
-                    }
-                };
-
-                spans.push(Span::styled(word, style));
-                idx = end;
-                continue;
-            }
-
-            spans.push(Span::styled(
-                chars[idx].to_string(),
-                Style::default().fg(Color::Rgb(140, 150, 170)),
-            ));
-            idx += 1;
-        }
-
-        spans
-    }
-
-    /// Highlights a single line of Markdown text based on structural block prefixes.
-    ///
-    /// Applies distinct colors and bold formatting to headers (`#`, `##`, `###`),
-    /// accent colors to code fences (```` ``` ````), and neutral foreground tones
-    /// to standard text.
     fn highlight_markdown(line_text: &str) -> Vec<Span<'static>> {
         let trimmed = line_text.trim_start();
         if trimmed.starts_with("# ") {
@@ -1013,47 +1109,60 @@ impl SyntaxEngine {
         }
     }
 
-    /// Performs lexical analysis on code lines for languages with keyword-based tokenization.
-    ///
-    /// Scans characters sequentially to tokenize:
-    /// - Line comments (`//` for Rust, `#` for Python)
-    /// - Single and double-quoted string literals with escape sequence handling
-    /// - Numeric constants (integers and floats)
-    /// - Rust macro calls (detecting identifier followed by `!`)
-    /// - Function calls (detecting identifier followed by whitespace and `(`)
-    /// - Language-specific reserved keywords and built-in type identifiers
-    /// - Punctuation and operators
-    fn highlight_code(line_text: &str, lang: SupportedLanguage) -> Vec<Span<'static>> {
+    fn highlight_code_universal(&self, line_text: &str) -> Vec<Span<'static>> {
         let mut spans = Vec::new();
-        let mut idx = 0;
         let chars: Vec<char> = line_text.chars().collect();
         let len = chars.len();
+        let mut idx = 0;
+
+        let comment_prefix = match self.language {
+            SupportedLanguage::Python
+            | SupportedLanguage::Bash
+            | SupportedLanguage::Yaml
+            | SupportedLanguage::Toml
+            | SupportedLanguage::Ruby => Some("#"),
+            SupportedLanguage::Lua | SupportedLanguage::Sql => Some("--"),
+            _ => Some("//"),
+        };
 
         while idx < len {
-            // Line Comments
-            if (lang == SupportedLanguage::Rust
-                && idx + 1 < len
-                && chars[idx] == '/'
-                && chars[idx + 1] == '/')
-                || (lang == SupportedLanguage::Python && chars[idx] == '#')
-            {
+            if let Some(prefix) = comment_prefix {
                 let rest: String = chars[idx..].iter().collect();
-                spans.push(Span::styled(
-                    rest,
-                    Style::default()
-                        .fg(Color::Rgb(115, 125, 140))
-                        .add_modifier(Modifier::ITALIC),
-                ));
-                break;
+                if rest.starts_with(prefix) {
+                    spans.push(Span::styled(
+                        rest,
+                        Style::default()
+                            .fg(Color::Rgb(115, 125, 140))
+                            .add_modifier(Modifier::ITALIC),
+                    ));
+                    break;
+                }
             }
 
-            // String Literals
-            if chars[idx] == '"' || chars[idx] == '\'' {
+            // Builtin compiler intrinsics (Zig @import, @as, @intCast, etc.)
+            if chars[idx] == '@' && idx + 1 < len && chars[idx + 1].is_alphabetic() {
+                let start = idx;
+                idx += 1;
+                while idx < len && (chars[idx].is_alphanumeric() || chars[idx] == '_') {
+                    idx += 1;
+                }
+                let builtin: String = chars[start..idx].iter().collect();
+                spans.push(Span::styled(
+                    builtin,
+                    Style::default()
+                        .fg(Color::Rgb(80, 210, 240))
+                        .add_modifier(Modifier::BOLD),
+                ));
+                continue;
+            }
+
+            // String literals
+            if chars[idx] == '"' || chars[idx] == '\'' || chars[idx] == '`' {
                 let quote = chars[idx];
                 let mut end = idx + 1;
                 while end < len {
                     if chars[end] == '\\' && end + 1 < len {
-                        end += 2; // Skip escaped character
+                        end += 2;
                         continue;
                     }
                     if chars[end] == quote {
@@ -1071,7 +1180,7 @@ impl SyntaxEngine {
                 continue;
             }
 
-            // Numeric Literals
+            // Numbers
             if chars[idx].is_ascii_digit() {
                 let mut end = idx;
                 while end < len && (chars[end].is_ascii_alphanumeric() || chars[end] == '.') {
@@ -1086,7 +1195,7 @@ impl SyntaxEngine {
                 continue;
             }
 
-            // Identifiers, Keywords, Macros & Functions
+            // Keywords, Builtins, and Types
             if chars[idx].is_alphabetic() || chars[idx] == '_' {
                 let mut end = idx;
                 while end < len && (chars[end].is_alphanumeric() || chars[end] == '_') {
@@ -1094,77 +1203,52 @@ impl SyntaxEngine {
                 }
                 let word: String = chars[idx..end].iter().collect();
 
-                // Rust macro check: println!, format!, vec!
-                if lang == SupportedLanguage::Rust && end < len && chars[end] == '!' {
-                    end += 1;
-                    let macro_word: String = chars[idx..end].iter().collect();
-                    spans.push(Span::styled(
-                        macro_word,
-                        Style::default()
-                            .fg(Color::Rgb(80, 210, 240))
-                            .add_modifier(Modifier::BOLD),
-                    ));
-                    idx = end;
-                    continue;
-                }
-
-                // Function call lookahead: identifier followed by optional whitespace and '('
                 let mut lookahead = end;
                 while lookahead < len && chars[lookahead].is_whitespace() {
                     lookahead += 1;
                 }
                 let is_func = lookahead < len && chars[lookahead] == '(';
 
-                let style = match lang {
-                    SupportedLanguage::Rust => match word.as_str() {
-                        "fn" | "let" | "mut" | "pub" | "struct" | "enum" | "match" | "if"
-                        | "else" | "impl" | "for" | "in" | "while" | "return" | "use" | "mod"
-                        | "async" | "await" | "trait" | "type" | "where" | "loop" | "as"
-                        | "break" | "continue" | "const" | "static" | "ref" | "move" => {
-                            Style::default()
-                                .fg(Color::Rgb(220, 110, 240))
-                                .add_modifier(Modifier::BOLD)
-                        }
-                        "i8" | "i16" | "i32" | "i64" | "i128" | "u8" | "u16" | "u32" | "u64"
-                        | "u128" | "usize" | "isize" | "f32" | "f64" | "bool" | "char" | "str"
-                        | "String" | "Option" | "Result" | "Some" | "None" | "Ok" | "Err"
-                        | "Self" | "self" | "Vec" | "Box" | "Rc" | "Arc" => {
+                let style = match word.as_str() {
+                    // Control flow & definitions
+                    "fn" | "func" | "def" | "function" | "proc" | "let" | "mut" | "const"
+                    | "var" | "val" | "if" | "else" | "match" | "switch" | "case" | "for"
+                    | "while" | "loop" | "do" | "end" | "return" | "break" | "continue"
+                    | "import" | "from" | "pub" | "export" | "extern" | "struct" | "enum"
+                    | "union" | "class" | "interface" | "trait" | "impl" | "type" | "package"
+                    | "comptime" | "inline" | "defer" | "errdefer" | "catch" | "try" | "throw"
+                    | "throws" | "usingnamespace" | "threadlocal" | "unreachable" | "test"
+                    | "async" | "await" | "suspend" | "resume" | "chan" | "select" | "go"
+                    | "range" | "map" | "yield" | "package_clause" | "public" | "private"
+                    | "protected" | "static" | "final" | "override" | "guard" => Style::default()
+                        .fg(Color::Rgb(220, 110, 240))
+                        .add_modifier(Modifier::BOLD),
+                    // Booleans and primitives
+                    "true" | "false" | "None" | "null" | "nil" | "undefined" | "iota" | "Some"
+                    | "Ok" | "Err" => Style::default().fg(Color::Rgb(240, 200, 90)),
+                    // Types
+                    "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "i8" | "i16" | "i32"
+                    | "i64" | "i128" | "isize" | "f16" | "f32" | "f64" | "f128" | "bool"
+                    | "char" | "str" | "String" | "Vec" | "int" | "int8" | "int16" | "int32"
+                    | "int64" | "uint" | "uint8" | "uint16" | "uint32" | "uint64" | "uintptr"
+                    | "float" | "float32" | "float64" | "byte" | "rune" | "error" | "anyerror"
+                    | "anyopaque" | "noreturn" | "void" | "boolean" => {
+                        Style::default().fg(Color::Rgb(240, 200, 100))
+                    }
+                    // Common built-in utilities
+                    "make" | "new" | "len" | "cap" | "append" | "copy" | "delete" | "close"
+                    | "panic" | "recover" | "print" | "println" => {
+                        Style::default().fg(Color::Rgb(100, 175, 255))
+                    }
+                    _ => {
+                        if is_func {
+                            Style::default().fg(Color::Rgb(100, 175, 255))
+                        } else if word.chars().next().is_some_and(char::is_uppercase) {
                             Style::default().fg(Color::Rgb(240, 200, 90))
+                        } else {
+                            Style::default().fg(Color::Rgb(220, 225, 235))
                         }
-                        _ => {
-                            if is_func {
-                                Style::default().fg(Color::Rgb(100, 175, 255))
-                            } else if word.chars().next().is_some_and(char::is_uppercase) {
-                                Style::default().fg(Color::Rgb(240, 200, 90))
-                            } else {
-                                Style::default().fg(Color::Rgb(220, 225, 235))
-                            }
-                        }
-                    },
-                    SupportedLanguage::Python => match word.as_str() {
-                        "def" | "class" | "if" | "elif" | "else" | "for" | "while" | "return"
-                        | "import" | "from" | "as" | "with" | "try" | "except" | "finally"
-                        | "lambda" | "yield" | "pass" | "break" | "continue" | "in" | "is"
-                        | "not" | "and" | "or" | "global" | "nonlocal" | "assert" => {
-                            Style::default()
-                                .fg(Color::Rgb(220, 110, 240))
-                                .add_modifier(Modifier::BOLD)
-                        }
-                        "True" | "False" | "None" | "self" | "int" | "str" | "list" | "dict"
-                        | "set" | "tuple" | "bool" | "float" => {
-                            Style::default().fg(Color::Rgb(240, 200, 90))
-                        }
-                        _ => {
-                            if is_func {
-                                Style::default().fg(Color::Rgb(100, 175, 255))
-                            } else if word.chars().next().is_some_and(char::is_uppercase) {
-                                Style::default().fg(Color::Rgb(240, 200, 90))
-                            } else {
-                                Style::default().fg(Color::Rgb(220, 225, 235))
-                            }
-                        }
-                    },
-                    _ => Style::default().fg(Color::Rgb(220, 225, 235)),
+                    }
                 };
 
                 spans.push(Span::styled(word, style));
@@ -1172,7 +1256,6 @@ impl SyntaxEngine {
                 continue;
             }
 
-            // Operators & Punctuation
             spans.push(Span::styled(
                 chars[idx].to_string(),
                 Style::default().fg(Color::Rgb(140, 150, 170)),
@@ -1197,21 +1280,31 @@ pub fn file_icon_and_color(path: Option<&PathBuf>) -> (&'static str, Color) {
 
     match ext {
         "rs" => ("", Color::Rgb(235, 102, 60)),
-        "py" => ("", Color::Rgb(255, 212, 59)),
+        "py" | "pyi" => ("", Color::Rgb(255, 212, 59)),
         "go" => ("", Color::Rgb(80, 200, 240)),
-        "zig" => ("", Color::Rgb(245, 160, 60)),
-        "js" | "jsx" => ("", Color::Rgb(245, 215, 75)),
-        "ts" | "tsx" => ("", Color::Rgb(80, 160, 240)),
-        "html" => ("", Color::Rgb(240, 100, 60)),
+        "zig" | "zon" => ("", Color::Rgb(245, 160, 60)),
+        "c" | "h" => ("", Color::Rgb(80, 140, 255)),
+        "cpp" | "hpp" | "cc" | "cxx" => ("", Color::Rgb(80, 140, 255)),
+        "js" | "jsx" | "mjs" | "cjs" => ("", Color::Rgb(245, 215, 75)),
+        "ts" | "tsx" | "mts" | "cts" => ("", Color::Rgb(80, 160, 240)),
+        "html" | "htm" => ("", Color::Rgb(240, 100, 60)),
         "css" | "scss" | "less" => ("", Color::Rgb(80, 160, 240)),
+        "json" => ("", Color::Rgb(240, 200, 80)),
+        "toml" => ("", Color::Rgb(160, 80, 50)),
+        "yaml" | "yml" => ("", Color::Rgb(220, 100, 100)),
         "sh" | "bash" | "zsh" => ("", Color::Rgb(100, 200, 140)),
         "lua" => ("", Color::Rgb(80, 140, 240)),
-        "yaml" | "yml" => ("", Color::Rgb(220, 100, 100)),
-        "md" => ("", Color::Rgb(120, 180, 255)),
-        "toml" => ("", Color::Rgb(160, 80, 50)),
-        "json" => ("", Color::Rgb(240, 200, 80)),
-        "c" | "h" => ("", Color::Rgb(80, 140, 255)),
-        "cpp" | "hpp" => ("", Color::Rgb(80, 140, 255)),
+        "md" | "markdown" => ("", Color::Rgb(120, 180, 255)),
+        "java" => ("", Color::Rgb(240, 80, 80)),
+        "cs" => ("󰌛", Color::Rgb(180, 120, 240)),
+        "php" => ("", Color::Rgb(130, 140, 220)),
+        "rb" | "rake" => ("", Color::Rgb(220, 60, 60)),
+        "kt" | "kts" => ("", Color::Rgb(160, 100, 240)),
+        "swift" => ("", Color::Rgb(240, 120, 60)),
+        "dart" => ("", Color::Rgb(80, 180, 240)),
+        "sql" => ("", Color::Rgb(220, 140, 80)),
+        "scala" | "sc" => ("", Color::Rgb(220, 60, 60)),
+        "odin" => ("", Color::Rgb(80, 180, 220)),
         _ => ("󰈔", Color::Rgb(160, 165, 175)),
     }
 }
