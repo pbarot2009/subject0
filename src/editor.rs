@@ -868,21 +868,33 @@ impl Editor {
         }
 
         self.snapshot();
-        let line_end = self.rope.line_to_char(self.cursor_y + 1) - 1;
-        self.rope.remove(line_end..=line_end);
+        let next_line_start = self.rope.line_to_char(self.cursor_y + 1);
+        let del_range = if next_line_start >= 2
+            && self.rope.char(next_line_start - 1) == '\n'
+            && self.rope.char(next_line_start - 2) == '\r'
+        {
+            (next_line_start - 2)..next_line_start
+        } else if next_line_start > 0 {
+            (next_line_start - 1)..next_line_start
+        } else {
+            0..0
+        };
 
-        let next_line_start = line_end;
+        let insert_pos = del_range.start;
+        self.rope.remove(del_range);
+
         let mut ws_len = 0;
-        while next_line_start + ws_len < self.rope.len_chars()
-            && self.rope.char(next_line_start + ws_len).is_whitespace()
+        while insert_pos + ws_len < self.rope.len_chars()
+            && (self.rope.char(insert_pos + ws_len) == ' '
+                || self.rope.char(insert_pos + ws_len) == '\t')
         {
             ws_len += 1;
         }
 
         if ws_len > 0 {
-            self.rope.remove(next_line_start..next_line_start + ws_len);
+            self.rope.remove(insert_pos..insert_pos + ws_len);
         }
-        self.rope.insert_char(next_line_start, ' ');
+        self.rope.insert_char(insert_pos, ' ');
 
         self.modified = true;
         self.on_buffer_modified();
@@ -892,19 +904,76 @@ impl Editor {
     /// Creates an empty line beneath the current line and switches into [`Mode::Insert`].
     pub fn insert_line_below(&mut self) {
         self.snapshot();
-        self.cursor_x = self.current_line_len();
-        self.insert_newline();
+        let indent: String = if self.cursor_y < self.rope.len_lines() {
+            self.rope
+                .line(self.cursor_y)
+                .chars()
+                .take_while(|c| *c == ' ' || *c == '\t')
+                .collect()
+        } else {
+            String::new()
+        };
+
+        let line_len_with_nl = if self.cursor_y < self.rope.len_lines() {
+            self.rope.line(self.cursor_y).len_chars()
+        } else {
+            0
+        };
+        let line_start = if self.cursor_y < self.rope.len_lines() {
+            self.rope.line_to_char(self.cursor_y)
+        } else {
+            self.rope.len_chars()
+        };
+
+        let has_newline = if self.cursor_y < self.rope.len_lines() {
+            let l = self.rope.line(self.cursor_y);
+            let len = l.len_chars();
+            len > 0 && l.char(len - 1) == '\n'
+        } else {
+            false
+        };
+
+        let insert_idx = line_start + line_len_with_nl;
+        let to_insert = if has_newline {
+            format!("{indent}\n")
+        } else {
+            format!("\n{indent}")
+        };
+
+        self.rope.insert(insert_idx, &to_insert);
+        self.cursor_y += 1;
+        self.cursor_x = indent.chars().count();
+        self.modified = true;
         self.mode = Mode::Insert;
+        self.completion_visible = false;
+        self.on_buffer_modified();
     }
 
     /// Creates an empty line above the current line and switches into [`Mode::Insert`].
     pub fn insert_line_above(&mut self) {
         self.snapshot();
-        self.cursor_x = 0;
-        let idx = self.rope.line_to_char(self.cursor_y);
-        self.rope.insert_char(idx, '\n');
+        let indent: String = if self.cursor_y < self.rope.len_lines() {
+            self.rope
+                .line(self.cursor_y)
+                .chars()
+                .take_while(|c| *c == ' ' || *c == '\t')
+                .collect()
+        } else {
+            String::new()
+        };
+
+        let idx = if self.cursor_y < self.rope.len_lines() {
+            self.rope.line_to_char(self.cursor_y)
+        } else {
+            0
+        };
+
+        let to_insert = format!("{indent}\n");
+        self.rope.insert(idx, &to_insert);
+        self.cursor_x = indent.chars().count();
         self.modified = true;
         self.mode = Mode::Insert;
+        self.completion_visible = false;
         self.on_buffer_modified();
     }
 
@@ -1011,7 +1080,12 @@ impl Editor {
             let prev_len = line_len(&self.rope, self.cursor_y - 1);
             let current_line_idx = self.rope.line_to_char(self.cursor_y);
 
-            if current_line_idx > 0 {
+            if current_line_idx >= 2
+                && self.rope.char(current_line_idx - 1) == '\n'
+                && self.rope.char(current_line_idx - 2) == '\r'
+            {
+                self.rope.remove(current_line_idx - 2..current_line_idx);
+            } else if current_line_idx > 0 {
                 self.rope.remove(current_line_idx - 1..current_line_idx);
             }
 
@@ -1020,6 +1094,7 @@ impl Editor {
             self.modified = true;
             self.on_buffer_modified();
         }
+
         self.completion_visible = false;
     }
 
@@ -1058,19 +1133,21 @@ impl Editor {
         self.on_buffer_modified();
     }
 
-    /// Deletes a single character situated directly under the cursor without modifying the clipboard.
+    /// Deletes a single character situated directly under the cursor and stores it in [`Self::clipboard`].
     pub fn delete_under_cursor(&mut self) {
         let line_len = self.current_line_len();
         if self.cursor_x < line_len {
             self.snapshot();
             let idx = self.char_index();
+            self.clipboard = self.rope.char(idx).to_string();
             self.rope.remove(idx..=idx);
             self.modified = true;
+            self.clamp_cursor();
             self.on_buffer_modified();
         }
     }
 
-    /// Deletes the entire active line including its trailing newline delimiter.
+    /// Deletes the entire active line including its trailing newline delimiter and stores it in [`Self::clipboard`].
     pub fn delete_current_line(&mut self) {
         if self.rope.len_lines() == 0 {
             return;
@@ -1084,8 +1161,10 @@ impl Editor {
         };
 
         if start < end {
+            self.clipboard = self.rope.slice(start..end).to_string();
             self.rope.remove(start..end);
             self.modified = true;
+            self.status_msg = "Cut line".to_string();
             self.on_buffer_modified();
         }
 
