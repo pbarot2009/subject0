@@ -112,9 +112,7 @@ fn setup_panic_hook() {
     }));
 }
 
-// -----------------------------------------------------------------------------
-// Application Lifecycle & Event Loop
-// -----------------------------------------------------------------------------
+// === Application Lifecycle & Event Loop ===
 
 /// Application entry point initializing terminal subsystems and running the event loop.
 ///
@@ -255,9 +253,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-// -----------------------------------------------------------------------------
-// Touch & Mouse Handling
-// -----------------------------------------------------------------------------
+// === Touch & Mouse Handling ===
 
 /// Translates raw mouse and touchscreen interactions into editor actions.
 ///
@@ -501,9 +497,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
     }
 }
 
-// -----------------------------------------------------------------------------
-// Keyboard Controller
-// -----------------------------------------------------------------------------
+// === Keyboard Controller ===
 
 /// Dispatches raw key events according to the active mode and focus context.
 ///
@@ -910,9 +904,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
     editor.clamp_cursor();
 }
 
-// -----------------------------------------------------------------------------
-// UI Render Pipeline
-// -----------------------------------------------------------------------------
+// === UI Render Pipeline ===
 
 /// Renders the complete editor user interface into the Ratatui frame buffer.
 ///

@@ -35,9 +35,7 @@ use tokio::{
 };
 use tree_sitter::{Parser, Tree};
 
-// -----------------------------------------------------------------------------
-// LSP Types & Actor Protocol
-// -----------------------------------------------------------------------------
+// === LSP Types & Actor Protocol ===
 
 /// Represents a single diagnostic entry emitted by an LSP server.
 ///
@@ -270,7 +268,10 @@ pub async fn run_lsp_actor(
     tx: mpsc::UnboundedSender<LspOutbound>,
     initial_text: String,
 ) {
-    let Some(bin_path) = resolve_binary_path(&server_cmd) else { let _ = tx.send(LspOutbound::Status(LspStatus::NotFound(server_cmd))); return; };
+    let Some(bin_path) = resolve_binary_path(&server_cmd) else {
+        let _ = tx.send(LspOutbound::Status(LspStatus::NotFound(server_cmd)));
+        return;
+    };
 
     let _ = tx.send(LspOutbound::Status(LspStatus::Starting(server_cmd.clone())));
 
@@ -494,9 +495,7 @@ pub async fn run_lsp_actor(
     }
 }
 
-// -----------------------------------------------------------------------------
-// Syntax Highlighting Engine
-// -----------------------------------------------------------------------------
+// === Syntax Highlighting Engine ===
 
 /// Identifies the source programming language or document format for syntax styling.
 #[derive(Clone, Copy, PartialEq, Eq)]

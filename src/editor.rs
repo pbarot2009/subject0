@@ -69,9 +69,7 @@ pub enum Focus {
     Explorer,
 }
 
-// -----------------------------------------------------------------------------
-// Command Palette Definitions
-// -----------------------------------------------------------------------------
+// === Command Palette Definitions ===
 
 /// Enumeration of all discrete operations dispatchable via the interactive command palette.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -271,9 +269,7 @@ impl CommandPalette {
     }
 }
 
-// -----------------------------------------------------------------------------
 // File Explorer
-// -----------------------------------------------------------------------------
 
 /// Represents a single node (file or directory) within the hierarchical file tree.
 #[derive(Clone, Debug)]
@@ -402,7 +398,8 @@ impl FileExplorer {
             let dir_path = self.entries[idx].path.clone();
             let children = Self::read_directory(&dir_path, current_depth + 1);
 
-            let insert_pos = idx + 1; self.entries.splice(insert_pos..insert_pos, children);
+            let insert_pos = idx + 1;
+            self.entries.splice(insert_pos..insert_pos, children);
         }
     }
 
@@ -416,9 +413,7 @@ impl FileExplorer {
     }
 }
 
-// -----------------------------------------------------------------------------
-// Editor Buffer Model
-// -----------------------------------------------------------------------------
+// === Editor Buffer Model ===
 
 /// Primary application state model encapsulating buffer data, UI state, and subsystems.
 #[allow(clippy::struct_excessive_bools)]

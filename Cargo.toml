@@ -1,6 +1,6 @@
 [package]
 name = "subject0"
-version = "0.1.0"
+version = "0.1.0-dev"
 edition = "2021"
 authors = ["pbarot2009"]
 description = "Modal terminal code editor with LSP client and Tree-sitter highlighting."
