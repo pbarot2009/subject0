@@ -45,9 +45,11 @@ use std::{
     cmp::Ordering,
     env,
     io::{stdout, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::Duration,
 };
+
+const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 use anyhow::Result;
 use crossterm::{
@@ -113,11 +115,11 @@ fn setup_panic_hook() {
 }
 
 /// Spawns an LSP background actor using the unified outbound channel.
-fn start_lsp_for_file(editor: &mut Editor, path: &PathBuf, lang_id: &str, cmd: &str) {
+fn start_lsp_for_file(editor: &mut Editor, path: &Path, lang_id: &str, cmd: &str) {
     if let Some(out_tx) = &editor.lsp_out_tx {
         let (in_tx, in_rx) = mpsc::unbounded_channel::<LspInbound>();
         editor.lsp_tx = Some(in_tx);
-        let p = path.clone();
+        let p = path.to_path_buf();
         let initial_text = editor.rope.to_string();
         tokio::spawn(run_lsp_actor(
             p,
@@ -1392,7 +1394,6 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         Span::styled("", Style::default().bg(bar_bg).fg(pill_bg)),
     ]);
 
-    const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let spinner_icon = SPINNER[(editor.spinner_tick / 3) % SPINNER.len()];
 
     let mut status_right_spans = Vec::new();

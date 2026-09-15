@@ -244,23 +244,7 @@ pub async fn send_lsp_message<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
-/// Background actor responsible for orchestrating an LSP server process session.
-///
-/// # Lifecycle Stages
-/// 1. **Binary Discovery**: Resolves the executable path using [`resolve_binary_path`].
-/// 2. **Process Spawning**: Spawns the child process with piped standard I/O handles.
-/// 3. **Handshake**:
-///    - Dispatches the `initialize` request (request ID `1`) configured with client capabilities
-///      (full sync, completion, diagnostics) and current root URI.
-///    - Awaits the response with matching ID `1`.
-///    - Sends the `initialized` notification.
-/// 4. **Document Ingestion**: Sends an initial `textDocument/didOpen` notification with `initial_text`.
-/// 5. **Event Multiplexing**: Enters a bi-directional `tokio::select!` event loop:
-///    - **Inbound (`rx`)**: Processes changes, saves, completions, and file open events,
-///      serializing them to server stdin.
-///    - **Outbound (`stdout`)**: Consumes incoming JSON-RPC notifications and responses,
-///      extracting diagnostics and completion responses and routing them over `tx`.
-/// Resolves the actual binary name and standard arguments (e.g. `--stdio`) for an LSP command.
+/// Resolves the actual binary name and standard arguments for an LSP command.
 pub fn server_cmd_and_args(cmd: &str) -> (String, Vec<&'static str>) {
     match cmd {
         "pyright" => {
@@ -278,6 +262,22 @@ pub fn server_cmd_and_args(cmd: &str) -> (String, Vec<&'static str>) {
     }
 }
 
+/// Background actor responsible for orchestrating an LSP server process session.
+///
+/// # Lifecycle Stages
+/// 1. **Binary Discovery**: Resolves the executable path using [`resolve_binary_path`].
+/// 2. **Process Spawning**: Spawns the child process with piped standard I/O handles.
+/// 3. **Handshake**:
+///    - Dispatches the `initialize` request (request ID `1`) configured with client capabilities
+///      (full sync, completion, diagnostics) and current root URI.
+///    - Awaits the response with matching ID `1`.
+///    - Sends the `initialized` notification.
+/// 4. **Document Ingestion**: Sends an initial `textDocument/didOpen` notification with `initial_text`.
+/// 5. **Event Multiplexing**: Enters a bi-directional `tokio::select!` event loop:
+///    - **Inbound (`rx`)**: Processes changes, saves, completions, and file open events,
+///      serializing them to server stdin.
+///    - **Outbound (`stdout`)**: Consumes incoming JSON-RPC notifications and responses,
+///      extracting diagnostics and completion responses and routing them over `tx`.
 pub async fn run_lsp_actor(
     initial_file: PathBuf,
     initial_lang: String,
@@ -318,9 +318,8 @@ pub async fn run_lsp_actor(
     };
     let mut current_file_uri = file_to_uri(&initial_file);
 
-    let root_path = env::current_dir()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| ".".to_string());
+    let root_path =
+        env::current_dir().map_or_else(|_| ".".to_string(), |p| p.to_string_lossy().to_string());
 
     // Construct the standard LSP initialization payload announcing client capabilities.
     let init_req = serde_json::json!({
@@ -577,7 +576,7 @@ impl SupportedLanguage {
         }
     }
 
-    pub fn lsp_id(&self) -> &'static str {
+    pub fn lsp_id(self) -> &'static str {
         match self {
             SupportedLanguage::Rust => "rust",
             SupportedLanguage::Go => "go",
@@ -591,7 +590,7 @@ impl SupportedLanguage {
     }
 
     /// Returns candidate language server binary names in priority order.
-    pub fn candidate_servers(&self) -> &'static [&'static str] {
+    pub fn candidate_servers(self) -> &'static [&'static str] {
         match self {
             SupportedLanguage::Rust => &["rust-analyzer"],
             SupportedLanguage::Go => &["gopls"],
@@ -611,7 +610,7 @@ impl SupportedLanguage {
     }
 
     /// Scans the system for installed candidate servers.
-    pub fn installed_servers(&self) -> Vec<String> {
+    pub fn installed_servers(self) -> Vec<String> {
         self.candidate_servers()
             .iter()
             .filter(|cmd| resolve_binary_path(cmd).is_some())
