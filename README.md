@@ -40,10 +40,10 @@ The compiled binary will be located at `target/release/s0`. Copy it to a directo
 cp target/release/s0 ~/.local/bin/
 ```
 
-## Usage
+## CLI Usage
 
 ```bash
-s0 [FILE_PATH]
+s0 [OPTIONS] [PATH] [+LINE]
 ```
 
 If no path is provided, an empty scratch buffer opens.
