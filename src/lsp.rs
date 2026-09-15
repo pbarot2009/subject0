@@ -260,6 +260,24 @@ pub async fn send_lsp_message<W: AsyncWriteExt + Unpin>(
 ///      serializing them to server stdin.
 ///    - **Outbound (`stdout`)**: Consumes incoming JSON-RPC notifications and responses,
 ///      extracting diagnostics and completion responses and routing them over `tx`.
+/// Resolves the actual binary name and standard arguments (e.g. `--stdio`) for an LSP command.
+pub fn server_cmd_and_args(cmd: &str) -> (String, Vec<&'static str>) {
+    match cmd {
+        "pyright" => {
+            if resolve_binary_path("pyright-langserver").is_some() {
+                ("pyright-langserver".to_string(), vec!["--stdio"])
+            } else {
+                ("pyright".to_string(), vec!["--stdio"])
+            }
+        }
+        "pyright-langserver" => ("pyright-langserver".to_string(), vec!["--stdio"]),
+        "typescript-language-server"
+        | "vscode-html-language-server"
+        | "vscode-css-language-server" => (cmd.to_string(), vec!["--stdio"]),
+        _ => (cmd.to_string(), vec![]),
+    }
+}
+
 pub async fn run_lsp_actor(
     initial_file: PathBuf,
     initial_lang: String,
@@ -268,14 +286,17 @@ pub async fn run_lsp_actor(
     tx: mpsc::UnboundedSender<LspOutbound>,
     initial_text: String,
 ) {
-    let Some(bin_path) = resolve_binary_path(&server_cmd) else {
+    let (resolved_cmd, args) = server_cmd_and_args(&server_cmd);
+    let Some(bin_path) = resolve_binary_path(&resolved_cmd) else {
         let _ = tx.send(LspOutbound::Status(LspStatus::NotFound(server_cmd)));
         return;
     };
 
     let _ = tx.send(LspOutbound::Status(LspStatus::Starting(server_cmd.clone())));
 
-    let mut child = match TokioCommand::new(bin_path)
+    let mut cmd_builder = TokioCommand::new(bin_path);
+    cmd_builder.args(&args);
+    let mut child = match cmd_builder
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -297,6 +318,10 @@ pub async fn run_lsp_actor(
     };
     let mut current_file_uri = file_to_uri(&initial_file);
 
+    let root_path = env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+
     // Construct the standard LSP initialization payload announcing client capabilities.
     let init_req = serde_json::json!({
         "jsonrpc": "2.0",
@@ -304,18 +329,29 @@ pub async fn run_lsp_actor(
         "method": "initialize",
         "params": {
             "processId": std::process::id(),
+            "rootPath": root_path,
             "rootUri": root_uri,
+            "workspaceFolders": [
+                {
+                    "uri": root_uri,
+                    "name": "root"
+                }
+            ],
             "capabilities": {
+                "workspace": {
+                    "workspaceFolders": true
+                },
                 "textDocument": {
                     "synchronization": {
                         "openClose": true,
-                        "change": 1, // 1 = Full text synchronization
+                        "change": 1,
                         "save": { "includeText": false }
                     },
                     "completion": {
                         "completionItem": {
                             "snippetSupport": false,
-                            "documentationFormat": ["plaintext"]
+                            "commitCharactersSupport": true,
+                            "documentationFormat": ["plaintext", "markdown"]
                         }
                     },
                     "publishDiagnostics": {
@@ -469,11 +505,16 @@ pub async fn run_lsp_actor(
                         if let Some(arr) = items_array {
                             for item in arr {
                                 if let Some(label) = item.get("label").and_then(|l| l.as_str()) {
-                                    let insert_text = item
-                                        .get("insertText")
-                                        .and_then(|it| it.as_str())
-                                        .unwrap_or(label)
-                                        .to_string();
+                                    let insert_text = if let Some(it) = item.get("insertText").and_then(|it| it.as_str()) {
+                                        it.to_string()
+                                    } else if let Some(te) = item.get("textEdit") {
+                                        te.get("newText")
+                                            .and_then(|nt| nt.as_str())
+                                            .unwrap_or(label)
+                                            .to_string()
+                                    } else {
+                                        label.to_string()
+                                    };
                                     let detail = item
                                         .get("detail")
                                         .and_then(|d| d.as_str())
@@ -489,6 +530,7 @@ pub async fn run_lsp_actor(
                                 }
                             }
                         }
+
                         let _ = tx.send(LspOutbound::Completions { req_id: resp_id, items: results });
                     }
                 } else {
@@ -503,56 +545,105 @@ pub async fn run_lsp_actor(
 
 // === Syntax Highlighting Engine ===
 
-/// Identifies the source programming language or document format for syntax styling.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// Identifies the source programming language or document format.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SupportedLanguage {
-    /// Rust source file (`.rs`).
     Rust,
-    /// Python source file (`.py`).
+    Go,
     Python,
-    /// Markdown documentation file (`.md`).
+    Html,
+    Css,
+    JavaScript,
     Markdown,
-    /// Unrecognized file extension or raw plain text.
     Plain,
 }
 
-/// Core syntax engine coordinating tree-sitter AST parsing and lexical highlighting.
-pub struct SyntaxEngine {
-    /// Active language detected for the current buffer.
-    pub language: SupportedLanguage,
-    /// Tree-sitter parser instance for languages supporting concrete grammar compilation.
-    parser: Option<Parser>,
-    /// Most recently computed Tree-sitter concrete syntax tree.
-    #[allow(dead_code)]
-    tree: Option<Tree>,
-}
-
-impl SyntaxEngine {
-    /// Initializes a syntax engine configured for the file type indicated by `path`.
-    ///
-    /// Configures the internal Tree-sitter parser with the appropriate language grammar
-    /// (`tree-sitter-rust` or `tree-sitter-python`). Falls back to non-parser highlighting
-    /// for Markdown and plain text.
-    pub fn new(path: Option<&PathBuf>) -> Self {
+impl SupportedLanguage {
+    pub fn from_path(path: Option<&PathBuf>) -> Self {
         let ext = path
             .and_then(|p| p.extension())
             .and_then(|e| e.to_str())
             .unwrap_or("");
 
-        let (language, parser) = match ext {
-            "rs" => {
-                let mut p = Parser::new();
-                let _ = p.set_language(&tree_sitter_rust::language());
-                (SupportedLanguage::Rust, Some(p))
+        match ext {
+            "rs" => SupportedLanguage::Rust,
+            "go" => SupportedLanguage::Go,
+            "py" => SupportedLanguage::Python,
+            "html" | "htm" => SupportedLanguage::Html,
+            "css" | "scss" | "less" => SupportedLanguage::Css,
+            "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" => SupportedLanguage::JavaScript,
+            "md" | "markdown" => SupportedLanguage::Markdown,
+            _ => SupportedLanguage::Plain,
+        }
+    }
+
+    pub fn lsp_id(&self) -> &'static str {
+        match self {
+            SupportedLanguage::Rust => "rust",
+            SupportedLanguage::Go => "go",
+            SupportedLanguage::Python => "python",
+            SupportedLanguage::Html => "html",
+            SupportedLanguage::Css => "css",
+            SupportedLanguage::JavaScript => "javascript",
+            SupportedLanguage::Markdown => "markdown",
+            SupportedLanguage::Plain => "plaintext",
+        }
+    }
+
+    /// Returns candidate language server binary names in priority order.
+    pub fn candidate_servers(&self) -> &'static [&'static str] {
+        match self {
+            SupportedLanguage::Rust => &["rust-analyzer"],
+            SupportedLanguage::Go => &["gopls"],
+            SupportedLanguage::Python => &[
+                "pyright",
+                "pyright-langserver",
+                "pylsp",
+                "jedi-language-server",
+            ],
+            SupportedLanguage::Html => &["vscode-html-language-server", "html-languageserver"],
+            SupportedLanguage::Css => &["vscode-css-language-server", "css-languageserver"],
+            SupportedLanguage::JavaScript => {
+                &["typescript-language-server", "vtsls", "quick-lint-js"]
             }
-            "py" => {
-                let mut p = Parser::new();
-                let _ = p.set_language(&tree_sitter_python::language());
-                (SupportedLanguage::Python, Some(p))
+            _ => &[],
+        }
+    }
+
+    /// Scans the system for installed candidate servers.
+    pub fn installed_servers(&self) -> Vec<String> {
+        self.candidate_servers()
+            .iter()
+            .filter(|cmd| resolve_binary_path(cmd).is_some())
+            .map(|s| (*s).to_string())
+            .collect()
+    }
+}
+
+/// Core syntax engine coordinating tree-sitter AST parsing and lexical highlighting.
+pub struct SyntaxEngine {
+    pub language: SupportedLanguage,
+    parser: Option<Parser>,
+    #[allow(dead_code)]
+    tree: Option<Tree>,
+}
+
+impl SyntaxEngine {
+    pub fn new(path: Option<&PathBuf>) -> Self {
+        let language = SupportedLanguage::from_path(path);
+        let mut parser = None;
+
+        if language == SupportedLanguage::Rust {
+            let mut p = Parser::new();
+            if p.set_language(&tree_sitter_rust::language()).is_ok() {
+                parser = Some(p);
             }
-            "md" => (SupportedLanguage::Markdown, None),
-            _ => (SupportedLanguage::Plain, None),
-        };
+        } else if language == SupportedLanguage::Python {
+            let mut p = Parser::new();
+            if p.set_language(&tree_sitter_python::language()).is_ok() {
+                parser = Some(p);
+            }
+        }
 
         Self {
             language,
@@ -578,13 +669,16 @@ impl SyntaxEngine {
 
         match self.language {
             SupportedLanguage::Markdown => Self::highlight_markdown(line_text),
-            SupportedLanguage::Rust | SupportedLanguage::Python => {
-                Self::highlight_code(line_text, self.language)
+            SupportedLanguage::Rust
+            | SupportedLanguage::Python
+            | SupportedLanguage::Go
+            | SupportedLanguage::JavaScript => Self::highlight_code(line_text, self.language),
+            SupportedLanguage::Html | SupportedLanguage::Css | SupportedLanguage::Plain => {
+                vec![Span::styled(
+                    line_text.to_string(),
+                    Style::default().fg(Color::Rgb(215, 220, 230)),
+                )]
             }
-            SupportedLanguage::Plain => vec![Span::styled(
-                line_text.to_string(),
-                Style::default().fg(Color::Rgb(215, 220, 230)),
-            )],
         }
     }
 

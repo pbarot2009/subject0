@@ -112,6 +112,24 @@ fn setup_panic_hook() {
     }));
 }
 
+/// Spawns an LSP background actor using the unified outbound channel.
+fn start_lsp_for_file(editor: &mut Editor, path: &PathBuf, lang_id: &str, cmd: &str) {
+    if let Some(out_tx) = &editor.lsp_out_tx {
+        let (in_tx, in_rx) = mpsc::unbounded_channel::<LspInbound>();
+        editor.lsp_tx = Some(in_tx);
+        let p = path.clone();
+        let initial_text = editor.rope.to_string();
+        tokio::spawn(run_lsp_actor(
+            p,
+            lang_id.to_string(),
+            cmd.to_string(),
+            in_rx,
+            out_tx.clone(),
+            initial_text,
+        ));
+    }
+}
+
 // === Application Lifecycle & Event Loop ===
 
 /// Application entry point initializing terminal subsystems and running the event loop.
@@ -139,28 +157,33 @@ async fn main() -> Result<()> {
     let mut editor = Editor::new(target_path.clone())?;
 
     let (lsp_out_tx, mut lsp_out_rx) = mpsc::unbounded_channel::<LspOutbound>();
-    let (lsp_in_tx, lsp_in_rx) = mpsc::unbounded_channel::<LspInbound>();
+    editor.lsp_out_tx = Some(lsp_out_tx.clone());
 
+    // Dynamic Multi-LSP Resolution
     if let Some(path) = &target_path {
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let (server_cmd, lang_id) = match ext {
-            "rs" => (Some("rust-analyzer"), "rust"),
-            "py" => (Some("pylsp"), "python"),
-            _ => (None, ""),
-        };
+        let lang = editor.syntax.language;
+        let lang_id = lang.lsp_id();
+        let installed = lang.installed_servers();
 
-        if let Some(cmd) = server_cmd {
-            editor.lsp_tx = Some(lsp_in_tx);
-            let p = path.clone();
-            let initial_text = editor.rope.to_string();
-            tokio::spawn(run_lsp_actor(
-                p,
-                lang_id.to_string(),
-                cmd.to_string(),
-                lsp_in_rx,
-                lsp_out_tx,
-                initial_text,
-            ));
+        if !installed.is_empty() {
+            let preferred = editor.config.preferred_lsps.get(lang_id).cloned();
+            let chosen_server = if let Some(pref) = preferred.filter(|p| installed.contains(p)) {
+                Some(pref)
+            } else if installed.len() == 1 {
+                Some(installed[0].clone())
+            } else {
+                // Multiple servers installed and none configured: prompt user
+                editor.lsp_picker = Some(editor::LspPicker {
+                    language_id: lang_id.to_string(),
+                    candidates: installed.clone(),
+                    selected_idx: 0,
+                });
+                None
+            };
+
+            if let Some(cmd) = chosen_server {
+                start_lsp_for_file(&mut editor, path, lang_id, &cmd);
+            }
         }
     }
 
@@ -227,6 +250,8 @@ async fn main() -> Result<()> {
                 }
             }
         }
+
+        editor.spinner_tick = editor.spinner_tick.wrapping_add(1);
 
         // Draw current state onto terminal frame.
         terminal.draw(|f| render_ui(f, &mut editor))?;
@@ -522,6 +547,46 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
     let prev_mode = editor.mode;
     let max_visible = 6usize;
 
+    // Intercept LSP Server Selection Modal
+    if let Some(mut picker) = editor.lsp_picker.take() {
+        match key.code {
+            KeyCode::Esc => {
+                // Dismiss modal
+                editor.status_msg = "LSP selection canceled".to_string();
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                picker.selected_idx = (picker.selected_idx + 1) % picker.candidates.len();
+                editor.lsp_picker = Some(picker);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                picker.selected_idx = if picker.selected_idx == 0 {
+                    picker.candidates.len() - 1
+                } else {
+                    picker.selected_idx - 1
+                };
+                editor.lsp_picker = Some(picker);
+            }
+            KeyCode::Enter => {
+                let chosen = picker.candidates[picker.selected_idx].clone();
+                editor
+                    .config
+                    .preferred_lsps
+                    .insert(picker.language_id.clone(), chosen.clone());
+                let _ = editor.config.save();
+                editor.status_msg = format!("Selected LSP: {chosen} (saved to .subject0)");
+
+                if let Some(path) = editor.path.clone() {
+                    start_lsp_for_file(editor, &path, &picker.language_id, &chosen);
+                }
+            }
+
+            _ => {
+                editor.lsp_picker = Some(picker);
+            }
+        }
+        return;
+    }
+
     // 1. Intercept Command Palette Key Events
     if editor.palette.visible {
         let cmds = editor.palette.filtered_commands();
@@ -802,32 +867,27 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                 KeyCode::Enter => editor.insert_newline(),
                 KeyCode::Backspace => editor.backspace(),
                 KeyCode::Tab => {
-                    if editor.completions.is_empty() {
-                        // Soft tabs: 4 spaces.
-                        for _ in 0..4 {
-                            editor.insert_char(' ');
-                        }
-                    } else {
-                        editor.completion_visible = true;
-                        editor.completion_idx = 0;
-                        editor.completion_scroll = 0;
+                    // Soft tabs: 4 spaces without reviving stale completion popups
+                    for _ in 0..4 {
+                        editor.insert_char(' ');
                     }
+                    editor.completion_visible = false;
                 }
                 KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     editor.request_completions();
                 }
-                // Automatic closing bracket and delimiter pairs.
+                // Automatic closing bracket and delimiter pairs without firing autocomplete
                 KeyCode::Char('(') => {
                     editor.insert_pair('(', ')');
-                    editor.request_completions();
+                    editor.completion_visible = false;
                 }
                 KeyCode::Char('[') => {
                     editor.insert_pair('[', ']');
-                    editor.request_completions();
+                    editor.completion_visible = false;
                 }
                 KeyCode::Char('{') => {
                     editor.insert_pair('{', '}');
-                    editor.request_completions();
+                    editor.completion_visible = false;
                 }
                 KeyCode::Char('"') => {
                     if editor.char_under_cursor() == Some('"') {
@@ -835,6 +895,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                     } else {
                         editor.insert_pair('"', '"');
                     }
+                    editor.completion_visible = false;
                 }
                 KeyCode::Char('\'') => {
                     if editor.char_under_cursor() == Some('\'') {
@@ -842,16 +903,20 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                     } else {
                         editor.insert_pair('\'', '\'');
                     }
+                    editor.completion_visible = false;
                 }
-                // Step over closing delimiter if already present.
+                // Step over closing delimiter if already present
                 KeyCode::Char(')') if editor.char_under_cursor() == Some(')') => {
                     editor.cursor_x += 1;
+                    editor.completion_visible = false;
                 }
                 KeyCode::Char(']') if editor.char_under_cursor() == Some(']') => {
                     editor.cursor_x += 1;
+                    editor.completion_visible = false;
                 }
                 KeyCode::Char('}') if editor.char_under_cursor() == Some('}') => {
                     editor.cursor_x += 1;
+                    editor.completion_visible = false;
                 }
                 KeyCode::Left => {
                     editor.cursor_x = editor.cursor_x.saturating_sub(1);
@@ -875,13 +940,18 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                 }
                 KeyCode::Char(c) => {
                     editor.insert_char(c);
-                    // Trigger completion debouncing on identifier characters.
-                    if c.is_alphanumeric() || c == '_' || c == '.' || c == ':' {
+                    // Only request completions on valid identifiers or trigger characters
+                    let prefix = editor.current_word_prefix();
+                    if c == '.'
+                        || c == ':'
+                        || (!prefix.is_empty() && (c.is_alphanumeric() || c == '_'))
+                    {
                         editor.request_completions();
                     } else {
                         editor.completion_visible = false;
                     }
                 }
+
                 _ => {}
             }
         }
@@ -1322,29 +1392,60 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         Span::styled("", Style::default().bg(bar_bg).fg(pill_bg)),
     ]);
 
-    let mut diag_indicators = Vec::new();
+    const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let spinner_icon = SPINNER[(editor.spinner_tick / 3) % SPINNER.len()];
+
+    let mut status_right_spans = Vec::new();
+
+    // LSP Lifecycle Status Indicator
+    match &editor.lsp_status {
+        LspStatus::Starting(name) => {
+            status_right_spans.push(Span::styled(
+                format!(" {spinner_icon} {name} "),
+                Style::default()
+                    .bg(bar_bg)
+                    .fg(Color::Rgb(245, 185, 60))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        LspStatus::Ready(name) => {
+            status_right_spans.push(Span::styled(
+                format!(" 󰄬 {name} "),
+                Style::default().bg(bar_bg).fg(Color::Rgb(100, 200, 140)),
+            ));
+        }
+        LspStatus::Error(err) => {
+            status_right_spans.push(Span::styled(
+                format!(" 󰅚 LSP: {err} "),
+                Style::default()
+                    .bg(bar_bg)
+                    .fg(Color::Rgb(240, 90, 90))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        LspStatus::NotFound(name) => {
+            status_right_spans.push(Span::styled(
+                format!(" 󰄰 {name} missing "),
+                Style::default().bg(bar_bg).fg(Color::Rgb(240, 140, 70)),
+            ));
+        }
+        LspStatus::Disabled => {}
+    }
+
+    // Diagnostics Indicators
     if error_count > 0 {
-        diag_indicators.push(Span::styled(
+        status_right_spans.push(Span::styled(
             format!("  {error_count} "),
             Style::default().bg(bar_bg).fg(Color::Rgb(240, 90, 90)),
         ));
     }
     if warn_count > 0 {
-        diag_indicators.push(Span::styled(
+        status_right_spans.push(Span::styled(
             format!(" {warn_count} "),
             Style::default().bg(bar_bg).fg(Color::Rgb(245, 185, 60)),
         ));
     }
-    if error_count == 0 && warn_count == 0 {
-        if let LspStatus::Ready(name) = &editor.lsp_status {
-            diag_indicators.push(Span::styled(
-                format!(" 󰄬 {name} "),
-                Style::default().bg(bar_bg).fg(Color::Rgb(100, 180, 120)),
-            ));
-        }
-    }
 
-    let mut status_right_spans = diag_indicators;
     status_right_spans.extend(vec![
         Span::styled("", Style::default().bg(bar_bg).fg(pill_bg)),
         Span::styled(
@@ -1611,5 +1712,76 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             )));
 
         frame.render_widget(Paragraph::new(palette_lines).block(p_block), palette_rect);
+    }
+    // 6. Render LSP Picker Modal Overlay
+    if let Some(picker) = &editor.lsp_picker {
+        let width = 48u16.min(size.width.saturating_sub(2));
+        let height = ((picker.candidates.len() as u16) + 4).min(size.height.saturating_sub(2));
+        let x = (size.width.saturating_sub(width)) / 2;
+        let y = (size.height.saturating_sub(height)) / 2;
+
+        let picker_rect = Rect::new(x, y, width, height);
+        frame.render_widget(Clear, picker_rect);
+
+        let mut lines = Vec::new();
+        lines.push(Line::from(vec![
+            Span::styled(
+                " Detected LSPs for ",
+                Style::default().fg(Color::Rgb(160, 170, 185)),
+            ),
+            Span::styled(
+                &picker.language_id,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " (Select with Enter):",
+                Style::default().fg(Color::Rgb(160, 170, 185)),
+            ),
+        ]));
+        lines.push(Line::from(Span::styled(
+            "─".repeat((width as usize).saturating_sub(2)),
+            Style::default().fg(Color::Rgb(60, 65, 80)),
+        )));
+
+        for (idx, candidate) in picker.candidates.iter().enumerate() {
+            let is_sel = idx == picker.selected_idx;
+            let bg = if is_sel {
+                Color::Rgb(40, 75, 145)
+            } else {
+                Color::Rgb(25, 27, 34)
+            };
+            let style = if is_sel {
+                Style::default()
+                    .bg(bg)
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().bg(bg).fg(Color::Rgb(215, 220, 230))
+            };
+
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if is_sel { " 󰄬 " } else { "   " },
+                    Style::default().bg(bg).fg(Color::Green),
+                ),
+                Span::styled(format!("{candidate:<38}"), style),
+            ]));
+        }
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Rgb(100, 180, 255)))
+            .style(Style::default().bg(Color::Rgb(25, 27, 34)))
+            .title(Line::from(Span::styled(
+                "  Choose Language Server ",
+                Style::default()
+                    .fg(Color::Rgb(180, 200, 240))
+                    .add_modifier(Modifier::BOLD),
+            )));
+
+        frame.render_widget(Paragraph::new(lines).block(block), picker_rect);
     }
 }

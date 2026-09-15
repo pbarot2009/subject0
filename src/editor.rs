@@ -36,11 +36,81 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::lsp::{
+    DiagnosticItem, LspInbound, LspOutbound, LspStatus, SuggestionItem, SyntaxEngine,
+};
 use anyhow::{anyhow, Result};
 use ropey::Rope;
 use tokio::sync::mpsc;
 
-use crate::lsp::{DiagnosticItem, LspInbound, LspStatus, SuggestionItem, SyntaxEngine};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+
+/// Persistent editor configuration stored in `.subject0`.
+#[derive(Clone, Debug)]
+pub struct AppConfig {
+    pub preferred_lsps: HashMap<String, String>,
+    pub line_wrap: bool,
+}
+
+impl AppConfig {
+    pub fn file_path() -> PathBuf {
+        let cwd_cfg = PathBuf::from(".subject0");
+        if cwd_cfg.exists() {
+            return cwd_cfg;
+        }
+        if let Ok(home) = env::var("HOME") {
+            let home_cfg = PathBuf::from(home).join(".subject0");
+            if home_cfg.exists() {
+                return home_cfg;
+            }
+        }
+        cwd_cfg
+    }
+
+    pub fn load() -> Self {
+        let path = Self::file_path();
+        let mut preferred_lsps = HashMap::new();
+        let mut line_wrap = true;
+
+        if let Ok(content) = fs::read_to_string(path) {
+            if let Ok(val) = serde_json::from_str::<Value>(&content) {
+                if let Some(obj) = val.get("preferred_lsps").and_then(Value::as_object) {
+                    for (k, v) in obj {
+                        if let Some(s) = v.as_str() {
+                            preferred_lsps.insert(k.clone(), s.to_string());
+                        }
+                    }
+                }
+                if let Some(w) = val.get("line_wrap").and_then(Value::as_bool) {
+                    line_wrap = w;
+                }
+            }
+        }
+
+        Self {
+            preferred_lsps,
+            line_wrap,
+        }
+    }
+
+    pub fn save(&self) -> Result<()> {
+        let path = Self::file_path();
+        let val = json!({
+            "preferred_lsps": self.preferred_lsps,
+            "line_wrap": self.line_wrap,
+        });
+        fs::write(path, serde_json::to_string_pretty(&val)?)?;
+        Ok(())
+    }
+}
+
+/// Interactive modal state when multiple LSPs are detected.
+pub struct LspPicker {
+    pub language_id: String,
+    pub candidates: Vec<String>,
+    pub selected_idx: usize,
+}
 
 /// Active input mode governing key event interpretation and cursor boundary constraints.
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -108,6 +178,10 @@ pub enum CommandId {
     JumpBottom,
     /// Dispatches an asynchronous LSP completion request at the current cursor position.
     TriggerCompletion,
+    /// Shows picker to select active LSP server for current file.
+    SelectLsp,
+    /// Toggles and saves default line wrap in .subject0.
+    SaveConfig,
 }
 
 /// Static descriptor defining metadata for a searchable command palette entry.
@@ -226,6 +300,18 @@ pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
         shortcut: "Ctrl-Space",
         icon: "󰌵",
         id: CommandId::TriggerCompletion,
+    },
+    PaletteCommand {
+        title: "Select Active LSP Server",
+        shortcut: ":lsp",
+        icon: "",
+        id: CommandId::SelectLsp,
+    },
+    PaletteCommand {
+        title: "Save Config to .subject0",
+        shortcut: ":cfg",
+        icon: "󰄛",
+        id: CommandId::SaveConfig,
     },
 ];
 
@@ -470,8 +556,13 @@ pub struct Editor {
     pub lsp_status: LspStatus,
     /// Transmission channel dispatching requests to the background LSP actor.
     pub lsp_tx: Option<mpsc::UnboundedSender<LspInbound>>,
+    /// Receiver channel forwarder for LSP outbound events.
+    pub lsp_out_tx: Option<mpsc::UnboundedSender<LspOutbound>>,
+    /// Animation tick counter for UI spinners.
+    pub spinner_tick: usize,
     /// Monotonically increasing request ID counter for correlating LSP responses.
     pub lsp_req_id: i64,
+
     /// Monotonically increasing document version counter sent in LSP change events.
     pub doc_version: i64,
 
@@ -492,6 +583,10 @@ pub struct Editor {
     pub palette: CommandPalette,
     /// Flag signaling the main application event loop to shut down.
     pub should_quit: bool,
+    /// Persistent configuration loaded from `.subject0`.
+    pub config: AppConfig,
+    /// LSP server selection modal state.
+    pub lsp_picker: Option<LspPicker>,
 }
 
 impl Editor {
@@ -517,6 +612,8 @@ impl Editor {
 
         let root_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let explorer = FileExplorer::new(root_dir);
+        let config = AppConfig::load();
+        let initial_wrap = config.line_wrap;
 
         Ok(Self {
             rope,
@@ -527,7 +624,10 @@ impl Editor {
             cursor_y: 0,
             scroll_x: 0,
             scroll_y: 0,
-            line_wrap: true,
+            line_wrap: initial_wrap,
+            config,
+            lsp_picker: None,
+
             clipboard: String::new(),
             modified: false,
             status_msg,
@@ -538,7 +638,10 @@ impl Editor {
             diagnostics: Vec::new(),
             lsp_status: LspStatus::Disabled,
             lsp_tx: None,
+            lsp_out_tx: None,
+            spinner_tick: 0,
             lsp_req_id: 10,
+
             doc_version: 1,
             completions: Vec::new(),
             completion_idx: 0,
@@ -1269,6 +1372,26 @@ impl Editor {
                 self.cursor_x = 0;
             }
             CommandId::TriggerCompletion => self.request_completions(),
+            CommandId::SelectLsp => {
+                let installed = self.syntax.language.installed_servers();
+                if installed.is_empty() {
+                    self.status_msg = "No installed LSP found for this file".to_string();
+                } else {
+                    self.lsp_picker = Some(LspPicker {
+                        language_id: self.syntax.language.lsp_id().to_string(),
+                        candidates: installed,
+                        selected_idx: 0,
+                    });
+                }
+            }
+            CommandId::SaveConfig => {
+                self.config.line_wrap = self.line_wrap;
+                if self.config.save().is_ok() {
+                    self.status_msg = "Config saved to .subject0".to_string();
+                } else {
+                    self.status_msg = "Failed to write .subject0".to_string();
+                }
+            }
         }
     }
 

@@ -1,0 +1,6 @@
+{
+  "line_wrap": true,
+  "preferred_lsps": {
+    "python": "pyright-langserver"
+  }
+}
