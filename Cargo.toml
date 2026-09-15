@@ -1,8 +1,8 @@
 [package]
 name = "subject0"
-version = "0.1.0-dev"
-edition = "2021"
-authors = ["pbarot2009"]
+version = "0.1.0-alpha.1"
+edition = "2024"
+authors = ["Prathmesh S. Barot"]
 description = "Modal terminal code editor with LSP client and Tree-sitter highlighting."
 repository = "https://github.com/pbarot2009/subject0"
 readme = "README.md"

@@ -597,29 +597,53 @@ impl Editor {
     /// the syntax engine, initializes the file explorer from the current working directory,
     /// and resets cursor coordinates.
     pub fn new(path: Option<PathBuf>) -> Result<Self> {
-        let (rope, status_msg) = match &path {
+        let is_dir_target = path.as_ref().is_some_and(|p| p.is_dir());
+
+        let (rope, buffer_path, status_msg) = match &path {
+            Some(p) if p.is_dir() => (Rope::new(), None, format!("Opened folder {}", p.display())),
             Some(p) if p.exists() => {
                 let file = File::open(p)?;
-                (Rope::from_reader(file)?, format!("Loaded {}", p.display()))
+                (
+                    Rope::from_reader(file)?,
+                    Some(p.clone()),
+                    format!("Loaded {}", p.display()),
+                )
             }
-            Some(p) => (Rope::new(), format!("New: {}", p.display())),
-            None => (Rope::new(), "Ready".to_string()),
+            Some(p) => (
+                Rope::new(),
+                Some(p.clone()),
+                format!("New: {}", p.display()),
+            ),
+            None => (Rope::new(), None, "Ready".to_string()),
         };
 
-        let mut syntax = SyntaxEngine::new(path.as_ref());
+        let mut syntax = SyntaxEngine::new(buffer_path.as_ref());
         let text = rope.to_string();
         syntax.reparse(&text);
 
-        let root_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let explorer = FileExplorer::new(root_dir);
+        let root_dir = if is_dir_target {
+            path.clone().unwrap()
+        } else {
+            env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        };
+
+        let mut explorer = FileExplorer::new(root_dir);
+        if is_dir_target {
+            explorer.visible = true;
+        }
+
         let config = AppConfig::load();
         let initial_wrap = config.line_wrap;
 
         Ok(Self {
             rope,
-            path,
+            path: buffer_path,
             mode: Mode::Normal,
-            focus: Focus::Editor,
+            focus: if is_dir_target {
+                Focus::Explorer
+            } else {
+                Focus::Editor
+            },
             cursor_x: 0,
             cursor_y: 0,
             scroll_x: 0,

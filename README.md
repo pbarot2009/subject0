@@ -13,7 +13,7 @@ A modal terminal code editor built in Rust with native Language Server Protocol 
 
 ## Prerequisites
 
-- **Rust**: 1.74 or later (2021 edition).
+- **Rust**: 1.85 or later (2024 edition).
 - **Nerd Font**: Required to render file icons and completion glyphs properly.
 - **Language Servers** (optional, auto-detected from `$PATH` and `~/.cargo/bin`):
   - **Rust**: `rust-analyzer`

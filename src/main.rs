@@ -38,6 +38,7 @@
 //!    - Computes absolute screen coordinates for floating popup overlays (autocomplete dropdown
 //!      and command palette).
 
+mod cmd;
 mod editor;
 mod lsp;
 
@@ -148,6 +149,9 @@ fn start_lsp_for_file(editor: &mut Editor, path: &Path, lang_id: &str, cmd: &str
 /// 5. Restores original terminal state on exit.
 #[tokio::main]
 async fn main() -> Result<()> {
+    // 1. Parse command-line flags before initializing terminal screen
+    let cli_args = cmd::CliArgs::parse();
+
     setup_panic_hook();
     enable_raw_mode()?;
     let mut stdout = stdout();
@@ -155,36 +159,54 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let target_path = env::args().nth(1).map(PathBuf::from);
+    let target_path = cli_args.path.clone();
     let mut editor = Editor::new(target_path.clone())?;
+
+    // Apply CLI flag overrides
+    if cli_args.ignore_config {
+        editor.config = editor::AppConfig {
+            preferred_lsps: std::collections::HashMap::new(),
+            line_wrap: true,
+        };
+    }
+    if let Some(wrap) = cli_args.line_wrap {
+        editor.line_wrap = wrap;
+    }
+    if let Some(line) = cli_args.jump_line {
+        editor.cursor_y = line.saturating_sub(1);
+        editor.clamp_cursor();
+    }
 
     let (lsp_out_tx, mut lsp_out_rx) = mpsc::unbounded_channel::<LspOutbound>();
     editor.lsp_out_tx = Some(lsp_out_tx.clone());
 
-    // Dynamic Multi-LSP Resolution
+    // Dynamic Multi-LSP Resolution (only spawn for files, not directories)
     if let Some(path) = &target_path {
-        let lang = editor.syntax.language;
-        let lang_id = lang.lsp_id();
-        let installed = lang.installed_servers();
+        if path.is_file() {
+            let lang = editor.syntax.language;
+            let lang_id = lang.lsp_id();
+            let installed = lang.installed_servers();
 
-        if !installed.is_empty() {
-            let preferred = editor.config.preferred_lsps.get(lang_id).cloned();
-            let chosen_server = if let Some(pref) = preferred.filter(|p| installed.contains(p)) {
-                Some(pref)
-            } else if installed.len() == 1 {
-                Some(installed[0].clone())
-            } else {
-                // Multiple servers installed and none configured: prompt user
-                editor.lsp_picker = Some(editor::LspPicker {
-                    language_id: lang_id.to_string(),
-                    candidates: installed.clone(),
-                    selected_idx: 0,
-                });
-                None
-            };
+            if !installed.is_empty() {
+                let preferred = editor.config.preferred_lsps.get(lang_id).cloned();
+                let chosen_server = if let Some(pref) = preferred.filter(|p| installed.contains(p))
+                {
+                    Some(pref)
+                } else if installed.len() == 1 {
+                    Some(installed[0].clone())
+                } else {
+                    // Multiple servers installed and none configured: prompt user
+                    editor.lsp_picker = Some(editor::LspPicker {
+                        language_id: lang_id.to_string(),
+                        candidates: installed.clone(),
+                        selected_idx: 0,
+                    });
+                    None
+                };
 
-            if let Some(cmd) = chosen_server {
-                start_lsp_for_file(&mut editor, path, lang_id, &cmd);
+                if let Some(cmd) = chosen_server {
+                    start_lsp_for_file(&mut editor, path, lang_id, &cmd);
+                }
             }
         }
     }
