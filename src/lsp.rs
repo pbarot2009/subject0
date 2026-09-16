@@ -17,7 +17,7 @@
 //!    per-language keyword, literal, comment, and identifier highlighting for Rust, Python,
 //!    and Markdown, as well as glyph and color resolution for file trees and completion menus.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use ratatui::{
     style::{Color, Modifier, Style},
     text::Span,
@@ -1511,7 +1511,9 @@ impl SupportedLanguage {
             SupportedLanguage::Sql => &["sqls", "sql-language-server"],
             SupportedLanguage::Scala => &["metals"],
             SupportedLanguage::Odin => &["ols"],
-            SupportedLanguage::Haskell => &["haskell-language-server-wrapper", "haskell-language-server"],
+            SupportedLanguage::Haskell => {
+                &["haskell-language-server-wrapper", "haskell-language-server"]
+            }
             SupportedLanguage::Elixir => &["elixir-ls", "lexical"],
             SupportedLanguage::Erlang => &["erlang_ls"],
             SupportedLanguage::OCaml => &["ocamllsp"],

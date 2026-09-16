@@ -44,7 +44,7 @@ mod lsp;
 
 use std::{
     cmp::Ordering,
-    io::{stdout, Write},
+    io::{Write, stdout},
     path::Path,
     time::Duration,
 };
@@ -58,22 +58,22 @@ use crossterm::{
         KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
+    Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Position, Rect, Size},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
-    Frame, Terminal,
 };
 use tokio::sync::mpsc;
 
-use editor::{line_len, Editor, Focus, Mode};
+use editor::{Editor, Focus, Mode, line_len};
 use lsp::{
-    completion_kind_icon, file_icon_and_color, run_lsp_actor, LspInbound, LspOutbound, LspStatus,
-    SuggestionItem,
+    LspInbound, LspOutbound, LspStatus, SuggestionItem, completion_kind_icon, file_icon_and_color,
+    run_lsp_actor,
 };
 
 /// Configures the terminal hardware cursor geometry based on the active modal editing state.

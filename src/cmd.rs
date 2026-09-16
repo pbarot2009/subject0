@@ -9,7 +9,7 @@ use std::{
     process::{self, Command},
 };
 
-use crate::lsp::{resolve_binary_path, DynamicGrammar, SupportedLanguage};
+use crate::lsp::{DynamicGrammar, SupportedLanguage, resolve_binary_path};
 
 /// Parsed command-line arguments.
 #[derive(Debug, Default, Clone)]
@@ -267,7 +267,9 @@ impl CliArgs {
                 format!(" Library:   {blue}{display_so}{r}"),
                 format!(" Queries:   {query_status}"),
                 String::new(),
-                format!(" {gray}Pass {yellow}--force{gray} or {yellow}--reinstall{gray} to recompile{r}"),
+                format!(
+                    " {gray}Pass {yellow}--force{gray} or {yellow}--reinstall{gray} to recompile{r}"
+                ),
             ];
 
             Self::print_boxed_card(&lines, 56);
@@ -379,7 +381,9 @@ impl CliArgs {
         match compile_status {
             Ok(s) if s.success() => {}
             _ => {
-                eprintln!("{red}Compilation failed. Ensure a C/C++ compiler is installed on your host.{r}");
+                eprintln!(
+                    "{red}Compilation failed. Ensure a C/C++ compiler is installed on your host.{r}"
+                );
                 let _ = fs::remove_dir_all(&temp_dir);
                 process::exit(1);
             }

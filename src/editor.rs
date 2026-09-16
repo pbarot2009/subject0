@@ -39,11 +39,11 @@ use std::{
 use crate::lsp::{
     DiagnosticItem, LspInbound, LspOutbound, LspStatus, SuggestionItem, SyntaxEngine,
 };
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use ropey::Rope;
 use tokio::sync::mpsc;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 
 /// Persistent editor configuration stored in `.subject0`.
