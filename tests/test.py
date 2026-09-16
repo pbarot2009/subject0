@@ -1,4 +1,7 @@
-class Person:
-    
-    def __init__(self) -> None:
-        print("")
+def help_menu() -> None:
+    print("Help!!!!!!")
+    for i in range(0, 10):
+        print("menu...")
+        
+        
+help_menu()
