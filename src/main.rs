@@ -114,24 +114,6 @@ fn setup_panic_hook() {
     }));
 }
 
-/// Spawns an LSP background actor using the unified outbound channel.
-fn start_lsp_for_file(editor: &mut Editor, path: &Path, lang_id: &str, cmd: &str) {
-    if let Some(out_tx) = &editor.lsp_out_tx {
-        let (in_tx, in_rx) = mpsc::unbounded_channel::<LspInbound>();
-        editor.lsp_tx = Some(in_tx);
-        let p = path.to_path_buf();
-        let initial_text = editor.rope.to_string();
-        tokio::spawn(run_lsp_actor(
-            p,
-            lang_id.to_string(),
-            cmd.to_string(),
-            in_rx,
-            out_tx.clone(),
-            initial_text,
-        ));
-    }
-}
-
 // === Application Lifecycle & Event Loop ===
 
 /// Application entry point initializing terminal subsystems and running the event loop.
@@ -189,30 +171,7 @@ async fn main() -> Result<()> {
     if let Some(path) = &target_path
         && path.is_file()
     {
-        let lang = editor.syntax.language;
-        let lang_id = lang.lsp_id();
-        let installed = lang.installed_servers();
-
-        if !installed.is_empty() {
-            let preferred = editor.config.preferred_lsps.get(lang_id).cloned();
-            let chosen_server = if let Some(pref) = preferred.filter(|p| installed.contains(p)) {
-                Some(pref)
-            } else if installed.len() == 1 {
-                Some(installed[0].clone())
-            } else {
-                // Multiple servers installed and none configured: prompt user
-                editor.lsp_picker = Some(editor::LspPicker {
-                    language_id: lang_id.to_string(),
-                    candidates: installed.clone(),
-                    selected_idx: 0,
-                });
-                None
-            };
-
-            if let Some(cmd) = chosen_server {
-                start_lsp_for_file(&mut editor, path, lang_id, &cmd);
-            }
-        }
+        editor.ensure_lsp_for_file(path);
     }
 
     set_terminal_cursor_style(editor.mode);
@@ -457,27 +416,47 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
 
     // 4. Completion Dropdown Interactions
     if editor.completion_visible && !editor.completions.is_empty() {
-        let max_visible = 6usize;
-        match mouse.kind {
-            MouseEventKind::ScrollDown => {
-                if editor.completion_idx + 1 < editor.completions.len() {
-                    editor.completion_idx += 1;
-                    editor.update_completion_scroll(max_visible);
-                    return;
+        if let Some((px, py, pw, ph)) = editor.completion_rect {
+            let in_popup = mouse.column >= px
+                && mouse.column < px + pw
+                && mouse.row >= py
+                && mouse.row < py + ph;
+
+            if in_popup {
+                let max_visible = 6usize;
+                match mouse.kind {
+                    MouseEventKind::ScrollDown => {
+                        if editor.completion_idx + 1 < editor.completions.len() {
+                            editor.completion_idx += 1;
+                            editor.update_completion_scroll(max_visible);
+                        }
+                        return;
+                    }
+                    MouseEventKind::ScrollUp => {
+                        if editor.completion_idx > 0 {
+                            editor.completion_idx -= 1;
+                            editor.update_completion_scroll(max_visible);
+                        }
+                        return;
+                    }
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if mouse.row >= py + 1 && mouse.row < py + ph - 1 {
+                            let clicked_row = (mouse.row - (py + 1)) as usize;
+                            let target_idx = editor.completion_scroll + clicked_row;
+                            if target_idx < editor.completions.len() {
+                                editor.completion_idx = target_idx;
+                            }
+                        }
+                        editor.accept_completion();
+                        return;
+                    }
+                    _ => return,
                 }
+            } else if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+                // Dismiss popup on outside click and permit remaining handlers to process click
+                editor.completion_visible = false;
+                editor.completion_rect = None;
             }
-            MouseEventKind::ScrollUp => {
-                if editor.completion_idx > 0 {
-                    editor.completion_idx -= 1;
-                    editor.update_completion_scroll(max_visible);
-                    return;
-                }
-            }
-            MouseEventKind::Down(MouseButton::Left) => {
-                editor.accept_completion();
-                return;
-            }
-            _ => {}
         }
     }
 
@@ -636,7 +615,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                 editor.status_msg = format!("Selected LSP: {chosen} (saved to .subject0)");
 
                 if let Some(path) = editor.path.clone() {
-                    start_lsp_for_file(editor, &path, &picker.language_id, &chosen);
+                    editor.start_lsp_server(&path, &picker.language_id, &chosen);
                 }
             }
 
@@ -1609,6 +1588,13 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         let (screen_x, screen_y) =
             cursor_screen_pos.unwrap_or((inner_area.x + gutter_width as u16, inner_area.y));
 
+        if !(editor.mode == Mode::Insert
+            && editor.completion_visible
+            && !editor.completions.is_empty())
+        {
+            editor.completion_rect = None;
+        }
+
         // Floating Auto-Complete Dropdown
         if editor.mode == Mode::Insert
             && editor.completion_visible
@@ -1632,6 +1618,7 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             };
 
             let popup_rect = Rect::new(popup_x, popup_y, popup_width, popup_height);
+            editor.completion_rect = Some((popup_x, popup_y, popup_width, popup_height));
             frame.render_widget(Clear, popup_rect);
 
             let scroll_start = editor.completion_scroll;

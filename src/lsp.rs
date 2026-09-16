@@ -276,8 +276,15 @@ pub fn file_to_uri(path: &Path) -> String {
     } else {
         path.to_path_buf()
     };
-    format!("file://{}", abs.to_string_lossy())
+    let s = abs.to_string_lossy();
+    if cfg!(target_os = "windows") {
+        let clean = s.replace('\\', "/");
+        format!("file:///{}", clean.trim_start_matches('/'))
+    } else {
+        format!("file://{s}")
+    }
 }
+
 
 /// Reads a single framed JSON-RPC message from an asynchronous buffered LSP stream.
 ///
@@ -310,9 +317,11 @@ pub async fn read_lsp_message<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> Res
         if trimmed.is_empty() {
             break;
         }
-        if let Some(val) = trimmed.strip_prefix("Content-Length:") {
+        let trimmed_lower = trimmed.to_ascii_lowercase();
+        if let Some(val) = trimmed_lower.strip_prefix("content-length:") {
             content_length = val.trim().parse::<usize>()?;
         }
+
     }
 
     if content_length == 0 {
@@ -361,10 +370,12 @@ pub fn server_cmd_and_args(cmd: &str) -> (String, Vec<&'static str>) {
         | "vscode-json-language-server"
         | "yaml-language-server"
         | "intelephense" => (cmd.to_string(), vec!["--stdio"]),
+        "bash-language-server" => ("bash-language-server".to_string(), vec!["start"]),
         "taplo" => ("taplo".to_string(), vec!["lsp", "stdio"]),
         "dart" => ("dart".to_string(), vec!["language-server"]),
         "omnisharp" => ("omnisharp".to_string(), vec!["-lsp"]),
         _ => (cmd.to_string(), vec![]),
+
     }
 }
 
@@ -402,6 +413,7 @@ pub async fn run_lsp_actor(
 
     let mut cmd_builder = TokioCommand::new(bin_path);
     cmd_builder.args(&args);
+    cmd_builder.kill_on_drop(true);
     let mut child = match cmd_builder
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -423,6 +435,8 @@ pub async fn run_lsp_actor(
         Err(_) => "file://.".to_string(),
     };
     let mut current_file_uri = file_to_uri(&initial_file);
+    let mut pending_requests: std::collections::HashMap<i64, &'static str> =
+        std::collections::HashMap::new();
 
     let root_path =
         env::current_dir().map_or_else(|_| ".".to_string(), |p| p.to_string_lossy().to_string());
@@ -592,7 +606,8 @@ pub async fn run_lsp_actor(
                         });
                         let _ = send_lsp_message(&mut stdin, &did_save).await;
                     }
-                                        Some(LspInbound::Completion { line, col, req_id }) => {
+                    Some(LspInbound::Completion { line, col, req_id }) => {
+                        pending_requests.insert(req_id, "completion");
                         let comp_req = serde_json::json!({
                             "jsonrpc": "2.0",
                             "id": req_id,
@@ -605,6 +620,7 @@ pub async fn run_lsp_actor(
                         let _ = send_lsp_message(&mut stdin, &comp_req).await;
                     }
                     Some(LspInbound::SemanticTokens { req_id }) => {
+                        pending_requests.insert(req_id, "semanticTokens");
                         let st_req = serde_json::json!({
                             "jsonrpc": "2.0",
                             "id": req_id,
@@ -615,6 +631,7 @@ pub async fn run_lsp_actor(
                         });
                         let _ = send_lsp_message(&mut stdin, &st_req).await;
                     }
+
                     Some(LspInbound::OpenFile { path, text, lang_id }) => {
 
                         current_file_uri = file_to_uri(&path);
@@ -657,92 +674,112 @@ pub async fn run_lsp_actor(
                                 let _ = tx.send(LspOutbound::Diagnostics(items));
                             }
                         }
-                                        // Handle completion and semantic tokens responses matching a previously sent request ID.
-                    } else if let Some(resp_id) = json.get("id").and_then(Value::as_i64) {
+                        // Handle completion and semantic tokens responses matching a previously sent request ID.
+                        } else if let Some(resp_id) = json.get("id").and_then(Value::as_i64) {
                         let result_val = json.get("result");
 
-                        if let Some(data) = result_val.and_then(|r| r.get("data")).and_then(|d| d.as_array()) {
-                            let ints: Vec<usize> = data.iter().filter_map(Value::as_u64).map(|v| v as usize).collect();
-                            let mut tokens = Vec::new();
-                            let mut cur_line = 0usize;
-                            let mut cur_char = 0usize;
+                        if let Some(req_type) = pending_requests.remove(&resp_id) {
+                            match req_type {
+                                "semanticTokens" => {
+                                    let mut tokens = Vec::new();
+                                    if let Some(data) = result_val
+                                        .and_then(|r| r.get("data"))
+                                        .and_then(|d| d.as_array())
+                                    {
+                                        let ints: Vec<usize> = data
+                                            .iter()
+                                            .filter_map(Value::as_u64)
+                                            .map(|v| v as usize)
+                                            .collect();
+                                        let mut cur_line = 0usize;
+                                        let mut cur_char = 0usize;
 
-                            // chunks_exact is intentional here: the LSP semantic-tokens data
-                            // array is a flat, non-array-backed Vec<usize> of arbitrary
-                            // runtime length, so `as_chunks::<5>()` (which needs a fixed-size
-                            // array as input) does not apply.
-                            #[allow(clippy::chunks_exact_to_as_chunks)]
-                            for chunk in ints.chunks_exact(5) {
-                                let delta_line = chunk[0];
-                                let delta_start = chunk[1];
-                                let length = chunk[2];
-                                let token_type_idx = chunk[3];
+                                        #[allow(clippy::chunks_exact_to_as_chunks)]
+                                        for chunk in ints.chunks_exact(5) {
+                                            let delta_line = chunk[0];
+                                            let delta_start = chunk[1];
+                                            let length = chunk[2];
+                                            let token_type_idx = chunk[3];
 
-                                let token_name = server_legend.get(token_type_idx).map_or("", String::as_str);
-                                let token_type = CanonicalTokenType::from_name(token_name);
+                                            let token_name = server_legend
+                                                .get(token_type_idx)
+                                                .map_or("", String::as_str);
+                                            let token_type =
+                                                CanonicalTokenType::from_name(token_name);
 
-                                if delta_line > 0 {
-                                    cur_line = cur_line.saturating_add(delta_line);
-                                    cur_char = delta_start;
-                                } else {
-                                    cur_char = cur_char.saturating_add(delta_start);
+                                            if delta_line > 0 {
+                                                cur_line = cur_line.saturating_add(delta_line);
+                                                cur_char = delta_start;
+                                            } else {
+                                                cur_char = cur_char.saturating_add(delta_start);
+                                            }
+
+                                            tokens.push(SemanticTokenSpan {
+                                                line: cur_line,
+                                                start_col: cur_char,
+                                                length,
+                                                token_type,
+                                            });
+                                        }
+                                    }
+                                    let _ = tx.send(LspOutbound::SemanticTokens { tokens });
                                 }
+                                "completion" => {
+                                    let mut results = Vec::new();
+                                    let items_array = result_val.and_then(|r| {
+                                        if r.is_array() {
+                                            Some(r.as_array().unwrap())
+                                        } else {
+                                            r.get("items").and_then(|it| it.as_array())
+                                        }
+                                    });
 
-                                tokens.push(SemanticTokenSpan {
-                                    line: cur_line,
-                                    start_col: cur_char,
-                                    length,
-                                    token_type,
-                                });
-                            }
+                                    if let Some(arr) = items_array {
+                                        for item in arr {
+                                            if let Some(label) =
+                                                item.get("label").and_then(|l| l.as_str())
+                                            {
+                                                let insert_text = if let Some(it) = item
+                                                    .get("insertText")
+                                                    .and_then(|it| it.as_str())
+                                                {
+                                                    it.to_string()
+                                                } else if let Some(te) = item.get("textEdit") {
+                                                    te.get("newText")
+                                                        .and_then(|nt| nt.as_str())
+                                                        .unwrap_or(label)
+                                                        .to_string()
+                                                } else {
+                                                    label.to_string()
+                                                };
+                                                let detail = item
+                                                    .get("detail")
+                                                    .and_then(|d| d.as_str())
+                                                    .map(ToString::to_string);
+                                                let kind = item
+                                                    .get("kind")
+                                                    .and_then(Value::as_u64)
+                                                    .unwrap_or(0);
 
-
-                            let _ = tx.send(LspOutbound::SemanticTokens { tokens });
-                        } else {
-                            let mut results = Vec::new();
-
-                            // LSP completion responses may return either `CompletionItem[]` or `CompletionList { items: [...] }`.
-                            let items_array = result_val.and_then(|r| {
-                                if r.is_array() {
-                                    Some(r.as_array().unwrap())
-                                } else {
-                                    r.get("items").and_then(|it| it.as_array())
-                                }
-                            });
-
-                            if let Some(arr) = items_array {
-
-                            for item in arr {
-                                if let Some(label) = item.get("label").and_then(|l| l.as_str()) {
-                                    let insert_text = if let Some(it) = item.get("insertText").and_then(|it| it.as_str()) {
-                                        it.to_string()
-                                    } else if let Some(te) = item.get("textEdit") {
-                                        te.get("newText")
-                                            .and_then(|nt| nt.as_str())
-                                            .unwrap_or(label)
-                                            .to_string()
-                                    } else {
-                                        label.to_string()
-                                    };
-                                    let detail = item
-                                        .get("detail")
-                                        .and_then(|d| d.as_str())
-                                        .map(ToString::to_string);
-                                    let kind = item.get("kind").and_then(Value::as_u64).unwrap_or(0);
-
-                                    results.push(SuggestionItem {
-                                        label: label.to_string(),
-                                        insert_text,
-                                        detail,
-                                        kind,
+                                                results.push(SuggestionItem {
+                                                    label: label.to_string(),
+                                                    insert_text,
+                                                    detail,
+                                                    kind,
+                                                });
+                                            }
+                                        }
+                                    }
+                                    let _ = tx.send(LspOutbound::Completions {
+                                        req_id: resp_id,
+                                        items: results,
                                     });
                                 }
+                                _ => {}
                             }
                         }
-
-                                                    let _ = tx.send(LspOutbound::Completions { req_id: resp_id, items: results });
-                        }
                     }
+
                 } else {
 
                     // Stream closed or unreadable; notify UI and terminate actor.
@@ -840,11 +877,16 @@ impl DynamicGrammar {
                                 }
                             }
 
-                            return Some(Self {
-                                parser,
-                                query,
-                                _lib: lib,
-                            });
+                            // Only register Tree-sitter as active if both the parser and highlights query succeeded
+                            if query.is_some() {
+                                return Some(Self {
+                                    parser,
+                                    query,
+                                    _lib: lib,
+                                });
+                            }
+
+
                         }
                     }
                 }
@@ -1539,12 +1581,13 @@ impl SupportedLanguage {
             SupportedLanguage::PowerShell => &["powershell-editor-services"],
             SupportedLanguage::Groovy | SupportedLanguage::Gradle => &["groovy-language-server"],
             SupportedLanguage::ObjectiveC | SupportedLanguage::ObjectiveCpp => &["clangd"],
-            SupportedLanguage::Solidity => &["solc", "nomicfoundation-solidity-language-server"],
+            SupportedLanguage::Solidity => &["nomicfoundation-solidity-language-server"],
             SupportedLanguage::Haxe => &["haxe-language-server"],
             SupportedLanguage::Pascal => &["pasls"],
             SupportedLanguage::Ada => &["ada_language_server"],
-            SupportedLanguage::Tcl => &["tclsh"],
-            SupportedLanguage::Makefile => &["cmake-language-server"],
+            SupportedLanguage::Tcl => &[],
+            SupportedLanguage::Makefile => &[],
+
             SupportedLanguage::Cmake => &["neocmakelsp", "cmake-language-server"],
             SupportedLanguage::Dockerfile => &["docker-langserver"],
             SupportedLanguage::GraphQL => &["graphql-lsp"],
@@ -1709,43 +1752,68 @@ impl SyntaxEngine {
         }
     }
 
-    /// Reparses buffer text using dynamic Tree-sitter and evaluates highlight queries.
+        /// Returns true if Tree-sitter grammar and highlights query are active.
+    pub fn has_treesitter(&self) -> bool {
+        matches!(&self.dynamic_grammar, Some(dg) if dg.query.is_some())
+    }
+
+    /// Reparses buffer text using Tree-sitter.
+    ///
+    /// Parses with `None` so Tree-sitter parses freshly on each change.
+    /// Its C engine takes <1ms and guarantees error-tolerant ASTs during active typing.
     pub fn reparse(&mut self, text: &str) {
         if let Some(dg) = &mut self.dynamic_grammar {
-            self.tree = dg.parser.parse(text, None);
-            self.ts_tokens.clear();
+            if let Some(query) = &dg.query {
+                self.tree = dg.parser.parse(text, None);
+                self.ts_tokens.clear();
 
-            if let (Some(tree), Some(query)) = (&self.tree, &dg.query) {
-                let mut cursor = tree_sitter::QueryCursor::new();
-                let text_bytes = text.as_bytes();
-                let lines: Vec<&str> = text.lines().collect();
+                if let Some(tree) = &self.tree {
+                    let mut cursor = tree_sitter::QueryCursor::new();
+                    let text_bytes = text.as_bytes();
+                    let lines: Vec<&str> = text.lines().collect();
 
-                for m in cursor.matches(query, tree.root_node(), text_bytes) {
-                    for capture in m.captures {
-                        let node = capture.node;
-                        let start = node.start_position();
-                        let end = node.end_position();
-                        let capture_name = query.capture_names()[capture.index as usize];
-                        let token_type = CanonicalTokenType::from_query_capture(capture_name);
+                    let byte_col_to_char_col = |line: &str, byte_col: usize| -> usize {
+                        let safe_col = byte_col.min(line.len());
+                        let mut boundary = safe_col;
+                        while boundary > 0 && !line.is_char_boundary(boundary) {
+                            boundary -= 1;
+                        }
+                        line[..boundary].chars().count()
+                    };
 
-                        if token_type != CanonicalTokenType::Other {
-                            for row in start.row..=end.row {
-                                let col_start = if row == start.row { start.column } else { 0 };
-                                let col_end = if row == end.row {
-                                    end.column
-                                } else {
-                                    lines.get(row).map_or(0, |l| l.len())
-                                };
+                    for m in cursor.matches(query, tree.root_node(), text_bytes) {
+                        for capture in m.captures {
+                            let node = capture.node;
+                            let start = node.start_position();
+                            let end = node.end_position();
+                            let capture_name = query.capture_names()[capture.index as usize];
+                            let token_type = CanonicalTokenType::from_query_capture(capture_name);
 
-                                if col_end > col_start {
-                                    self.ts_tokens.entry(row).or_default().push(
-                                        SemanticTokenSpan {
-                                            line: row,
-                                            start_col: col_start,
-                                            length: col_end - col_start,
-                                            token_type,
-                                        },
-                                    );
+                            if token_type != CanonicalTokenType::Other {
+                                for row in start.row..=end.row {
+                                    let col_start = if row == start.row { start.column } else { 0 };
+                                    let col_end = if row == end.row {
+                                        end.column
+                                    } else {
+                                        lines.get(row).map_or(0, |l| l.len())
+                                    };
+
+                                    if col_end > col_start
+                                        && let Some(line_str) = lines.get(row)
+                                    {
+                                        let char_start = byte_col_to_char_col(line_str, col_start);
+                                        let char_end = byte_col_to_char_col(line_str, col_end);
+                                        if char_end > char_start {
+                                            self.ts_tokens.entry(row).or_default().push(
+                                                SemanticTokenSpan {
+                                                    line: row,
+                                                    start_col: char_start,
+                                                    length: char_end - char_start,
+                                                    token_type,
+                                                },
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1756,95 +1824,142 @@ impl SyntaxEngine {
     }
 
     /// Ingests and indexes decoded LSP semantic tokens by line row.
+    ///
+    /// Ignored if Tree-sitter is available to prevent highlight conflicts.
     pub fn set_semantic_tokens(&mut self, tokens: Vec<SemanticTokenSpan>) {
+        if self.has_treesitter() {
+            return;
+        }
         self.semantic_tokens.clear();
         for tok in tokens {
             self.semantic_tokens.entry(tok.line).or_default().push(tok);
         }
     }
 
-    /// Renders a single row of text into styled Ratatui Spans.
+    /// Renders a single row of text into styled Ratatui Spans using a strict 2-tier pipeline:
     ///
-    /// Layered composition (each tier only overrides the characters it actually
-    /// classifies; anything a higher tier leaves untagged keeps the styling from
-    /// the tier below it, so highlighting never "falls through" to a flat color):
-    /// 1. Instant Universal Lexer (Tier 1) — always computed first as the base layer.
-    /// 2. Dynamic Tree-sitter Query tokens via `.scm` (Tier 2) — overlaid on top.
-    /// 3. Compiler-accurate LSP semantic tokens (Tier 3) — overlaid last, highest priority.
+    /// - Tier 1: Tree-sitter AST (authoritative when grammar library is loaded).
+    /// - Tier 2: LSP Semantic Tokens (applied only when Tree-sitter grammar is absent).
+    /// - Fallback: Clean Plain Text (neutral foreground, zero heuristic guessing).
     pub fn highlight_line(&self, line_text: &str, line_idx: usize) -> Vec<Span<'static>> {
         if line_text.is_empty() {
             return vec![Span::raw("")];
         }
 
-        // Tier 1: Universal Lexer forms the base layer for every line.
-        let base_spans = match self.language {
-            SupportedLanguage::Markdown => Self::highlight_markdown(line_text),
-            _ => self.highlight_code_universal(line_text),
-        };
-
-        let ts_tokens = self.ts_tokens.get(&line_idx).map_or(&[][..], Vec::as_slice);
-        let semantic_tokens = self
-            .semantic_tokens
-            .get(&line_idx)
-            .map_or(&[][..], Vec::as_slice);
-
-        if ts_tokens.is_empty() && semantic_tokens.is_empty() {
-            return base_spans;
+        // Tier 1: Tree-sitter AST is the absolute authority when loaded
+        if self.has_treesitter() {
+            return self.render_treesitter_line(line_text, line_idx);
         }
 
-        Self::render_layered_line(line_text, &base_spans, ts_tokens, semantic_tokens)
+        // Tier 2: LSP semantic tokens active only if Tree-sitter is absent
+        if !self.semantic_tokens.is_empty() {
+            return self.render_semantic_line(line_text, line_idx);
+        }
+
+        // Fallback: Clean Plain Text (no regex guessing or color bleeding)
+        vec![Span::styled(
+            line_text.to_string(),
+            Style::default().fg(Color::Rgb(220, 225, 235)),
+        )]
     }
 
-    /// Merges Tier 1 base spans with Tier 2 and Tier 3 token overlays on a
-    /// per-character basis, so gaps left by a higher tier fall back to the next
-    /// tier down instead of a flat default color.
-    fn render_layered_line(
-        text: &str,
-        base_spans: &[Span<'static>],
-        ts_tokens: &[SemanticTokenSpan],
-        semantic_tokens: &[SemanticTokenSpan],
-    ) -> Vec<Span<'static>> {
-        let chars: Vec<char> = text.chars().collect();
+
+    /// Renders Tree-sitter tokens with length and capture-specificity ordering.
+    fn render_treesitter_line(&self, line_text: &str, line_idx: usize) -> Vec<Span<'static>> {
+        let chars: Vec<char> = line_text.chars().collect();
         if chars.is_empty() {
             return vec![Span::raw("")];
         }
 
-        // Expand the Tier 1 base spans into a per-character style array.
-        let mut styles = Vec::with_capacity(chars.len());
-        for span in base_spans {
-            let span_len = span.content.chars().count();
-            for _ in 0..span_len {
-                styles.push(span.style);
-            }
-        }
-        // Defensive: if base span char count ever drifts from `chars.len()`
-        // (should not happen), pad with the default style rather than panic.
-        let default_style = Style::default().fg(Color::Rgb(215, 220, 230));
-        while styles.len() < chars.len() {
-            styles.push(default_style);
-        }
-        styles.truncate(chars.len());
+        let default_style = Style::default().fg(Color::Rgb(220, 225, 235));
+        let mut styles = vec![default_style; chars.len()];
 
-        // Overlay Tier 2 (tree-sitter) on top of the Tier 1 base.
-        for tok in ts_tokens {
-            let start = tok.start_col;
-            let end = (start + tok.length).min(chars.len());
-            if start < chars.len() && end > start {
-                let style = Self::style_for_token_type(tok.token_type);
-                for cell in &mut styles[start..end] {
-                    *cell = style;
+        if let Some(tokens) = self.ts_tokens.get(&line_idx) {
+            let mut sorted_tokens = tokens.clone();
+
+            let specificity = |t: CanonicalTokenType| -> u8 {
+                match t {
+                    CanonicalTokenType::Other => 0,
+                    CanonicalTokenType::Variable => 1,
+                    CanonicalTokenType::Operator => 2,
+                    CanonicalTokenType::Property => 3,
+                    CanonicalTokenType::Parameter => 4,
+                    CanonicalTokenType::Namespace => 5,
+                    CanonicalTokenType::Macro => 6,
+                    CanonicalTokenType::Number => 7,
+                    CanonicalTokenType::String => 8,
+                    CanonicalTokenType::Comment => 9,
+                    CanonicalTokenType::Type => 10,
+                    CanonicalTokenType::Function => 11,
+                    CanonicalTokenType::Keyword => 12,
+                }
+            };
+
+            // Enclosing AST nodes apply first; specific leaf nodes (keywords, types) apply last
+            sorted_tokens.sort_by(|a, b| {
+                b.length
+                    .cmp(&a.length)
+                    .then_with(|| specificity(a.token_type).cmp(&specificity(b.token_type)))
+            });
+
+            for tok in sorted_tokens {
+                if tok.token_type == CanonicalTokenType::Other {
+                    continue;
+                }
+                let start = tok.start_col;
+                let end = (start + tok.length).min(chars.len());
+                if start < chars.len() && end > start {
+                    let style = Self::style_for_token_type(tok.token_type);
+                    for cell in &mut styles[start..end] {
+                        *cell = style;
+                    }
                 }
             }
         }
 
-        // Overlay Tier 3 (LSP semantic tokens) last, taking final priority.
-        for tok in semantic_tokens {
-            let start = tok.start_col;
-            let end = (start + tok.length).min(chars.len());
-            if start < chars.len() && end > start {
-                let style = Self::style_for_token_type(tok.token_type);
-                for cell in &mut styles[start..end] {
-                    *cell = style;
+        let mut spans = Vec::new();
+        let mut chunk = String::new();
+        let mut current_style = styles[0];
+
+        for (i, &ch) in chars.iter().enumerate() {
+            if styles[i] == current_style {
+                chunk.push(ch);
+            } else {
+                spans.push(Span::styled(chunk.clone(), current_style));
+                chunk.clear();
+                chunk.push(ch);
+                current_style = styles[i];
+            }
+        }
+        if !chunk.is_empty() {
+            spans.push(Span::styled(chunk, current_style));
+        }
+
+        spans
+    }
+
+    /// Renders compiler-grade semantic tokens when Tree-sitter grammar is not installed.
+    fn render_semantic_line(&self, line_text: &str, line_idx: usize) -> Vec<Span<'static>> {
+        let chars: Vec<char> = line_text.chars().collect();
+        if chars.is_empty() {
+            return vec![Span::raw("")];
+        }
+
+        let default_style = Style::default().fg(Color::Rgb(220, 225, 235));
+        let mut styles = vec![default_style; chars.len()];
+
+        if let Some(tokens) = self.semantic_tokens.get(&line_idx) {
+            for tok in tokens {
+                if tok.token_type == CanonicalTokenType::Other {
+                    continue;
+                }
+                let start = tok.start_col;
+                let end = (start + tok.length).min(chars.len());
+                if start < chars.len() && end > start {
+                    let style = Self::style_for_token_type(tok.token_type);
+                    for cell in &mut styles[start..end] {
+                        *cell = style;
+                    }
                 }
             }
         }
@@ -1887,243 +2002,13 @@ impl SyntaxEngine {
                 .add_modifier(Modifier::BOLD),
             CanonicalTokenType::Operator => Style::default().fg(Color::Rgb(140, 150, 170)),
             CanonicalTokenType::Namespace => Style::default().fg(Color::Rgb(140, 180, 240)),
-            CanonicalTokenType::Variable
-            | CanonicalTokenType::Parameter
-            | CanonicalTokenType::Property
-            | CanonicalTokenType::Other => Style::default().fg(Color::Rgb(220, 225, 235)),
+            CanonicalTokenType::Variable => Style::default().fg(Color::Rgb(215, 220, 235)),
+            CanonicalTokenType::Parameter => Style::default().fg(Color::Rgb(245, 175, 145)),
+            CanonicalTokenType::Property => Style::default().fg(Color::Rgb(160, 205, 245)),
+            CanonicalTokenType::Other => Style::default().fg(Color::Rgb(220, 225, 235)),
         }
     }
 
-    fn highlight_markdown(line_text: &str) -> Vec<Span<'static>> {
-        let trimmed = line_text.trim_start();
-        if trimmed.starts_with("# ") {
-            vec![Span::styled(
-                line_text.to_string(),
-                Style::default()
-                    .fg(Color::Rgb(80, 200, 240))
-                    .add_modifier(Modifier::BOLD),
-            )]
-        } else if trimmed.starts_with("## ") {
-            vec![Span::styled(
-                line_text.to_string(),
-                Style::default()
-                    .fg(Color::Rgb(120, 180, 255))
-                    .add_modifier(Modifier::BOLD),
-            )]
-        } else if trimmed.starts_with("### ") {
-            vec![Span::styled(
-                line_text.to_string(),
-                Style::default()
-                    .fg(Color::Rgb(180, 160, 240))
-                    .add_modifier(Modifier::BOLD),
-            )]
-        } else if trimmed.starts_with("```") {
-            vec![Span::styled(
-                line_text.to_string(),
-                Style::default().fg(Color::Rgb(240, 180, 90)),
-            )]
-        } else {
-            vec![Span::styled(
-                line_text.to_string(),
-                Style::default().fg(Color::Rgb(210, 215, 225)),
-            )]
-        }
-    }
-
-    fn highlight_code_universal(&self, line_text: &str) -> Vec<Span<'static>> {
-        let mut spans = Vec::new();
-        let chars: Vec<char> = line_text.chars().collect();
-        let len = chars.len();
-        let mut idx = 0;
-
-        let comment_prefix = match self.language {
-            SupportedLanguage::Python
-            | SupportedLanguage::Bash
-            | SupportedLanguage::Zsh
-            | SupportedLanguage::Fish
-            | SupportedLanguage::Yaml
-            | SupportedLanguage::Toml
-            | SupportedLanguage::Ruby
-            | SupportedLanguage::Perl
-            | SupportedLanguage::Nim
-            | SupportedLanguage::Julia
-            | SupportedLanguage::R
-            | SupportedLanguage::Elixir
-            | SupportedLanguage::Crystal
-            | SupportedLanguage::PowerShell
-            | SupportedLanguage::Dockerfile
-            | SupportedLanguage::Makefile
-            | SupportedLanguage::Awk
-            | SupportedLanguage::Tcl
-            | SupportedLanguage::Gd
-            | SupportedLanguage::EnvFile
-            | SupportedLanguage::Properties
-            | SupportedLanguage::Cmake
-            | SupportedLanguage::Nginx
-            | SupportedLanguage::Terraform
-            | SupportedLanguage::Hcl
-            | SupportedLanguage::GraphQL
-            | SupportedLanguage::Ini => Some("#"),
-            SupportedLanguage::Lua
-            | SupportedLanguage::Sql
-            | SupportedLanguage::Haskell
-            | SupportedLanguage::Elm
-            | SupportedLanguage::Ada
-            | SupportedLanguage::VHDL => Some("--"),
-            SupportedLanguage::Clojure
-            | SupportedLanguage::CommonLisp
-            | SupportedLanguage::Scheme
-            | SupportedLanguage::Racket
-            | SupportedLanguage::EmacsLisp
-            | SupportedLanguage::Assembly => Some(";"),
-            SupportedLanguage::Erlang
-            | SupportedLanguage::Prolog
-            | SupportedLanguage::Latex
-            | SupportedLanguage::Bibtex => Some("%"),
-            SupportedLanguage::Vim => Some("\""),
-            _ => Some("//"),
-        };
-
-        while idx < len {
-            if let Some(prefix) = comment_prefix {
-                let rest: String = chars[idx..].iter().collect();
-                if rest.starts_with(prefix) {
-                    spans.push(Span::styled(
-                        rest,
-                        Style::default()
-                            .fg(Color::Rgb(115, 125, 140))
-                            .add_modifier(Modifier::ITALIC),
-                    ));
-                    break;
-                }
-            }
-
-            // Builtin compiler intrinsics (Zig @import, @as, @intCast, etc.)
-            if chars[idx] == '@' && idx + 1 < len && chars[idx + 1].is_alphabetic() {
-                let start = idx;
-                idx += 1;
-                while idx < len && (chars[idx].is_alphanumeric() || chars[idx] == '_') {
-                    idx += 1;
-                }
-                let builtin: String = chars[start..idx].iter().collect();
-                spans.push(Span::styled(
-                    builtin,
-                    Style::default()
-                        .fg(Color::Rgb(80, 210, 240))
-                        .add_modifier(Modifier::BOLD),
-                ));
-                continue;
-            }
-
-            // String literals
-            if chars[idx] == '"' || chars[idx] == '\'' || chars[idx] == '`' {
-                let quote = chars[idx];
-                let mut end = idx + 1;
-                while end < len {
-                    if chars[end] == '\\' && end + 1 < len {
-                        end += 2;
-                        continue;
-                    }
-                    if chars[end] == quote {
-                        end += 1;
-                        break;
-                    }
-                    end += 1;
-                }
-                let token: String = chars[idx..end].iter().collect();
-                spans.push(Span::styled(
-                    token,
-                    Style::default().fg(Color::Rgb(150, 215, 120)),
-                ));
-                idx = end;
-                continue;
-            }
-
-            // Numbers
-            if chars[idx].is_ascii_digit() {
-                let mut end = idx;
-                while end < len && (chars[end].is_ascii_alphanumeric() || chars[end] == '.') {
-                    end += 1;
-                }
-                let num: String = chars[idx..end].iter().collect();
-                spans.push(Span::styled(
-                    num,
-                    Style::default().fg(Color::Rgb(250, 175, 95)),
-                ));
-                idx = end;
-                continue;
-            }
-
-            // Keywords, Builtins, and Types
-            if chars[idx].is_alphabetic() || chars[idx] == '_' {
-                let mut end = idx;
-                while end < len && (chars[end].is_alphanumeric() || chars[end] == '_') {
-                    end += 1;
-                }
-                let word: String = chars[idx..end].iter().collect();
-
-                let mut lookahead = end;
-                while lookahead < len && chars[lookahead].is_whitespace() {
-                    lookahead += 1;
-                }
-                let is_func = lookahead < len && chars[lookahead] == '(';
-
-                let style = match word.as_str() {
-                    // Control flow & definitions
-                    "fn" | "func" | "def" | "function" | "proc" | "let" | "mut" | "const"
-                    | "var" | "val" | "if" | "else" | "match" | "switch" | "case" | "for"
-                    | "while" | "loop" | "do" | "end" | "return" | "break" | "continue"
-                    | "import" | "from" | "pub" | "export" | "extern" | "struct" | "enum"
-                    | "union" | "class" | "interface" | "trait" | "impl" | "type" | "package"
-                    | "comptime" | "inline" | "defer" | "errdefer" | "catch" | "try" | "throw"
-                    | "throws" | "usingnamespace" | "threadlocal" | "unreachable" | "test"
-                    | "async" | "await" | "suspend" | "resume" | "chan" | "select" | "go"
-                    | "range" | "map" | "yield" | "package_clause" | "public" | "private"
-                    | "protected" | "static" | "final" | "override" | "guard" => Style::default()
-                        .fg(Color::Rgb(220, 110, 240))
-                        .add_modifier(Modifier::BOLD),
-                    // Booleans and primitives
-                    "true" | "false" | "None" | "null" | "nil" | "undefined" | "iota" | "Some"
-                    | "Ok" | "Err" => Style::default().fg(Color::Rgb(240, 200, 90)),
-                    // Types
-                    "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "i8" | "i16" | "i32"
-                    | "i64" | "i128" | "isize" | "f16" | "f32" | "f64" | "f128" | "bool"
-                    | "char" | "str" | "String" | "Vec" | "int" | "int8" | "int16" | "int32"
-                    | "int64" | "uint" | "uint8" | "uint16" | "uint32" | "uint64" | "uintptr"
-                    | "float" | "float32" | "float64" | "byte" | "rune" | "error" | "anyerror"
-                    | "anyopaque" | "noreturn" | "void" | "boolean" => {
-                        Style::default().fg(Color::Rgb(240, 200, 100))
-                    }
-                    // Common built-in utilities
-                    "make" | "new" | "len" | "cap" | "append" | "copy" | "delete" | "close"
-                    | "panic" | "recover" | "print" | "println" => {
-                        Style::default().fg(Color::Rgb(100, 175, 255))
-                    }
-                    _ => {
-                        if is_func {
-                            Style::default().fg(Color::Rgb(100, 175, 255))
-                        } else if word.chars().next().is_some_and(char::is_uppercase) {
-                            Style::default().fg(Color::Rgb(240, 200, 90))
-                        } else {
-                            Style::default().fg(Color::Rgb(220, 225, 235))
-                        }
-                    }
-                };
-
-                spans.push(Span::styled(word, style));
-                idx = end;
-                continue;
-            }
-
-            spans.push(Span::styled(
-                chars[idx].to_string(),
-                Style::default().fg(Color::Rgb(140, 150, 170)),
-            ));
-            idx += 1;
-        }
-
-        spans
-    }
 }
 
 /// Returns the Nerd Font glyph icon and corresponding theme color for a file path.

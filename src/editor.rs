@@ -37,8 +37,9 @@ use std::{
 };
 
 use crate::lsp::{
-    DiagnosticItem, LspInbound, LspOutbound, LspStatus, SuggestionItem, SyntaxEngine,
+    DiagnosticItem, LspInbound, LspOutbound, LspStatus, SuggestionItem, SyntaxEngine, run_lsp_actor,
 };
+
 use anyhow::{Result, anyhow};
 use ropey::Rope;
 use tokio::sync::mpsc;
@@ -601,6 +602,10 @@ pub struct Editor {
     pub completion_scroll: usize,
     /// Controls whether the completion popup window is visible.
     pub completion_visible: bool,
+    /// Absolute rendered screen boundary of the completion popup (x, y, width, height).
+    pub completion_rect: Option<(u16, u16, u16, u16)>,
+    /// Tracks the language identifier for the currently spawned LSP session.
+    pub active_lsp_lang: Option<String>,
 
     // File Tree & Command Palette
     /// File tree explorer state machine.
@@ -706,6 +711,8 @@ impl Editor {
             completion_idx: 0,
             completion_scroll: 0,
             completion_visible: false,
+            completion_rect: None,
+            active_lsp_lang: None,
             explorer,
             palette: CommandPalette::new(),
             show_help: false,
@@ -738,24 +745,99 @@ impl Editor {
         self.syntax.reparse(&text);
         self.doc_version = 1;
 
-        if let Some(tx) = &self.lsp_tx {
-            let lang_id = self.syntax.language.lsp_id();
-            if !lang_id.is_empty() && lang_id != "plaintext" {
-                let _ = tx.send(LspInbound::OpenFile {
-                    path: path_buf.clone(),
-                    text,
-                    lang_id: lang_id.to_string(),
-                });
-                self.request_semantic_tokens();
+        let lang_id = self.syntax.language.lsp_id();
+        if !lang_id.is_empty() && lang_id != "plaintext" {
+            if self.lsp_tx.is_some() && self.active_lsp_lang.as_deref() == Some(lang_id) {
+                if let Some(tx) = &self.lsp_tx {
+                    let _ = tx.send(LspInbound::OpenFile {
+                        path: path_buf.clone(),
+                        text,
+                        lang_id: lang_id.to_string(),
+                    });
+                    self.request_semantic_tokens();
+                }
+            } else {
+                self.ensure_lsp_for_file(&path_buf);
             }
+        } else {
+            self.lsp_tx = None;
+            self.active_lsp_lang = None;
+            self.lsp_status = LspStatus::Disabled;
         }
 
         self.status_msg = format!("Opened {}", path_buf.display());
         Ok(())
     }
 
+    /// Spawns or configures an LSP server instance matching the target file.
+    pub fn ensure_lsp_for_file(&mut self, path: &Path) {
+        let lang = self.syntax.language;
+        let lang_id = lang.lsp_id();
+        if lang_id.is_empty() || lang_id == "plaintext" {
+            self.lsp_tx = None;
+            self.active_lsp_lang = None;
+            self.lsp_status = LspStatus::Disabled;
+            return;
+        }
+
+        let installed = lang.installed_servers();
+        if installed.is_empty() {
+            self.lsp_tx = None;
+            self.active_lsp_lang = None;
+            let candidates = lang.candidate_servers();
+            if let Some(first) = candidates.first() {
+                self.lsp_status = LspStatus::NotFound((*first).to_string());
+            } else {
+                self.lsp_status = LspStatus::Disabled;
+            }
+            return;
+        }
+
+        let preferred = self.config.preferred_lsps.get(lang_id).cloned();
+        let chosen_server = if let Some(pref) = preferred.filter(|p| installed.contains(p)) {
+            Some(pref)
+        } else if installed.len() == 1 {
+            Some(installed[0].clone())
+        } else {
+            self.lsp_picker = Some(LspPicker {
+                language_id: lang_id.to_string(),
+                candidates: installed.clone(),
+                selected_idx: 0,
+            });
+            None
+        };
+
+        if let Some(cmd) = chosen_server {
+            self.start_lsp_server(path, lang_id, &cmd);
+        }
+    }
+
+    /// Spawns the background LSP actor task for a specific language and executable.
+    pub fn start_lsp_server(&mut self, path: &Path, lang_id: &str, cmd: &str) {
+        if let Some(out_tx) = &self.lsp_out_tx {
+            let (in_tx, in_rx) = mpsc::unbounded_channel::<LspInbound>();
+            self.lsp_tx = Some(in_tx);
+            self.active_lsp_lang = Some(lang_id.to_string());
+            let p = path.to_path_buf();
+            let initial_text = self.rope.to_string();
+            tokio::spawn(run_lsp_actor(
+                p,
+                lang_id.to_string(),
+                cmd.to_string(),
+                in_rx,
+                out_tx.clone(),
+                initial_text,
+            ));
+        }
+    }
+
     /// Dispatches an asynchronous `textDocument/semanticTokens/full` request to the LSP actor.
+    ///
+    /// Bypassed if Tree-sitter is available to prevent LSP responses from overriding AST highlights.
     pub fn request_semantic_tokens(&mut self) {
+        if self.syntax.has_treesitter() {
+            return;
+        }
         if let Some(tx) = &self.lsp_tx {
             self.lsp_req_id += 1;
             let _ = tx.send(LspInbound::SemanticTokens {
@@ -763,6 +845,7 @@ impl Editor {
             });
         }
     }
+
 
     /// Pushes a snapshot of the current [`Rope`] onto `undo_stack`.
     ///
@@ -805,8 +888,10 @@ impl Editor {
                 text,
                 version: self.doc_version,
             });
+            self.request_semantic_tokens();
         }
     }
+
 
     /// Dispatches an asynchronous `textDocument/completion` request to the LSP actor
     /// corresponding to the current cursor position.

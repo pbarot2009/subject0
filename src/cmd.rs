@@ -9,7 +9,7 @@ use std::{
     process::{self, Command},
 };
 
-use crate::lsp::{DynamicGrammar, SupportedLanguage, resolve_binary_path};
+use crate::lsp::{resolve_binary_path, DynamicGrammar, SupportedLanguage};
 
 /// Parsed command-line arguments.
 #[derive(Debug, Default, Clone)]
@@ -238,8 +238,15 @@ impl CliArgs {
             process::exit(1);
         };
 
+        let canon_lang = match lang {
+            "ts" => "typescript",
+            "js" => "javascript",
+            "sh" => "bash",
+            _ => lang,
+        };
+
         let grammars_dir = home.join(".local/share/subject0/grammars");
-        let queries_dir = home.join(".local/share/subject0/queries").join(lang);
+        let queries_dir = home.join(".local/share/subject0/queries").join(canon_lang);
         let target_scm = queries_dir.join("highlights.scm");
 
         let ext = if cfg!(target_os = "windows") {
@@ -250,7 +257,7 @@ impl CliArgs {
             "so"
         };
 
-        let target_so = grammars_dir.join(format!("{lang}.{ext}"));
+        let target_so = grammars_dir.join(format!("{canon_lang}.{ext}"));
 
         // Cache detection: skip cloning/compilation if already installed
         if target_so.is_file() && !force {
@@ -285,28 +292,28 @@ impl CliArgs {
             process::exit(1);
         }
 
-        let repo_url = match lang {
+        let repo_url = match canon_lang {
             "rust" => "https://github.com/tree-sitter/tree-sitter-rust.git",
             "python" => "https://github.com/tree-sitter/tree-sitter-python.git",
             "c" => "https://github.com/tree-sitter/tree-sitter-c.git",
             "cpp" => "https://github.com/tree-sitter/tree-sitter-cpp.git",
             "go" => "https://github.com/tree-sitter/tree-sitter-go.git",
             "zig" => "https://github.com/ziglibs/tree-sitter-zig.git",
-            "javascript" | "js" => "https://github.com/tree-sitter/tree-sitter-javascript.git",
-            "typescript" | "ts" => "https://github.com/tree-sitter/tree-sitter-typescript.git",
-            "bash" | "sh" => "https://github.com/tree-sitter/tree-sitter-bash.git",
+            "javascript" => "https://github.com/tree-sitter/tree-sitter-javascript.git",
+            "typescript" => "https://github.com/tree-sitter/tree-sitter-typescript.git",
+            "bash" => "https://github.com/tree-sitter/tree-sitter-bash.git",
             "lua" => "https://github.com/MunifTanjim/tree-sitter-lua.git",
             "toml" => "https://github.com/tree-sitter-grammars/tree-sitter-toml.git",
             "json" => "https://github.com/tree-sitter/tree-sitter-json.git",
-            _ => &format!("https://github.com/tree-sitter/tree-sitter-{lang}.git"),
+            _ => &format!("https://github.com/tree-sitter/tree-sitter-{canon_lang}.git"),
         };
 
-        let temp_dir = env::temp_dir().join(format!("s0-grammar-{lang}"));
+        let temp_dir = env::temp_dir().join(format!("s0-grammar-{canon_lang}"));
         if temp_dir.exists() {
             let _ = fs::remove_dir_all(&temp_dir);
         }
 
-        println!("{blue}󰄬 Cloning Tree-sitter grammar for {b}{lang}{r}{blue}...{r}");
+        println!("{blue}󰄬 Cloning Tree-sitter grammar for {b}{canon_lang}{r}{blue}...{r}");
 
         let clone_status = Command::new("git")
             .args(["clone", "--depth=1", repo_url, temp_dir.to_str().unwrap()])
@@ -322,11 +329,13 @@ impl CliArgs {
             }
         }
 
-        // Locate source files
-        let src_dir = if temp_dir.join(lang).join("src").exists() {
-            temp_dir.join(lang).join("src")
-        } else {
+        // Locate source files (supports both flat and monorepo structures like tree-sitter-typescript)
+        let src_dir = if temp_dir.join(canon_lang).join("src").exists() {
+            temp_dir.join(canon_lang).join("src")
+        } else if temp_dir.join("src").exists() {
             temp_dir.join("src")
+        } else {
+            temp_dir.clone()
         };
 
         let parser_c = src_dir.join("parser.c");
@@ -357,13 +366,20 @@ impl CliArgs {
             "gcc"
         };
 
-        println!("{yellow}󰑮 Compiling {b}{lang}.{ext}{r}{yellow} with {compiler}...{r}");
+        println!("{yellow}󰑮 Compiling {b}{canon_lang}.{ext}{r}{yellow} with {compiler}...{r}");
 
         let mut compile_cmd = Command::new(compiler);
+        compile_cmd.arg("-O3");
+
+        if cfg!(target_os = "macos") {
+            compile_cmd.args(["-fPIC", "-dynamiclib", "-undefined", "dynamic_lookup"]);
+        } else if cfg!(target_os = "windows") {
+            compile_cmd.arg("-shared");
+        } else {
+            compile_cmd.args(["-fPIC", "-shared"]);
+        }
+
         compile_cmd
-            .arg("-O3")
-            .arg("-fPIC")
-            .arg("-shared")
             .arg(format!("-I{}", src_dir.display()))
             .arg(parser_c);
 
@@ -392,8 +408,14 @@ impl CliArgs {
         // Copy highlights.scm queries if present
         let query_candidates = [
             temp_dir.join("queries").join("highlights.scm"),
-            temp_dir.join("queries").join(lang).join("highlights.scm"),
-            temp_dir.join(lang).join("queries").join("highlights.scm"),
+            temp_dir
+                .join("queries")
+                .join(canon_lang)
+                .join("highlights.scm"),
+            temp_dir
+                .join(canon_lang)
+                .join("queries")
+                .join("highlights.scm"),
             src_dir.join("highlights.scm"),
         ];
 
@@ -413,7 +435,7 @@ impl CliArgs {
         let display_so = Self::shorten_home(&target_so);
         let lines = vec![
             format!(" {green}󰄬 Grammar Installed Successfully!{r}"),
-            format!(" Language:  {b}{lang}{r}"),
+            format!(" Language:  {b}{canon_lang}{r}"),
             format!(" Library:   {blue}{display_so}{r}"),
             format!(
                 " Queries:   {}",
