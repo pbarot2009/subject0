@@ -159,7 +159,7 @@ async fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let target_path = cli_args.path.clone();
-    let mut editor = Editor::new(target_path.clone())?;
+    let mut editor = Editor::new(target_path.as_ref())?;
 
     // Apply CLI flag overrides
     if cli_args.ignore_config {
@@ -186,32 +186,31 @@ async fn main() -> Result<()> {
     editor.lsp_out_tx = Some(lsp_out_tx.clone());
 
     // Dynamic Multi-LSP Resolution (only spawn for files, not directories)
-    if let Some(path) = &target_path {
-        if path.is_file() {
-            let lang = editor.syntax.language;
-            let lang_id = lang.lsp_id();
-            let installed = lang.installed_servers();
+    if let Some(path) = &target_path
+        && path.is_file()
+    {
+        let lang = editor.syntax.language;
+        let lang_id = lang.lsp_id();
+        let installed = lang.installed_servers();
 
-            if !installed.is_empty() {
-                let preferred = editor.config.preferred_lsps.get(lang_id).cloned();
-                let chosen_server = if let Some(pref) = preferred.filter(|p| installed.contains(p))
-                {
-                    Some(pref)
-                } else if installed.len() == 1 {
-                    Some(installed[0].clone())
-                } else {
-                    // Multiple servers installed and none configured: prompt user
-                    editor.lsp_picker = Some(editor::LspPicker {
-                        language_id: lang_id.to_string(),
-                        candidates: installed.clone(),
-                        selected_idx: 0,
-                    });
-                    None
-                };
+        if !installed.is_empty() {
+            let preferred = editor.config.preferred_lsps.get(lang_id).cloned();
+            let chosen_server = if let Some(pref) = preferred.filter(|p| installed.contains(p)) {
+                Some(pref)
+            } else if installed.len() == 1 {
+                Some(installed[0].clone())
+            } else {
+                // Multiple servers installed and none configured: prompt user
+                editor.lsp_picker = Some(editor::LspPicker {
+                    language_id: lang_id.to_string(),
+                    candidates: installed.clone(),
+                    selected_idx: 0,
+                });
+                None
+            };
 
-                if let Some(cmd) = chosen_server {
-                    start_lsp_for_file(&mut editor, path, lang_id, &cmd);
-                }
+            if let Some(cmd) = chosen_server {
+                start_lsp_for_file(&mut editor, path, lang_id, &cmd);
             }
         }
     }
@@ -1690,12 +1689,12 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             frame.render_widget(Paragraph::new(list_lines).block(comp_block), popup_rect);
         }
 
-        if editor.focus == Focus::Editor {
-            if let Some((cx, cy)) = cursor_screen_pos {
-                if cx < inner_area.right() && cy < inner_area.bottom() {
-                    frame.set_cursor_position(Position::new(cx, cy));
-                }
-            }
+        if editor.focus == Focus::Editor
+            && let Some((cx, cy)) = cursor_screen_pos
+            && cx < inner_area.right()
+            && cy < inner_area.bottom()
+        {
+            frame.set_cursor_position(Position::new(cx, cy));
         }
     }
 

@@ -9,6 +9,8 @@ use std::{
     process::{self, Command},
 };
 
+use crate::lsp::{resolve_binary_path, DynamicGrammar, SupportedLanguage};
+
 /// Parsed command-line arguments.
 #[derive(Debug, Default, Clone)]
 pub struct CliArgs {
@@ -60,6 +62,10 @@ impl CliArgs {
                 s if s.starts_with("--install-grammar=") => {
                     let lang = s.trim_start_matches("--install-grammar=");
                     Self::run_grammar_installer(lang, force_grammar);
+                    process::exit(0);
+                }
+                "-H" | "--health" | "--doctor" => {
+                    Self::run_health_check();
                     process::exit(0);
                 }
 
@@ -143,6 +149,7 @@ impl CliArgs {
       {yellow}-v, --version{r}             Print version information and metadata
       {yellow}-g, --install-grammar <L>{r}  Download & compile Tree-sitter grammar (.so & queries)
       {yellow}--force, --reinstall{r}      Re-download and recompile existing grammar
+      {yellow}-H, --health, --doctor{r}    Show install status of every supported language
       {yellow}-w, --wrap{r}                Force soft line wrapping on
       {yellow}-nw, --no-wrap{r}            Force line wrapping off (horizontal scroll)
       {yellow}--clean{r}                   Bypass workspace and user {gray}.subject0{r} configs
@@ -155,7 +162,10 @@ impl CliArgs {
       {white}s0 .{r}
 
       {gray}# Launch scratch buffer with no configuration:{r}
-      {white}s0 --clean{r}"
+      {white}s0 --clean{r}
+
+      {gray}# Check which languages have an LSP server and grammar installed:{r}
+      {white}s0 --health{r}"
         );
     }
 
@@ -221,12 +231,11 @@ impl CliArgs {
         let blue = "\x1b[38;2;100;180;255m";
         let gray = "\x1b[38;2;140;145;160m";
 
-        let home = match env::var("HOME") {
-            Ok(h) => PathBuf::from(h),
-            Err(_) => {
-                eprintln!("{red}Error: Unable to locate $HOME environment variable.{r}");
-                process::exit(1);
-            }
+        let home = if let Ok(h) = env::var("HOME") {
+            PathBuf::from(h)
+        } else {
+            eprintln!("{red}Error: Unable to locate $HOME environment variable.{r}");
+            process::exit(1);
         };
 
         let grammars_dir = home.join(".local/share/subject0/grammars");
@@ -413,5 +422,143 @@ impl CliArgs {
         ];
 
         Self::print_boxed_card(&lines, 56);
+    }
+
+    /// Prints a health report showing, for every supported language: whether
+    /// a Tree-sitter grammar is installed, and whether at least one candidate
+    /// LSP server binary is reachable on `$PATH` (or `~/.cargo/bin`).
+    ///
+    /// This purely inspects the local filesystem/`$PATH` — it never spawns or
+    /// initializes any language server, so it's always fast and side-effect free.
+    fn run_health_check() {
+        let r = "\x1b[0m";
+        let b = "\x1b[1m";
+        let green = "\x1b[38;2;100;200;140m";
+        let yellow = "\x1b[38;2;240;200;90m";
+        let blue = "\x1b[38;2;100;180;255m";
+        let gray = "\x1b[38;2;140;145;160m";
+        let white = "\x1b[38;2;225;230;240m";
+        let ver = env!("CARGO_PKG_VERSION");
+
+        let ok = format!("{green}󰄬{r}");
+        let missing = format!("{gray}󰚌{r}");
+
+        let header = vec![format!(
+            " {blue}󰆉{r} {b}{white}subject0{r} {gray}(s0){r} {green}v{ver}{r} {gray}— Language Support Health{r}"
+        )];
+        Self::print_boxed_card(&header, 62);
+        println!();
+
+        let langs = SupportedLanguage::all();
+
+        // Column widths sized off the longest actual value, so the table
+        // stays aligned no matter the terminal width or language name length.
+        let name_w = langs
+            .iter()
+            .map(|l| l.display_name().chars().count())
+            .max()
+            .unwrap_or(8)
+            .max("LANGUAGE".len());
+        let server_w = langs
+            .iter()
+            .flat_map(|l| l.candidate_servers().iter())
+            .map(|s| s.chars().count())
+            .max()
+            .unwrap_or(6)
+            .max("LSP SERVER".len());
+
+        println!(
+            "  {gray}{:<name_w$}  {:<4}  {:<server_w$}  {:<4}{r}",
+            "LANGUAGE",
+            "AST",
+            "LSP SERVER",
+            "LSP",
+            name_w = name_w,
+            server_w = server_w
+        );
+        println!(
+            "  {gray}{}  {}  {}  {}{r}",
+            "─".repeat(name_w),
+            "─".repeat(4),
+            "─".repeat(server_w),
+            "─".repeat(4)
+        );
+
+        let mut grammar_count = 0usize;
+        let mut lsp_count = 0usize;
+
+        for lang in langs {
+            let grammar_installed =
+                DynamicGrammar::grammar_file_path(lang.grammar_name()).is_some();
+            if grammar_installed {
+                grammar_count += 1;
+            }
+            let ast_cell = if lang.grammar_name().is_empty() {
+                format!("{gray}  ·{r} ")
+            } else if grammar_installed {
+                format!("{ok} ")
+            } else {
+                format!("{missing} ")
+            };
+
+            let candidates = lang.candidate_servers();
+            let installed_server = candidates
+                .iter()
+                .find(|cmd| resolve_binary_path(cmd).is_some());
+
+            if installed_server.is_some() {
+                lsp_count += 1;
+            }
+
+            let (server_text, server_label, lsp_cell) = if candidates.is_empty() {
+                (
+                    "(none available)".to_string(),
+                    format!("{gray}(none available){r}"),
+                    format!("{gray}  ·{r} "),
+                )
+            } else if let Some(found) = installed_server {
+                (
+                    (*found).to_string(),
+                    format!("{white}{found}{r}"),
+                    format!("{ok} "),
+                )
+            } else {
+                (
+                    candidates[0].to_string(),
+                    format!("{gray}{}{r}", candidates[0]),
+                    format!("{missing} "),
+                )
+            };
+            // Pad on the plain (ANSI-free) text width, then append the
+            // colorized label, so the escape codes never throw off alignment.
+            let server_pad = " ".repeat(server_w.saturating_sub(server_text.chars().count()));
+
+            println!(
+                "  {white}{:<name_w$}{r}  {}  {}{}  {}",
+                lang.display_name(),
+                ast_cell,
+                server_label,
+                server_pad,
+                lsp_cell,
+                name_w = name_w,
+            );
+        }
+
+        println!();
+        let total = langs.len();
+        let summary = vec![
+            format!(
+                " {b}{white}Grammars:{r}  {green}{grammar_count}{r}{gray}/{total} installed{r}"
+            ),
+            format!(
+                " {b}{white}LSP servers:{r} {green}{lsp_count}{r}{gray}/{total} found on $PATH{r}"
+            ),
+            String::new(),
+            format!(
+                " {yellow}󰄬{r} = installed   {gray}󰚌{r} = not found   {gray}·{r} = not applicable"
+            ),
+            format!(" {gray}Install a grammar with:{r} {blue}s0 -g <language>{r}"),
+        ];
+        Self::print_boxed_card(&summary, 56);
     }
 }

@@ -667,13 +667,18 @@ pub async fn run_lsp_actor(
                             let mut cur_line = 0usize;
                             let mut cur_char = 0usize;
 
-                                                        for chunk in ints.chunks_exact(5) {
+                            // chunks_exact is intentional here: the LSP semantic-tokens data
+                            // array is a flat, non-array-backed Vec<usize> of arbitrary
+                            // runtime length, so `as_chunks::<5>()` (which needs a fixed-size
+                            // array as input) does not apply.
+                            #[allow(clippy::chunks_exact_to_as_chunks)]
+                            for chunk in ints.chunks_exact(5) {
                                 let delta_line = chunk[0];
                                 let delta_start = chunk[1];
                                 let length = chunk[2];
                                 let token_type_idx = chunk[3];
 
-                                let token_name = server_legend.get(token_type_idx).map(String::as_str).unwrap_or("");
+                                let token_name = server_legend.get(token_type_idx).map_or("", String::as_str);
                                 let token_type = CanonicalTokenType::from_name(token_name);
 
                                 if delta_line > 0 {
@@ -790,61 +795,99 @@ impl DynamicGrammar {
         for dir in search_dirs {
             for name in &file_candidates {
                 let p = dir.join(name);
-                if p.is_file() {
-                    if let Ok(lib) = unsafe { libloading::Library::new(&p) } {
-                        let symbol_name = format!("tree_sitter_{lang_name}");
-                        let constructor: Result<
-                            libloading::Symbol<unsafe extern "C" fn() -> tree_sitter::Language>,
-                            _,
-                        > = unsafe { lib.get(symbol_name.as_bytes()) };
-                        if let Ok(lang_fn) = constructor {
-                            let language = unsafe { lang_fn() };
-                            let mut parser = tree_sitter::Parser::new();
-                            if parser.set_language(&language).is_ok() {
-                                // Load highlights.scm query if present
-                                let mut query = None;
-                                let mut query_paths = Vec::new();
-                                if let Ok(home) = env::var("HOME") {
-                                    query_paths.push(
-                                        PathBuf::from(home.clone())
-                                            .join(".local/share/subject0/queries")
-                                            .join(lang_name)
-                                            .join("highlights.scm"),
-                                    );
-                                    query_paths.push(
-                                        PathBuf::from(home)
-                                            .join(".config/subject0/queries")
-                                            .join(lang_name)
-                                            .join("highlights.scm"),
-                                    );
-                                }
+                if p.is_file()
+                    && let Ok(lib) = unsafe { libloading::Library::new(&p) }
+                {
+                    let symbol_name = format!("tree_sitter_{lang_name}");
+                    let constructor: Result<
+                        libloading::Symbol<unsafe extern "C" fn() -> tree_sitter::Language>,
+                        _,
+                    > = unsafe { lib.get(symbol_name.as_bytes()) };
+                    if let Ok(lang_fn) = constructor {
+                        let language = unsafe { lang_fn() };
+                        let mut parser = tree_sitter::Parser::new();
+                        if parser.set_language(&language).is_ok() {
+                            // Load highlights.scm query if present
+                            let mut query = None;
+                            let mut query_paths = Vec::new();
+                            if let Ok(home) = env::var("HOME") {
                                 query_paths.push(
-                                    PathBuf::from("./queries")
+                                    PathBuf::from(home.clone())
+                                        .join(".local/share/subject0/queries")
                                         .join(lang_name)
                                         .join("highlights.scm"),
                                 );
-
-                                for qp in query_paths {
-                                    if qp.is_file() {
-                                        if let Ok(content) = fs::read_to_string(&qp) {
-                                            if let Ok(q) =
-                                                tree_sitter::Query::new(&language, &content)
-                                            {
-                                                query = Some(q);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-
-                                return Some(Self {
-                                    parser,
-                                    query,
-                                    _lib: lib,
-                                });
+                                query_paths.push(
+                                    PathBuf::from(home)
+                                        .join(".config/subject0/queries")
+                                        .join(lang_name)
+                                        .join("highlights.scm"),
+                                );
                             }
+                            query_paths.push(
+                                PathBuf::from("./queries")
+                                    .join(lang_name)
+                                    .join("highlights.scm"),
+                            );
+
+                            for qp in query_paths {
+                                if qp.is_file()
+                                    && let Ok(content) = fs::read_to_string(&qp)
+                                    && let Ok(q) = tree_sitter::Query::new(&language, &content)
+                                {
+                                    query = Some(q);
+                                    break;
+                                }
+                            }
+
+                            return Some(Self {
+                                parser,
+                                query,
+                                _lib: lib,
+                            });
                         }
                     }
+                }
+            }
+        }
+        None
+    }
+
+    /// Checks whether a compiled grammar shared library for `lang_name` exists
+    /// on disk in any of the standard search locations, without loading it
+    /// (no `dlopen`). Used by the `--health` report so a broken/incompatible
+    /// library can't crash the check — it only confirms presence.
+    pub fn grammar_file_path(lang_name: &str) -> Option<PathBuf> {
+        if lang_name.is_empty() {
+            return None;
+        }
+
+        let ext = if cfg!(target_os = "windows") {
+            "dll"
+        } else if cfg!(target_os = "macos") {
+            "dylib"
+        } else {
+            "so"
+        };
+
+        let file_candidates = [
+            format!("{lang_name}.{ext}"),
+            format!("libtree-sitter-{lang_name}.{ext}"),
+            format!("tree-sitter-{lang_name}.{ext}"),
+        ];
+
+        let mut search_dirs = Vec::new();
+        if let Ok(home) = env::var("HOME") {
+            search_dirs.push(PathBuf::from(home.clone()).join(".local/share/subject0/grammars"));
+            search_dirs.push(PathBuf::from(home).join(".config/subject0/grammars"));
+        }
+        search_dirs.push(PathBuf::from("./grammars"));
+
+        for dir in search_dirs {
+            for name in &file_candidates {
+                let p = dir.join(name);
+                if p.is_file() {
+                    return Some(p);
                 }
             }
         }
@@ -854,7 +897,7 @@ impl DynamicGrammar {
 
 // === Syntax Highlighting Engine ===
 
-/// Identifies the source programming language across 25+ major languages.
+/// Identifies the source programming/markup language across 100+ languages.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SupportedLanguage {
     Rust,
@@ -883,44 +926,325 @@ pub enum SupportedLanguage {
     Sql,
     Scala,
     Odin,
+    // --- Extended language set ---
+    Haskell,
+    Elixir,
+    Erlang,
+    OCaml,
+    FSharp,
+    Elm,
+    Julia,
+    Nim,
+    Crystal,
+    Clojure,
+    Nix,
+    Gleam,
+    Terraform,
+    Vue,
+    Svelte,
+    Astro,
+    Perl,
+    R,
+    Racket,
+    Scheme,
+    CommonLisp,
+    PureScript,
+    Fortran,
+    D,
+    V,
+    Zsh,
+    Fish,
+    PowerShell,
+    Groovy,
+    Gradle,
+    ObjectiveC,
+    ObjectiveCpp,
+    Cuda,
+    Glsl,
+    Hlsl,
+    Wgsl,
+    Solidity,
+    Move,
+    Cairo,
+    Haxe,
+    Pascal,
+    Ada,
+    Cobol,
+    Prolog,
+    Tcl,
+    Awk,
+    Makefile,
+    Cmake,
+    Dockerfile,
+    GraphQL,
+    Proto,
+    Thrift,
+    Xml,
+    Ini,
+    Csv,
+    Properties,
+    EnvFile,
+    Hcl,
+    Jsonnet,
+    Dhall,
+    Nginx,
+    Diff,
+    Regex,
+    Vim,
+    EmacsLisp,
+    Latex,
+    Bibtex,
+    Typst,
+    Rst,
+    Org,
+    Assembly,
+    Verilog,
+    VHDL,
+    Zephyr,
+    Janet,
+    Wren,
+    Vala,
+    Gd,
     Plain,
 }
 
 impl SupportedLanguage {
     pub fn from_path(path: Option<&PathBuf>) -> Self {
+        let file_name = path
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
         let ext = path
             .and_then(|p| p.extension())
             .and_then(|e| e.to_str())
             .unwrap_or("");
 
+        // A handful of build/config files are recognized by exact filename
+        // rather than extension.
+        match file_name {
+            "Dockerfile" | "Containerfile" => return SupportedLanguage::Dockerfile,
+            "Makefile" | "makefile" | "GNUmakefile" => return SupportedLanguage::Makefile,
+            "CMakeLists.txt" => return SupportedLanguage::Cmake,
+            ".gitignore" | ".dockerignore" | ".npmignore" => return SupportedLanguage::Plain,
+            ".env" => return SupportedLanguage::EnvFile,
+            "nginx.conf" => return SupportedLanguage::Nginx,
+            _ => {}
+        }
+
         match ext {
             "rs" => SupportedLanguage::Rust,
             "go" => SupportedLanguage::Go,
-            "py" | "pyi" => SupportedLanguage::Python,
+            "py" | "pyi" | "pyw" => SupportedLanguage::Python,
             "c" | "h" => SupportedLanguage::C,
-            "cpp" | "hpp" | "cc" | "cxx" => SupportedLanguage::Cpp,
+            "cpp" | "hpp" | "cc" | "cxx" | "hh" | "hxx" | "c++" => SupportedLanguage::Cpp,
             "zig" | "zon" => SupportedLanguage::Zig,
             "js" | "jsx" | "mjs" | "cjs" => SupportedLanguage::JavaScript,
             "ts" | "tsx" | "mts" | "cts" => SupportedLanguage::TypeScript,
-            "html" | "htm" => SupportedLanguage::Html,
+            "html" | "htm" | "xhtml" => SupportedLanguage::Html,
             "css" | "scss" | "less" => SupportedLanguage::Css,
-            "json" => SupportedLanguage::Json,
+            "json" | "jsonc" | "json5" => SupportedLanguage::Json,
             "toml" => SupportedLanguage::Toml,
             "yaml" | "yml" => SupportedLanguage::Yaml,
-            "sh" | "bash" | "zsh" => SupportedLanguage::Bash,
+            "sh" | "bash" => SupportedLanguage::Bash,
             "lua" => SupportedLanguage::Lua,
-            "md" | "markdown" => SupportedLanguage::Markdown,
+            "md" | "markdown" | "mdx" => SupportedLanguage::Markdown,
             "java" => SupportedLanguage::Java,
-            "cs" => SupportedLanguage::CSharp,
-            "php" => SupportedLanguage::Php,
-            "rb" | "rake" => SupportedLanguage::Ruby,
+            "cs" | "csx" => SupportedLanguage::CSharp,
+            "php" | "phtml" => SupportedLanguage::Php,
+            "rb" | "rake" | "gemspec" => SupportedLanguage::Ruby,
             "kt" | "kts" => SupportedLanguage::Kotlin,
             "swift" => SupportedLanguage::Swift,
             "dart" => SupportedLanguage::Dart,
             "sql" => SupportedLanguage::Sql,
             "scala" | "sc" => SupportedLanguage::Scala,
             "odin" => SupportedLanguage::Odin,
+            "hs" | "lhs" => SupportedLanguage::Haskell,
+            "ex" | "exs" => SupportedLanguage::Elixir,
+            "erl" | "hrl" => SupportedLanguage::Erlang,
+            "ml" | "mli" => SupportedLanguage::OCaml,
+            "fs" | "fsi" | "fsx" => SupportedLanguage::FSharp,
+            "elm" => SupportedLanguage::Elm,
+            "jl" => SupportedLanguage::Julia,
+            "nim" | "nims" => SupportedLanguage::Nim,
+            "cr" => SupportedLanguage::Crystal,
+            "clj" | "cljs" | "cljc" | "edn" => SupportedLanguage::Clojure,
+            "nix" => SupportedLanguage::Nix,
+            "gleam" => SupportedLanguage::Gleam,
+            "tf" | "tfvars" => SupportedLanguage::Terraform,
+            "vue" => SupportedLanguage::Vue,
+            "svelte" => SupportedLanguage::Svelte,
+            "astro" => SupportedLanguage::Astro,
+            "pl" | "pm" => SupportedLanguage::Perl,
+            "r" | "rmd" => SupportedLanguage::R,
+            "rkt" => SupportedLanguage::Racket,
+            "scm" | "ss" => SupportedLanguage::Scheme,
+            "lisp" | "lsp" | "cl" => SupportedLanguage::CommonLisp,
+            "purs" => SupportedLanguage::PureScript,
+            "f90" | "f95" | "f03" | "f08" | "for" | "f" => SupportedLanguage::Fortran,
+            "d" | "di" => SupportedLanguage::D,
+            "v" => SupportedLanguage::V,
+            "zsh" => SupportedLanguage::Zsh,
+            "fish" => SupportedLanguage::Fish,
+            "ps1" | "psm1" | "psd1" => SupportedLanguage::PowerShell,
+            "groovy" | "gvy" => SupportedLanguage::Groovy,
+            "gradle" => SupportedLanguage::Gradle,
+            "m" => SupportedLanguage::ObjectiveC,
+            "mm" => SupportedLanguage::ObjectiveCpp,
+            "cu" | "cuh" => SupportedLanguage::Cuda,
+            "glsl" | "vert" | "frag" | "geom" => SupportedLanguage::Glsl,
+            "hlsl" => SupportedLanguage::Hlsl,
+            "wgsl" => SupportedLanguage::Wgsl,
+            "sol" => SupportedLanguage::Solidity,
+            "move" => SupportedLanguage::Move,
+            "cairo" => SupportedLanguage::Cairo,
+            "hx" => SupportedLanguage::Haxe,
+            "pas" | "pp" => SupportedLanguage::Pascal,
+            "ada" | "adb" | "ads" => SupportedLanguage::Ada,
+            "cob" | "cbl" => SupportedLanguage::Cobol,
+            "prolog" | "pro" => SupportedLanguage::Prolog,
+            "tcl" => SupportedLanguage::Tcl,
+            "awk" => SupportedLanguage::Awk,
+            "mk" | "mak" => SupportedLanguage::Makefile,
+            "cmake" => SupportedLanguage::Cmake,
+            "dockerfile" => SupportedLanguage::Dockerfile,
+            "graphql" | "gql" => SupportedLanguage::GraphQL,
+            "proto" => SupportedLanguage::Proto,
+            "thrift" => SupportedLanguage::Thrift,
+            "xml" | "xsd" | "xsl" | "plist" => SupportedLanguage::Xml,
+            "ini" | "cfg" | "conf" => SupportedLanguage::Ini,
+            "csv" | "tsv" => SupportedLanguage::Csv,
+            "properties" => SupportedLanguage::Properties,
+            "env" => SupportedLanguage::EnvFile,
+            "hcl" => SupportedLanguage::Hcl,
+            "jsonnet" | "libsonnet" => SupportedLanguage::Jsonnet,
+            "dhall" => SupportedLanguage::Dhall,
+            "diff" | "patch" => SupportedLanguage::Diff,
+            "vim" => SupportedLanguage::Vim,
+            "el" => SupportedLanguage::EmacsLisp,
+            "tex" | "latex" | "sty" | "cls" => SupportedLanguage::Latex,
+            "bib" => SupportedLanguage::Bibtex,
+            "typ" => SupportedLanguage::Typst,
+            "rst" => SupportedLanguage::Rst,
+            "org" => SupportedLanguage::Org,
+            "asm" | "s" => SupportedLanguage::Assembly,
+            "v_verilog" | "sv" | "svh" => SupportedLanguage::Verilog,
+            "vhd" | "vhdl" => SupportedLanguage::VHDL,
+            "janet" => SupportedLanguage::Janet,
+            "wren" => SupportedLanguage::Wren,
+            "vala" => SupportedLanguage::Vala,
+            "gd" => SupportedLanguage::Gd,
             _ => SupportedLanguage::Plain,
+        }
+    }
+
+    /// Human-readable display name, used in the `:health` report and status line.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            SupportedLanguage::Rust => "Rust",
+            SupportedLanguage::Go => "Go",
+            SupportedLanguage::Python => "Python",
+            SupportedLanguage::C => "C",
+            SupportedLanguage::Cpp => "C++",
+            SupportedLanguage::Zig => "Zig",
+            SupportedLanguage::JavaScript => "JavaScript",
+            SupportedLanguage::TypeScript => "TypeScript",
+            SupportedLanguage::Html => "HTML",
+            SupportedLanguage::Css => "CSS",
+            SupportedLanguage::Json => "JSON",
+            SupportedLanguage::Toml => "TOML",
+            SupportedLanguage::Yaml => "YAML",
+            SupportedLanguage::Bash => "Bash",
+            SupportedLanguage::Lua => "Lua",
+            SupportedLanguage::Markdown => "Markdown",
+            SupportedLanguage::Java => "Java",
+            SupportedLanguage::CSharp => "C#",
+            SupportedLanguage::Php => "PHP",
+            SupportedLanguage::Ruby => "Ruby",
+            SupportedLanguage::Kotlin => "Kotlin",
+            SupportedLanguage::Swift => "Swift",
+            SupportedLanguage::Dart => "Dart",
+            SupportedLanguage::Sql => "SQL",
+            SupportedLanguage::Scala => "Scala",
+            SupportedLanguage::Odin => "Odin",
+            SupportedLanguage::Haskell => "Haskell",
+            SupportedLanguage::Elixir => "Elixir",
+            SupportedLanguage::Erlang => "Erlang",
+            SupportedLanguage::OCaml => "OCaml",
+            SupportedLanguage::FSharp => "F#",
+            SupportedLanguage::Elm => "Elm",
+            SupportedLanguage::Julia => "Julia",
+            SupportedLanguage::Nim => "Nim",
+            SupportedLanguage::Crystal => "Crystal",
+            SupportedLanguage::Clojure => "Clojure",
+            SupportedLanguage::Nix => "Nix",
+            SupportedLanguage::Gleam => "Gleam",
+            SupportedLanguage::Terraform => "Terraform",
+            SupportedLanguage::Vue => "Vue",
+            SupportedLanguage::Svelte => "Svelte",
+            SupportedLanguage::Astro => "Astro",
+            SupportedLanguage::Perl => "Perl",
+            SupportedLanguage::R => "R",
+            SupportedLanguage::Racket => "Racket",
+            SupportedLanguage::Scheme => "Scheme",
+            SupportedLanguage::CommonLisp => "Common Lisp",
+            SupportedLanguage::PureScript => "PureScript",
+            SupportedLanguage::Fortran => "Fortran",
+            SupportedLanguage::D => "D",
+            SupportedLanguage::V => "V",
+            SupportedLanguage::Zsh => "Zsh",
+            SupportedLanguage::Fish => "Fish",
+            SupportedLanguage::PowerShell => "PowerShell",
+            SupportedLanguage::Groovy => "Groovy",
+            SupportedLanguage::Gradle => "Gradle",
+            SupportedLanguage::ObjectiveC => "Objective-C",
+            SupportedLanguage::ObjectiveCpp => "Objective-C++",
+            SupportedLanguage::Cuda => "CUDA",
+            SupportedLanguage::Glsl => "GLSL",
+            SupportedLanguage::Hlsl => "HLSL",
+            SupportedLanguage::Wgsl => "WGSL",
+            SupportedLanguage::Solidity => "Solidity",
+            SupportedLanguage::Move => "Move",
+            SupportedLanguage::Cairo => "Cairo",
+            SupportedLanguage::Haxe => "Haxe",
+            SupportedLanguage::Pascal => "Pascal",
+            SupportedLanguage::Ada => "Ada",
+            SupportedLanguage::Cobol => "COBOL",
+            SupportedLanguage::Prolog => "Prolog",
+            SupportedLanguage::Tcl => "Tcl",
+            SupportedLanguage::Awk => "AWK",
+            SupportedLanguage::Makefile => "Makefile",
+            SupportedLanguage::Cmake => "CMake",
+            SupportedLanguage::Dockerfile => "Dockerfile",
+            SupportedLanguage::GraphQL => "GraphQL",
+            SupportedLanguage::Proto => "Protocol Buffers",
+            SupportedLanguage::Thrift => "Thrift",
+            SupportedLanguage::Xml => "XML",
+            SupportedLanguage::Ini => "INI",
+            SupportedLanguage::Csv => "CSV",
+            SupportedLanguage::Properties => "Properties",
+            SupportedLanguage::EnvFile => "Dotenv",
+            SupportedLanguage::Hcl => "HCL",
+            SupportedLanguage::Jsonnet => "Jsonnet",
+            SupportedLanguage::Dhall => "Dhall",
+            SupportedLanguage::Nginx => "Nginx",
+            SupportedLanguage::Diff => "Diff",
+            SupportedLanguage::Regex => "Regex",
+            SupportedLanguage::Vim => "Vimscript",
+            SupportedLanguage::EmacsLisp => "Emacs Lisp",
+            SupportedLanguage::Latex => "LaTeX",
+            SupportedLanguage::Bibtex => "BibTeX",
+            SupportedLanguage::Typst => "Typst",
+            SupportedLanguage::Rst => "reStructuredText",
+            SupportedLanguage::Org => "Org Mode",
+            SupportedLanguage::Assembly => "Assembly",
+            SupportedLanguage::Verilog => "Verilog",
+            SupportedLanguage::VHDL => "VHDL",
+            SupportedLanguage::Zephyr => "Zephyr",
+            SupportedLanguage::Janet => "Janet",
+            SupportedLanguage::Wren => "Wren",
+            SupportedLanguage::Vala => "Vala",
+            SupportedLanguage::Gd => "GDScript",
+            SupportedLanguage::Plain => "Plain Text",
         }
     }
 
@@ -952,6 +1276,84 @@ impl SupportedLanguage {
             SupportedLanguage::Sql => "sql",
             SupportedLanguage::Scala => "scala",
             SupportedLanguage::Odin => "odin",
+            SupportedLanguage::Haskell => "haskell",
+            SupportedLanguage::Elixir => "elixir",
+            SupportedLanguage::Erlang => "erlang",
+            SupportedLanguage::OCaml => "ocaml",
+            SupportedLanguage::FSharp => "fsharp",
+            SupportedLanguage::Elm => "elm",
+            SupportedLanguage::Julia => "julia",
+            SupportedLanguage::Nim => "nim",
+            SupportedLanguage::Crystal => "crystal",
+            SupportedLanguage::Clojure => "clojure",
+            SupportedLanguage::Nix => "nix",
+            SupportedLanguage::Gleam => "gleam",
+            SupportedLanguage::Terraform => "hcl",
+            SupportedLanguage::Vue => "vue",
+            SupportedLanguage::Svelte => "svelte",
+            SupportedLanguage::Astro => "astro",
+            SupportedLanguage::Perl => "perl",
+            SupportedLanguage::R => "r",
+            SupportedLanguage::Racket => "racket",
+            SupportedLanguage::Scheme => "scheme",
+            SupportedLanguage::CommonLisp => "commonlisp",
+            SupportedLanguage::PureScript => "purescript",
+            SupportedLanguage::Fortran => "fortran",
+            SupportedLanguage::D => "d",
+            SupportedLanguage::V => "v",
+            SupportedLanguage::Zsh => "bash",
+            SupportedLanguage::Fish => "fish",
+            SupportedLanguage::PowerShell => "powershell",
+            SupportedLanguage::Groovy => "groovy",
+            SupportedLanguage::Gradle => "groovy",
+            SupportedLanguage::ObjectiveC => "objc",
+            SupportedLanguage::ObjectiveCpp => "objc",
+            SupportedLanguage::Cuda => "cuda",
+            SupportedLanguage::Glsl => "glsl",
+            SupportedLanguage::Hlsl => "hlsl",
+            SupportedLanguage::Wgsl => "wgsl",
+            SupportedLanguage::Solidity => "solidity",
+            SupportedLanguage::Move => "move",
+            SupportedLanguage::Cairo => "cairo",
+            SupportedLanguage::Haxe => "haxe",
+            SupportedLanguage::Pascal => "pascal",
+            SupportedLanguage::Ada => "ada",
+            SupportedLanguage::Cobol => "cobol",
+            SupportedLanguage::Prolog => "prolog",
+            SupportedLanguage::Tcl => "tcl",
+            SupportedLanguage::Awk => "awk",
+            SupportedLanguage::Makefile => "make",
+            SupportedLanguage::Cmake => "cmake",
+            SupportedLanguage::Dockerfile => "dockerfile",
+            SupportedLanguage::GraphQL => "graphql",
+            SupportedLanguage::Proto => "proto",
+            SupportedLanguage::Thrift => "thrift",
+            SupportedLanguage::Xml => "xml",
+            SupportedLanguage::Ini => "ini",
+            SupportedLanguage::Csv => "csv",
+            SupportedLanguage::Properties => "properties",
+            SupportedLanguage::EnvFile => "dotenv",
+            SupportedLanguage::Hcl => "hcl",
+            SupportedLanguage::Jsonnet => "jsonnet",
+            SupportedLanguage::Dhall => "dhall",
+            SupportedLanguage::Nginx => "nginx",
+            SupportedLanguage::Diff => "diff",
+            SupportedLanguage::Regex => "regex",
+            SupportedLanguage::Vim => "vim",
+            SupportedLanguage::EmacsLisp => "elisp",
+            SupportedLanguage::Latex => "latex",
+            SupportedLanguage::Bibtex => "bibtex",
+            SupportedLanguage::Typst => "typst",
+            SupportedLanguage::Rst => "rst",
+            SupportedLanguage::Org => "org",
+            SupportedLanguage::Assembly => "asm",
+            SupportedLanguage::Verilog => "verilog",
+            SupportedLanguage::VHDL => "vhdl",
+            SupportedLanguage::Zephyr => "devicetree",
+            SupportedLanguage::Janet => "janet_simple",
+            SupportedLanguage::Wren => "wren",
+            SupportedLanguage::Vala => "vala",
+            SupportedLanguage::Gd => "gdscript",
             SupportedLanguage::Plain => "",
         }
     }
@@ -984,11 +1386,95 @@ impl SupportedLanguage {
             SupportedLanguage::Sql => "sql",
             SupportedLanguage::Scala => "scala",
             SupportedLanguage::Odin => "odin",
+            SupportedLanguage::Haskell => "haskell",
+            SupportedLanguage::Elixir => "elixir",
+            SupportedLanguage::Erlang => "erlang",
+            SupportedLanguage::OCaml => "ocaml",
+            SupportedLanguage::FSharp => "fsharp",
+            SupportedLanguage::Elm => "elm",
+            SupportedLanguage::Julia => "julia",
+            SupportedLanguage::Nim => "nim",
+            SupportedLanguage::Crystal => "crystal",
+            SupportedLanguage::Clojure => "clojure",
+            SupportedLanguage::Nix => "nix",
+            SupportedLanguage::Gleam => "gleam",
+            SupportedLanguage::Terraform => "terraform",
+            SupportedLanguage::Vue => "vue",
+            SupportedLanguage::Svelte => "svelte",
+            SupportedLanguage::Astro => "astro",
+            SupportedLanguage::Perl => "perl",
+            SupportedLanguage::R => "r",
+            SupportedLanguage::Racket => "racket",
+            SupportedLanguage::Scheme => "scheme",
+            SupportedLanguage::CommonLisp => "lisp",
+            SupportedLanguage::PureScript => "purescript",
+            SupportedLanguage::Fortran => "fortran",
+            SupportedLanguage::D => "d",
+            SupportedLanguage::V => "vlang",
+            SupportedLanguage::Zsh => "shellscript",
+            SupportedLanguage::Fish => "fish",
+            SupportedLanguage::PowerShell => "powershell",
+            SupportedLanguage::Groovy => "groovy",
+            SupportedLanguage::Gradle => "groovy",
+            SupportedLanguage::ObjectiveC => "objective-c",
+            SupportedLanguage::ObjectiveCpp => "objective-cpp",
+            SupportedLanguage::Cuda => "cuda",
+            SupportedLanguage::Glsl => "glsl",
+            SupportedLanguage::Hlsl => "hlsl",
+            SupportedLanguage::Wgsl => "wgsl",
+            SupportedLanguage::Solidity => "solidity",
+            SupportedLanguage::Move => "move",
+            SupportedLanguage::Cairo => "cairo",
+            SupportedLanguage::Haxe => "haxe",
+            SupportedLanguage::Pascal => "pascal",
+            SupportedLanguage::Ada => "ada",
+            SupportedLanguage::Cobol => "cobol",
+            SupportedLanguage::Prolog => "prolog",
+            SupportedLanguage::Tcl => "tcl",
+            SupportedLanguage::Awk => "awk",
+            SupportedLanguage::Makefile => "makefile",
+            SupportedLanguage::Cmake => "cmake",
+            SupportedLanguage::Dockerfile => "dockerfile",
+            SupportedLanguage::GraphQL => "graphql",
+            SupportedLanguage::Proto => "proto",
+            SupportedLanguage::Thrift => "thrift",
+            SupportedLanguage::Xml => "xml",
+            SupportedLanguage::Ini => "ini",
+            SupportedLanguage::Csv => "csv",
+            SupportedLanguage::Properties => "properties",
+            SupportedLanguage::EnvFile => "dotenv",
+            SupportedLanguage::Hcl => "hcl",
+            SupportedLanguage::Jsonnet => "jsonnet",
+            SupportedLanguage::Dhall => "dhall",
+            SupportedLanguage::Nginx => "nginx",
+            SupportedLanguage::Diff => "diff",
+            SupportedLanguage::Regex => "regex",
+            SupportedLanguage::Vim => "vim",
+            SupportedLanguage::EmacsLisp => "emacs-lisp",
+            SupportedLanguage::Latex => "latex",
+            SupportedLanguage::Bibtex => "bibtex",
+            SupportedLanguage::Typst => "typst",
+            SupportedLanguage::Rst => "restructuredtext",
+            SupportedLanguage::Org => "org",
+            SupportedLanguage::Assembly => "asm",
+            SupportedLanguage::Verilog => "verilog",
+            SupportedLanguage::VHDL => "vhdl",
+            SupportedLanguage::Zephyr => "dts",
+            SupportedLanguage::Janet => "janet",
+            SupportedLanguage::Wren => "wren",
+            SupportedLanguage::Vala => "vala",
+            SupportedLanguage::Gd => "gdscript",
             SupportedLanguage::Plain => "plaintext",
         }
     }
 
     /// Returns candidate language server binary names in priority order.
+    ///
+    /// Entries are the real, verified binary names shipped by each server's
+    /// official distribution as of this writing. Languages with no widely
+    /// adopted standalone LSP implementation return an empty slice, so the
+    /// editor correctly falls back to Tier 1/2 highlighting alone rather than
+    /// claiming a server exists.
     pub fn candidate_servers(self) -> &'static [&'static str] {
         match self {
             SupportedLanguage::Rust => &["rust-analyzer"],
@@ -1012,7 +1498,7 @@ impl SupportedLanguage {
             SupportedLanguage::Json => &["vscode-json-language-server"],
             SupportedLanguage::Toml => &["taplo"],
             SupportedLanguage::Yaml => &["yaml-language-server"],
-            SupportedLanguage::Bash => &["bash-language-server"],
+            SupportedLanguage::Bash | SupportedLanguage::Zsh => &["bash-language-server"],
             SupportedLanguage::Lua => &["lua-language-server"],
             SupportedLanguage::Markdown => &["marksman"],
             SupportedLanguage::Java => &["jdtls"],
@@ -1025,7 +1511,52 @@ impl SupportedLanguage {
             SupportedLanguage::Sql => &["sqls", "sql-language-server"],
             SupportedLanguage::Scala => &["metals"],
             SupportedLanguage::Odin => &["ols"],
-            SupportedLanguage::Plain => &[],
+            SupportedLanguage::Haskell => &["haskell-language-server-wrapper", "haskell-language-server"],
+            SupportedLanguage::Elixir => &["elixir-ls", "lexical"],
+            SupportedLanguage::Erlang => &["erlang_ls"],
+            SupportedLanguage::OCaml => &["ocamllsp"],
+            SupportedLanguage::FSharp => &["fsautocomplete"],
+            SupportedLanguage::Elm => &["elm-language-server"],
+            SupportedLanguage::Julia => &["julia"],
+            SupportedLanguage::Nim => &["nimlsp", "nimlangserver"],
+            SupportedLanguage::Crystal => &["crystalline"],
+            SupportedLanguage::Clojure => &["clojure-lsp"],
+            SupportedLanguage::Nix => &["nil", "nixd"],
+            SupportedLanguage::Gleam => &["gleam"],
+            SupportedLanguage::Terraform | SupportedLanguage::Hcl => &["terraform-ls"],
+            SupportedLanguage::Vue => &["vue-language-server"],
+            SupportedLanguage::Svelte => &["svelteserver", "svelte-language-server"],
+            SupportedLanguage::Astro => &["astro-ls"],
+            SupportedLanguage::Perl => &["perlnavigator", "pls"],
+            SupportedLanguage::R => &["r-languageserver"],
+            SupportedLanguage::Racket => &["racket-langserver"],
+            SupportedLanguage::PureScript => &["purescript-language-server"],
+            SupportedLanguage::Fortran => &["fortls"],
+            SupportedLanguage::D => &["serve-d"],
+            SupportedLanguage::V => &["v-analyzer"],
+            SupportedLanguage::PowerShell => &["powershell-editor-services"],
+            SupportedLanguage::Groovy | SupportedLanguage::Gradle => &["groovy-language-server"],
+            SupportedLanguage::ObjectiveC | SupportedLanguage::ObjectiveCpp => &["clangd"],
+            SupportedLanguage::Solidity => &["solc", "nomicfoundation-solidity-language-server"],
+            SupportedLanguage::Haxe => &["haxe-language-server"],
+            SupportedLanguage::Pascal => &["pasls"],
+            SupportedLanguage::Ada => &["ada_language_server"],
+            SupportedLanguage::Tcl => &["tclsh"],
+            SupportedLanguage::Makefile => &["cmake-language-server"],
+            SupportedLanguage::Cmake => &["neocmakelsp", "cmake-language-server"],
+            SupportedLanguage::Dockerfile => &["docker-langserver"],
+            SupportedLanguage::GraphQL => &["graphql-lsp"],
+            SupportedLanguage::Proto => &["buf-language-server", "pls-proto"],
+            SupportedLanguage::Xml => &["lemminx"],
+            SupportedLanguage::Vim => &["vim-language-server"],
+            SupportedLanguage::EmacsLisp => &["elisp-language-server"],
+            SupportedLanguage::Latex | SupportedLanguage::Bibtex => &["texlab", "digestif"],
+            SupportedLanguage::Typst => &["tinymist", "typst-lsp"],
+            SupportedLanguage::Verilog | SupportedLanguage::VHDL => &["svlangserver", "vhdl_ls"],
+            SupportedLanguage::Zephyr => &["dts-lsp"],
+            SupportedLanguage::Vala => &["vala-language-server"],
+            SupportedLanguage::Gd => &[],
+            _ => &[],
         }
     }
 
@@ -1036,6 +1567,117 @@ impl SupportedLanguage {
             .filter(|cmd| resolve_binary_path(cmd).is_some())
             .map(|s| (*s).to_string())
             .collect()
+    }
+
+    /// All supported languages, in a stable order, for use by the `:health`
+    /// report and similar full-listing UI.
+    pub fn all() -> &'static [SupportedLanguage] {
+        &[
+            SupportedLanguage::Rust,
+            SupportedLanguage::Go,
+            SupportedLanguage::Python,
+            SupportedLanguage::C,
+            SupportedLanguage::Cpp,
+            SupportedLanguage::Zig,
+            SupportedLanguage::JavaScript,
+            SupportedLanguage::TypeScript,
+            SupportedLanguage::Html,
+            SupportedLanguage::Css,
+            SupportedLanguage::Json,
+            SupportedLanguage::Toml,
+            SupportedLanguage::Yaml,
+            SupportedLanguage::Bash,
+            SupportedLanguage::Lua,
+            SupportedLanguage::Markdown,
+            SupportedLanguage::Java,
+            SupportedLanguage::CSharp,
+            SupportedLanguage::Php,
+            SupportedLanguage::Ruby,
+            SupportedLanguage::Kotlin,
+            SupportedLanguage::Swift,
+            SupportedLanguage::Dart,
+            SupportedLanguage::Sql,
+            SupportedLanguage::Scala,
+            SupportedLanguage::Odin,
+            SupportedLanguage::Haskell,
+            SupportedLanguage::Elixir,
+            SupportedLanguage::Erlang,
+            SupportedLanguage::OCaml,
+            SupportedLanguage::FSharp,
+            SupportedLanguage::Elm,
+            SupportedLanguage::Julia,
+            SupportedLanguage::Nim,
+            SupportedLanguage::Crystal,
+            SupportedLanguage::Clojure,
+            SupportedLanguage::Nix,
+            SupportedLanguage::Gleam,
+            SupportedLanguage::Terraform,
+            SupportedLanguage::Vue,
+            SupportedLanguage::Svelte,
+            SupportedLanguage::Astro,
+            SupportedLanguage::Perl,
+            SupportedLanguage::R,
+            SupportedLanguage::Racket,
+            SupportedLanguage::Scheme,
+            SupportedLanguage::CommonLisp,
+            SupportedLanguage::PureScript,
+            SupportedLanguage::Fortran,
+            SupportedLanguage::D,
+            SupportedLanguage::V,
+            SupportedLanguage::Zsh,
+            SupportedLanguage::Fish,
+            SupportedLanguage::PowerShell,
+            SupportedLanguage::Groovy,
+            SupportedLanguage::Gradle,
+            SupportedLanguage::ObjectiveC,
+            SupportedLanguage::ObjectiveCpp,
+            SupportedLanguage::Cuda,
+            SupportedLanguage::Glsl,
+            SupportedLanguage::Hlsl,
+            SupportedLanguage::Wgsl,
+            SupportedLanguage::Solidity,
+            SupportedLanguage::Move,
+            SupportedLanguage::Cairo,
+            SupportedLanguage::Haxe,
+            SupportedLanguage::Pascal,
+            SupportedLanguage::Ada,
+            SupportedLanguage::Cobol,
+            SupportedLanguage::Prolog,
+            SupportedLanguage::Tcl,
+            SupportedLanguage::Awk,
+            SupportedLanguage::Makefile,
+            SupportedLanguage::Cmake,
+            SupportedLanguage::Dockerfile,
+            SupportedLanguage::GraphQL,
+            SupportedLanguage::Proto,
+            SupportedLanguage::Thrift,
+            SupportedLanguage::Xml,
+            SupportedLanguage::Ini,
+            SupportedLanguage::Csv,
+            SupportedLanguage::Properties,
+            SupportedLanguage::EnvFile,
+            SupportedLanguage::Hcl,
+            SupportedLanguage::Jsonnet,
+            SupportedLanguage::Dhall,
+            SupportedLanguage::Nginx,
+            SupportedLanguage::Diff,
+            SupportedLanguage::Regex,
+            SupportedLanguage::Vim,
+            SupportedLanguage::EmacsLisp,
+            SupportedLanguage::Latex,
+            SupportedLanguage::Bibtex,
+            SupportedLanguage::Typst,
+            SupportedLanguage::Rst,
+            SupportedLanguage::Org,
+            SupportedLanguage::Assembly,
+            SupportedLanguage::Verilog,
+            SupportedLanguage::VHDL,
+            SupportedLanguage::Zephyr,
+            SupportedLanguage::Janet,
+            SupportedLanguage::Wren,
+            SupportedLanguage::Vala,
+            SupportedLanguage::Gd,
+        ]
     }
 }
 
@@ -1138,29 +1780,23 @@ impl SyntaxEngine {
             _ => self.highlight_code_universal(line_text),
         };
 
-        let ts_tokens = self
-            .ts_tokens
-            .get(&line_idx)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
+        let ts_tokens = self.ts_tokens.get(&line_idx).map_or(&[][..], Vec::as_slice);
         let semantic_tokens = self
             .semantic_tokens
             .get(&line_idx)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
+            .map_or(&[][..], Vec::as_slice);
 
         if ts_tokens.is_empty() && semantic_tokens.is_empty() {
             return base_spans;
         }
 
-        self.render_layered_line(line_text, &base_spans, ts_tokens, semantic_tokens)
+        Self::render_layered_line(line_text, &base_spans, ts_tokens, semantic_tokens)
     }
 
     /// Merges Tier 1 base spans with Tier 2 and Tier 3 token overlays on a
     /// per-character basis, so gaps left by a higher tier fall back to the next
     /// tier down instead of a flat default color.
     fn render_layered_line(
-        &self,
         text: &str,
         base_spans: &[Span<'static>],
         ts_tokens: &[SemanticTokenSpan],
@@ -1301,10 +1937,48 @@ impl SyntaxEngine {
         let comment_prefix = match self.language {
             SupportedLanguage::Python
             | SupportedLanguage::Bash
+            | SupportedLanguage::Zsh
+            | SupportedLanguage::Fish
             | SupportedLanguage::Yaml
             | SupportedLanguage::Toml
-            | SupportedLanguage::Ruby => Some("#"),
-            SupportedLanguage::Lua | SupportedLanguage::Sql => Some("--"),
+            | SupportedLanguage::Ruby
+            | SupportedLanguage::Perl
+            | SupportedLanguage::Nim
+            | SupportedLanguage::Julia
+            | SupportedLanguage::R
+            | SupportedLanguage::Elixir
+            | SupportedLanguage::Crystal
+            | SupportedLanguage::PowerShell
+            | SupportedLanguage::Dockerfile
+            | SupportedLanguage::Makefile
+            | SupportedLanguage::Awk
+            | SupportedLanguage::Tcl
+            | SupportedLanguage::Gd
+            | SupportedLanguage::EnvFile
+            | SupportedLanguage::Properties
+            | SupportedLanguage::Cmake
+            | SupportedLanguage::Nginx
+            | SupportedLanguage::Terraform
+            | SupportedLanguage::Hcl
+            | SupportedLanguage::GraphQL
+            | SupportedLanguage::Ini => Some("#"),
+            SupportedLanguage::Lua
+            | SupportedLanguage::Sql
+            | SupportedLanguage::Haskell
+            | SupportedLanguage::Elm
+            | SupportedLanguage::Ada
+            | SupportedLanguage::VHDL => Some("--"),
+            SupportedLanguage::Clojure
+            | SupportedLanguage::CommonLisp
+            | SupportedLanguage::Scheme
+            | SupportedLanguage::Racket
+            | SupportedLanguage::EmacsLisp
+            | SupportedLanguage::Assembly => Some(";"),
+            SupportedLanguage::Erlang
+            | SupportedLanguage::Prolog
+            | SupportedLanguage::Latex
+            | SupportedLanguage::Bibtex => Some("%"),
+            SupportedLanguage::Vim => Some("\""),
             _ => Some("//"),
         };
 

@@ -91,18 +91,18 @@ impl AppConfig {
         let mut preferred_lsps = HashMap::new();
         let mut line_wrap = true;
 
-        if let Ok(content) = fs::read_to_string(&path) {
-            if let Ok(val) = serde_json::from_str::<Value>(&content) {
-                if let Some(obj) = val.get("preferred_lsps").and_then(Value::as_object) {
-                    for (k, v) in obj {
-                        if let Some(s) = v.as_str() {
-                            preferred_lsps.insert(k.clone(), s.to_string());
-                        }
+        if let Ok(content) = fs::read_to_string(&path)
+            && let Ok(val) = serde_json::from_str::<Value>(&content)
+        {
+            if let Some(obj) = val.get("preferred_lsps").and_then(Value::as_object) {
+                for (k, v) in obj {
+                    if let Some(s) = v.as_str() {
+                        preferred_lsps.insert(k.clone(), s.to_string());
                     }
                 }
-                if let Some(w) = val.get("line_wrap").and_then(Value::as_bool) {
-                    line_wrap = w;
-                }
+            }
+            if let Some(w) = val.get("line_wrap").and_then(Value::as_bool) {
+                line_wrap = w;
             }
         }
 
@@ -111,15 +111,6 @@ impl AppConfig {
             line_wrap,
             source_path: path,
         }
-    }
-
-    /// Loads configuration using the process's current working directory as
-    /// the project root. Kept for callers that construct a default/empty
-    /// config outside of an opened project (e.g. CLI flag overrides); prefer
-    /// [`AppConfig::load_from`] whenever a project root is known.
-    pub fn load() -> Self {
-        let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        Self::load_from(&cwd)
     }
 
     pub fn save(&self) -> Result<()> {
@@ -636,10 +627,10 @@ impl Editor {
     /// the [`Rope`] via buffered I/O. Otherwise, an empty rope is initialized. Also sets up
     /// the syntax engine, initializes the file explorer from the current working directory,
     /// and resets cursor coordinates.
-    pub fn new(path: Option<PathBuf>) -> Result<Self> {
-        let is_dir_target = path.as_ref().is_some_and(|p| p.is_dir());
+    pub fn new(path: Option<&PathBuf>) -> Result<Self> {
+        let is_dir_target = path.is_some_and(|p| p.is_dir());
 
-        let (rope, buffer_path, status_msg) = match &path {
+        let (rope, buffer_path, status_msg) = match path {
             Some(p) if p.is_dir() => (Rope::new(), None, format!("Opened folder {}", p.display())),
             Some(p) if p.exists() => {
                 let file = File::open(p)?;
@@ -662,7 +653,7 @@ impl Editor {
         syntax.reparse(&text);
 
         let root_dir = if is_dir_target {
-            path.clone().unwrap()
+            path.cloned().unwrap()
         } else {
             env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
         };
@@ -967,23 +958,23 @@ impl Editor {
     ///
     /// Records an undo snapshot, repositions the cursor to the deletion origin, and returns to [`Mode::Normal`].
     pub fn delete_selection(&mut self) {
-        if let Some((start, end)) = self.selection_range() {
-            if start < end {
-                self.snapshot();
-                let slice = self.rope.slice(start..end);
-                self.clipboard = slice.to_string();
-                self.rope.remove(start..end);
-                self.modified = true;
-                self.status_msg = format!("Deleted {} chars", self.clipboard.len());
+        if let Some((start, end)) = self.selection_range()
+            && start < end
+        {
+            self.snapshot();
+            let slice = self.rope.slice(start..end);
+            self.clipboard = slice.to_string();
+            self.rope.remove(start..end);
+            self.modified = true;
+            self.status_msg = format!("Deleted {} chars", self.clipboard.len());
 
-                let new_cursor_line = self.rope.char_to_line(start);
-                let line_start = self.rope.line_to_char(new_cursor_line);
-                self.cursor_y = new_cursor_line;
-                self.cursor_x = start.saturating_sub(line_start);
-                self.mode = Mode::Normal;
-                self.clamp_cursor();
-                self.on_buffer_modified();
-            }
+            let new_cursor_line = self.rope.char_to_line(start);
+            let line_start = self.rope.line_to_char(new_cursor_line);
+            self.cursor_y = new_cursor_line;
+            self.cursor_x = start.saturating_sub(line_start);
+            self.mode = Mode::Normal;
+            self.clamp_cursor();
+            self.on_buffer_modified();
         }
     }
 
