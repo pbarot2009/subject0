@@ -1,7 +1,7 @@
 //! # Command-Line Argument Parser
 //!
 //! Handles command-line arguments, flag decoding (`--help`, `--version`, `--clean`),
-//! jump-to-line specifiers (`+<line>`), and directory/file path resolution.
+//! jump-to-line specifiers (`+<line>`, `file:line:col`), and directory/file path resolution.
 
 use std::{
     env, fs,
@@ -9,7 +9,7 @@ use std::{
     process::{self, Command},
 };
 
-use crate::lsp::{resolve_binary_path, DynamicGrammar, SupportedLanguage};
+use crate::lsp::{DynamicGrammar, SupportedLanguage, resolve_binary_path};
 
 /// Parsed command-line arguments.
 #[derive(Debug, Default, Clone)]
@@ -18,6 +18,8 @@ pub struct CliArgs {
     pub path: Option<PathBuf>,
     /// Optional target line number to jump to on launch (1-based).
     pub jump_line: Option<usize>,
+    /// Optional target column number to jump to on launch (1-based).
+    pub jump_col: Option<usize>,
     /// Optional override for soft line wrapping.
     pub line_wrap: Option<bool>,
     /// When true, ignore `.subject0` configuration file.
@@ -38,9 +40,21 @@ impl CliArgs {
             .any(|a| a == "--force" || a == "--reinstall" || a == "-f");
 
         let mut idx = 0;
+        let mut treat_as_positional = false;
+
         while idx < raw_args.len() {
             let arg = &raw_args[idx];
+
+            if treat_as_positional {
+                Self::assign_target_path(&mut cli, arg);
+                idx += 1;
+                continue;
+            }
+
             match arg.as_str() {
+                "--" => {
+                    treat_as_positional = true;
+                }
                 "-h" | "--help" => {
                     Self::print_help();
                     process::exit(0);
@@ -52,7 +66,8 @@ impl CliArgs {
                 "-g" | "--install-grammar" => {
                     if idx + 1 < raw_args.len() {
                         let lang = raw_args[idx + 1].clone();
-                        Self::run_grammar_installer(&lang, force_grammar);
+                        let clean_lang = Self::clean_lang_arg(&lang);
+                        Self::run_grammar_installer(&clean_lang, force_grammar);
                         process::exit(0);
                     } else {
                         eprintln!("Error: Missing language argument for --install-grammar <lang>");
@@ -60,15 +75,15 @@ impl CliArgs {
                     }
                 }
                 s if s.starts_with("--install-grammar=") => {
-                    let lang = s.trim_start_matches("--install-grammar=");
-                    Self::run_grammar_installer(lang, force_grammar);
+                    let raw_lang = s.trim_start_matches("--install-grammar=");
+                    let clean_lang = Self::clean_lang_arg(raw_lang);
+                    Self::run_grammar_installer(&clean_lang, force_grammar);
                     process::exit(0);
                 }
                 "-H" | "--health" | "--doctor" => {
                     Self::run_health_check();
                     process::exit(0);
                 }
-
                 "--clean" | "--no-config" => {
                     cli.ignore_config = true;
                 }
@@ -85,8 +100,8 @@ impl CliArgs {
                     }
                 }
                 // Positional file or directory target
-                s if !s.starts_with('-') && cli.path.is_none() => {
-                    cli.path = Some(PathBuf::from(s));
+                s if !s.starts_with('-') => {
+                    Self::assign_target_path(&mut cli, s);
                 }
                 _ => {}
             }
@@ -94,6 +109,48 @@ impl CliArgs {
         }
 
         cli
+    }
+
+    /// Strips enclosing quotes from argument flags.
+    fn clean_lang_arg(raw: &str) -> String {
+        raw.trim().trim_matches('\'').trim_matches('"').to_string()
+    }
+
+    /// Assigns file path and checks for `path:line:col` or `path:line` format.
+    fn assign_target_path(cli: &mut Self, arg: &str) {
+        if cli.path.is_some() {
+            return;
+        }
+
+        // If the path literally exists on disk, use it directly
+        let literal_path = PathBuf::from(arg);
+        if literal_path.exists() {
+            cli.path = Some(literal_path);
+            return;
+        }
+
+        // Check for file:line:col or file:line syntax
+        let parts: Vec<&str> = arg.rsplitn(3, ':').collect();
+        if parts.len() == 3 {
+            // [col, line, file]
+            if let (Ok(line), Ok(col)) = (parts[1].parse::<usize>(), parts[0].parse::<usize>()) {
+                let candidate = PathBuf::from(parts[2]);
+                cli.path = Some(candidate);
+                cli.jump_line = Some(line);
+                cli.jump_col = Some(col);
+                return;
+            }
+        } else if parts.len() == 2 {
+            // [line, file]
+            if let Ok(line) = parts[0].parse::<usize>() {
+                let candidate = PathBuf::from(parts[1]);
+                cli.path = Some(candidate);
+                cli.jump_line = Some(line);
+                return;
+            }
+        }
+
+        cli.path = Some(literal_path);
     }
 
     fn print_version() {
@@ -142,21 +199,23 @@ impl CliArgs {
 
   {b}{blue}󰅂 ARGUMENTS:{r}
       {green}[PATH]{r}             File or folder path {gray}(opens scratch buffer if empty){r}
-      {magenta}[+LINE]{r}            Jump directly to line number {gray}(e.g. +42){r}
+      {magenta}[+LINE]{r}            Jump directly to line number {gray}(e.g. +42 or path:42){r}
 
   {b}{blue}󰅂 OPTIONS:{r}
       {yellow}-h, --help{r}                Show this formatted help menu and exit
       {yellow}-v, --version{r}             Print version information and metadata
-      {yellow}-g, --install-grammar <L>{r}  Download & compile Tree-sitter grammar (.so & queries)
+      {yellow}-g, --install-grammar <L>{r}  Download & compile Tree-sitter grammar (.so/.dll & queries)
       {yellow}--force, --reinstall{r}      Re-download and recompile existing grammar
       {yellow}-H, --health, --doctor{r}    Show install status of every supported language
       {yellow}-w, --wrap{r}                Force soft line wrapping on
       {yellow}-nw, --no-wrap{r}            Force line wrapping off (horizontal scroll)
       {yellow}--clean{r}                   Bypass workspace and user {gray}.subject0{r} configs
+      {yellow}--{r}                        Treat all subsequent arguments as positional paths
 
   {b}{blue}󰅂 EXAMPLES:{r}
       {gray}# Open a file at line 50:{r}
       {white}s0 src/main.rs +50{r}
+      {white}s0 src/main.rs:50{r}
 
       {gray}# Open project directory in the sidebar explorer:{r}
       {white}s0 .{r}
@@ -169,7 +228,7 @@ impl CliArgs {
         );
     }
 
-    /// Renders a bordered card with dynamic padding, guaranteeing 100% border alignment.
+    /// Renders a bordered card with dynamic padding, guaranteeing border alignment.
     fn print_boxed_card(lines: &[String], min_width: usize) {
         let r = "\x1b[0m";
         let border = "\x1b[38;2;70;75;95m";
@@ -195,7 +254,7 @@ impl CliArgs {
         println!("{border}╰{}╯{r}", "─".repeat(inner_width + 2));
     }
 
-    /// Computes printable character width by ignoring non-printing ANSI SGR escape codes.
+    /// Computes terminal display character width handling escape codes and double-width glyphs.
     fn visible_width(s: &str) -> usize {
         let mut width = 0;
         let mut in_escape = false;
@@ -207,17 +266,105 @@ impl CliArgs {
                     in_escape = false;
                 }
             } else {
-                width += 1;
+                // Wide characters and Nerd Font icons occupy 2 visual columns
+                let u = c as u32;
+                let is_wide = (0x1100..=0x115F).contains(&u)
+                    || (0x2E80..=0xA4CF).contains(&u)
+                    || (0xAC00..=0xD7A3).contains(&u)
+                    || (0xF900..=0xFAFF).contains(&u)
+                    || (0xFE30..=0xFE6F).contains(&u)
+                    || (0xFF00..=0xFF60).contains(&u)
+                    || (0xFFE0..=0xFFE6).contains(&u)
+                    || (0x1F300..=0x1F64F).contains(&u)
+                    || (0x1F680..=0x1F6FF).contains(&u)
+                    || (0xE000..=0xF8FF).contains(&u); // Private Use Area (Nerd Font icons)
+
+                width += if is_wide { 2 } else { 1 };
             }
         }
         width
     }
 
+    /// Cross-platform helper locating standard user home directory.
+    fn get_home_dir() -> Option<PathBuf> {
+        env::var_os("HOME")
+            .or_else(|| env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+    }
+
     fn shorten_home(path: &Path) -> String {
-        if let Ok(home) = env::var("HOME") {
-            path.to_string_lossy().replacen(&home, "~", 1)
-        } else {
-            path.to_string_lossy().to_string()
+        if let Some(home) = Self::get_home_dir() {
+            let s_path = path.to_string_lossy();
+            let s_home = home.to_string_lossy();
+            if s_path.starts_with(&*s_home) {
+                return s_path.replacen(&*s_home, "~", 1);
+            }
+        }
+        path.to_string_lossy().to_string()
+    }
+
+    /// Validates grammar identifier against path traversal attacks.
+    fn is_valid_grammar_name(name: &str) -> bool {
+        !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    }
+
+    /// Maps user input grammar aliases to official repository URLs and subdirectory targets.
+    fn resolve_grammar_target(lang: &str) -> (&'static str, Option<&'static str>) {
+        match lang {
+            "c_sharp" | "csharp" | "cs" => (
+                "https://github.com/tree-sitter/tree-sitter-c-sharp.git",
+                None,
+            ),
+            "typescript" | "ts" => (
+                "https://github.com/tree-sitter/tree-sitter-typescript.git",
+                Some("typescript"),
+            ),
+            "tsx" => (
+                "https://github.com/tree-sitter/tree-sitter-typescript.git",
+                Some("tsx"),
+            ),
+            "javascript" | "js" => (
+                "https://github.com/tree-sitter/tree-sitter-javascript.git",
+                None,
+            ),
+            "bash" | "sh" | "zsh" => ("https://github.com/tree-sitter/tree-sitter-bash.git", None),
+            "rust" | "rs" => ("https://github.com/tree-sitter/tree-sitter-rust.git", None),
+            "python" | "py" => (
+                "https://github.com/tree-sitter/tree-sitter-python.git",
+                None,
+            ),
+            "c" => ("https://github.com/tree-sitter/tree-sitter-c.git", None),
+            "cpp" | "c++" => ("https://github.com/tree-sitter/tree-sitter-cpp.git", None),
+            "go" => ("https://github.com/tree-sitter/tree-sitter-go.git", None),
+            "zig" => ("https://github.com/ziglibs/tree-sitter-zig.git", None),
+            "lua" => ("https://github.com/MunifTanjim/tree-sitter-lua.git", None),
+            "toml" => (
+                "https://github.com/tree-sitter-grammars/tree-sitter-toml.git",
+                None,
+            ),
+            "json" => ("https://github.com/tree-sitter/tree-sitter-json.git", None),
+            "yaml" | "yml" => (
+                "https://github.com/tree-sitter-grammars/tree-sitter-yaml.git",
+                None,
+            ),
+            "html" => ("https://github.com/tree-sitter/tree-sitter-html.git", None),
+            "css" => ("https://github.com/tree-sitter/tree-sitter-css.git", None),
+            "markdown" | "md" => (
+                "https://github.com/tree-sitter-grammars/tree-sitter-markdown.git",
+                Some("tree-sitter-markdown"),
+            ),
+            "hcl" | "terraform" => (
+                "https://github.com/tree-sitter-grammars/tree-sitter-hcl.git",
+                None,
+            ),
+            "janet_simple" | "janet" => (
+                "https://github.com/janet-lang/tree-sitter-janet-simple.git",
+                None,
+            ),
+            _ => ("", None),
         }
     }
 
@@ -231,18 +378,37 @@ impl CliArgs {
         let blue = "\x1b[38;2;100;180;255m";
         let gray = "\x1b[38;2;140;145;160m";
 
-        let home = if let Ok(h) = env::var("HOME") {
-            PathBuf::from(h)
+        if !Self::is_valid_grammar_name(lang) {
+            eprintln!(
+                "{red}Error: Invalid grammar name '{lang}'. Only alphanumeric, '-' and '_' characters are permitted.{r}"
+            );
+            process::exit(1);
+        }
+
+        let home = if let Some(h) = Self::get_home_dir() {
+            h
         } else {
-            eprintln!("{red}Error: Unable to locate $HOME environment variable.{r}");
+            eprintln!("{red}Error: Unable to locate home directory (HOME or USERPROFILE).{r}");
             process::exit(1);
         };
 
         let canon_lang = match lang {
             "ts" => "typescript",
             "js" => "javascript",
-            "sh" => "bash",
+            "sh" | "zsh" => "bash",
+            "csharp" | "cs" => "c_sharp",
+            "py" => "python",
+            "rs" => "rust",
+            "md" => "markdown",
             _ => lang,
+        };
+
+        let (explicit_repo, subpath) = Self::resolve_grammar_target(canon_lang);
+        let dynamic_url = format!("https://github.com/tree-sitter/tree-sitter-{canon_lang}.git");
+        let repo_url = if !explicit_repo.is_empty() {
+            explicit_repo
+        } else {
+            &dynamic_url
         };
 
         let grammars_dir = home.join(".local/share/subject0/grammars");
@@ -259,13 +425,12 @@ impl CliArgs {
 
         let target_so = grammars_dir.join(format!("{canon_lang}.{ext}"));
 
-        // Cache detection: skip cloning/compilation if already installed
         if target_so.is_file() && !force {
             let display_so = Self::shorten_home(&target_so);
             let query_status = if target_scm.is_file() {
                 format!("{green}Installed (highlights.scm){r}")
             } else {
-                format!("{yellow}None{r}")
+                format!("{yellow}Missing (Run with --force to refetch queries){r}")
             };
 
             let lines = vec![
@@ -292,22 +457,6 @@ impl CliArgs {
             process::exit(1);
         }
 
-        let repo_url = match canon_lang {
-            "rust" => "https://github.com/tree-sitter/tree-sitter-rust.git",
-            "python" => "https://github.com/tree-sitter/tree-sitter-python.git",
-            "c" => "https://github.com/tree-sitter/tree-sitter-c.git",
-            "cpp" => "https://github.com/tree-sitter/tree-sitter-cpp.git",
-            "go" => "https://github.com/tree-sitter/tree-sitter-go.git",
-            "zig" => "https://github.com/ziglibs/tree-sitter-zig.git",
-            "javascript" => "https://github.com/tree-sitter/tree-sitter-javascript.git",
-            "typescript" => "https://github.com/tree-sitter/tree-sitter-typescript.git",
-            "bash" => "https://github.com/tree-sitter/tree-sitter-bash.git",
-            "lua" => "https://github.com/MunifTanjim/tree-sitter-lua.git",
-            "toml" => "https://github.com/tree-sitter-grammars/tree-sitter-toml.git",
-            "json" => "https://github.com/tree-sitter/tree-sitter-json.git",
-            _ => &format!("https://github.com/tree-sitter/tree-sitter-{canon_lang}.git"),
-        };
-
         let temp_dir = env::temp_dir().join(format!("s0-grammar-{canon_lang}"));
         if temp_dir.exists() {
             let _ = fs::remove_dir_all(&temp_dir);
@@ -316,7 +465,10 @@ impl CliArgs {
         println!("{blue}󰄬 Cloning Tree-sitter grammar for {b}{canon_lang}{r}{blue}...{r}");
 
         let clone_status = Command::new("git")
-            .args(["clone", "--depth=1", repo_url, temp_dir.to_str().unwrap()])
+            .arg("clone")
+            .arg("--depth=1")
+            .arg(repo_url)
+            .arg(&temp_dir)
             .status();
 
         match clone_status {
@@ -329,13 +481,18 @@ impl CliArgs {
             }
         }
 
-        // Locate source files (supports both flat and monorepo structures like tree-sitter-typescript)
-        let src_dir = if temp_dir.join(canon_lang).join("src").exists() {
-            temp_dir.join(canon_lang).join("src")
-        } else if temp_dir.join("src").exists() {
-            temp_dir.join("src")
+        let base_repo_dir = if let Some(sub) = subpath {
+            temp_dir.join(sub)
         } else {
             temp_dir.clone()
+        };
+
+        let src_dir = if base_repo_dir.join("src").exists() {
+            base_repo_dir.join("src")
+        } else if temp_dir.join(canon_lang).join("src").exists() {
+            temp_dir.join(canon_lang).join("src")
+        } else {
+            base_repo_dir.clone()
         };
 
         let parser_c = src_dir.join("parser.c");
@@ -349,16 +506,7 @@ impl CliArgs {
         let scanner_cc = src_dir.join("scanner.cc");
         let scanner_cpp = src_dir.join("scanner.cpp");
 
-        let has_cpp_scanner = scanner_cc.exists() || scanner_cpp.exists();
-        let compiler = if has_cpp_scanner {
-            if Command::new("c++").arg("--version").output().is_ok() {
-                "c++"
-            } else if Command::new("clang++").arg("--version").output().is_ok() {
-                "clang++"
-            } else {
-                "g++"
-            }
-        } else if Command::new("cc").arg("--version").output().is_ok() {
+        let c_compiler = if Command::new("cc").arg("--version").output().is_ok() {
             "cc"
         } else if Command::new("clang").arg("--version").output().is_ok() {
             "clang"
@@ -366,55 +514,129 @@ impl CliArgs {
             "gcc"
         };
 
-        println!("{yellow}󰑮 Compiling {b}{canon_lang}.{ext}{r}{yellow} with {compiler}...{r}");
-
-        let mut compile_cmd = Command::new(compiler);
-        compile_cmd.arg("-O3");
-
-        if cfg!(target_os = "macos") {
-            compile_cmd.args(["-fPIC", "-dynamiclib", "-undefined", "dynamic_lookup"]);
-        } else if cfg!(target_os = "windows") {
-            compile_cmd.arg("-shared");
+        let cpp_compiler = if Command::new("c++").arg("--version").output().is_ok() {
+            "c++"
+        } else if Command::new("clang++").arg("--version").output().is_ok() {
+            "clang++"
         } else {
-            compile_cmd.args(["-fPIC", "-shared"]);
+            "g++"
+        };
+
+        let parser_obj = temp_dir.join("parser.o");
+        let scanner_obj = temp_dir.join("scanner.o");
+
+        println!("{yellow}󰑮 Compiling C parser for {b}{canon_lang}{r}{yellow}...{r}");
+
+        // 1. Compile parser.c strictly with C compiler to prevent name mangling
+        let mut cmd_c = Command::new(c_compiler);
+        cmd_c
+            .arg("-O3")
+            .arg("-fPIC")
+            .arg("-I")
+            .arg(&src_dir)
+            .arg("-I")
+            .arg(&base_repo_dir)
+            .arg("-c")
+            .arg(&parser_c)
+            .arg("-o")
+            .arg(&parser_obj);
+
+        if !cmd_c.status().map_or(false, |s| s.success()) {
+            eprintln!("{red}Failed to compile parser.c. Verify a C compiler is installed.{r}");
+            let _ = fs::remove_dir_all(&temp_dir);
+            process::exit(1);
         }
 
-        compile_cmd
-            .arg(format!("-I{}", src_dir.display()))
-            .arg(parser_c);
+        // 2. Compile scanner if present
+        let mut has_scanner = false;
+        let mut scanner_is_cpp = false;
 
         if scanner_c.exists() {
-            compile_cmd.arg(scanner_c);
-        } else if scanner_cc.exists() {
-            compile_cmd.arg(scanner_cc);
-        } else if scanner_cpp.exists() {
-            compile_cmd.arg(scanner_cpp);
-        }
-
-        compile_cmd.arg("-o").arg(&target_so);
-
-        let compile_status = compile_cmd.status();
-        match compile_status {
-            Ok(s) if s.success() => {}
-            _ => {
-                eprintln!(
-                    "{red}Compilation failed. Ensure a C/C++ compiler is installed on your host.{r}"
-                );
+            has_scanner = true;
+            let mut cmd_sc = Command::new(c_compiler);
+            cmd_sc
+                .arg("-O3")
+                .arg("-fPIC")
+                .arg("-I")
+                .arg(&src_dir)
+                .arg("-I")
+                .arg(&base_repo_dir)
+                .arg("-c")
+                .arg(&scanner_c)
+                .arg("-o")
+                .arg(&scanner_obj);
+            if !cmd_sc.status().map_or(false, |s| s.success()) {
+                eprintln!("{red}Failed to compile C scanner.{r}");
+                let _ = fs::remove_dir_all(&temp_dir);
+                process::exit(1);
+            }
+        } else if scanner_cc.exists() || scanner_cpp.exists() {
+            has_scanner = true;
+            scanner_is_cpp = true;
+            let active_scanner = if scanner_cc.exists() {
+                scanner_cc
+            } else {
+                scanner_cpp
+            };
+            let mut cmd_sc = Command::new(cpp_compiler);
+            cmd_sc
+                .arg("-O3")
+                .arg("-fPIC")
+                .arg("-I")
+                .arg(&src_dir)
+                .arg("-I")
+                .arg(&base_repo_dir)
+                .arg("-c")
+                .arg(&active_scanner)
+                .arg("-o")
+                .arg(&scanner_obj);
+            if !cmd_sc.status().map_or(false, |s| s.success()) {
+                eprintln!("{red}Failed to compile C++ scanner.{r}");
                 let _ = fs::remove_dir_all(&temp_dir);
                 process::exit(1);
             }
         }
 
+        // 3. Link objects into final shared library
+        println!("{yellow}󰑮 Linking {b}{canon_lang}.{ext}{r}{yellow}...{r}");
+        let linker = if scanner_is_cpp {
+            cpp_compiler
+        } else {
+            c_compiler
+        };
+        let mut link_cmd = Command::new(linker);
+
+        if cfg!(target_os = "macos") {
+            link_cmd.args(["-dynamiclib", "-undefined", "dynamic_lookup"]);
+        } else if cfg!(target_os = "windows") {
+            link_cmd.args(["-shared", "-Wl,--export-all-symbols"]);
+        } else {
+            link_cmd.arg("-shared");
+        }
+
+        link_cmd.arg(&parser_obj);
+        if has_scanner {
+            link_cmd.arg(&scanner_obj);
+        }
+        link_cmd.arg("-o").arg(&target_so);
+
+        if !link_cmd.status().map_or(false, |s| s.success()) {
+            eprintln!("{red}Linking failed for {canon_lang}.{ext}.{r}");
+            let _ = fs::remove_dir_all(&temp_dir);
+            process::exit(1);
+        }
+
         // Copy highlights.scm queries if present
         let query_candidates = [
+            base_repo_dir.join("queries").join("highlights.scm"),
+            base_repo_dir
+                .join("queries")
+                .join(canon_lang)
+                .join("highlights.scm"),
             temp_dir.join("queries").join("highlights.scm"),
             temp_dir
                 .join("queries")
                 .join(canon_lang)
-                .join("highlights.scm"),
-            temp_dir
-                .join(canon_lang)
-                .join("queries")
                 .join("highlights.scm"),
             src_dir.join("highlights.scm"),
         ];
@@ -442,7 +664,9 @@ impl CliArgs {
                 if query_copied {
                     format!("{green}Installed (highlights.scm){r}")
                 } else {
-                    format!("{yellow}None found in repo (AST fallback active){r}")
+                    format!(
+                        "{yellow}Missing from repository (Highlighting will fall back to Tier 2/LSP){r}"
+                    )
                 }
             ),
         ];
@@ -450,12 +674,7 @@ impl CliArgs {
         Self::print_boxed_card(&lines, 56);
     }
 
-    /// Prints a health report showing, for every supported language: whether
-    /// a Tree-sitter grammar is installed, and whether at least one candidate
-    /// LSP server binary is reachable on `$PATH` (or `~/.cargo/bin`).
-    ///
-    /// This purely inspects the local filesystem/`$PATH` — it never spawns or
-    /// initializes any language server, so it's always fast and side-effect free.
+    /// Prints a health report showing language grammar and LSP connectivity.
     fn run_health_check() {
         let r = "\x1b[0m";
         let b = "\x1b[1m";
@@ -477,21 +696,24 @@ impl CliArgs {
 
         let langs = SupportedLanguage::all();
 
-        // Column widths sized off the longest actual value, so the table
-        // stays aligned no matter the terminal width or language name length.
         let name_w = langs
             .iter()
             .map(|l| l.display_name().chars().count())
             .max()
             .unwrap_or(8)
             .max("LANGUAGE".len());
-        let server_w = langs
+
+        let candidate_max = langs
             .iter()
             .flat_map(|l| l.candidate_servers().iter())
             .map(|s| s.chars().count())
             .max()
-            .unwrap_or(6)
-            .max("LSP SERVER".len());
+            .unwrap_or(6);
+
+        // Account for "(none available)" text width (16 chars) so table columns align
+        let server_w = candidate_max
+            .max("LSP SERVER".len())
+            .max("(none available)".len());
 
         println!(
             "  {gray}{:<name_w$}  {:<4}  {:<server_w$}  {:<4}{r}",
@@ -555,8 +777,7 @@ impl CliArgs {
                     format!("{missing} "),
                 )
             };
-            // Pad on the plain (ANSI-free) text width, then append the
-            // colorized label, so the escape codes never throw off alignment.
+
             let server_pad = " ".repeat(server_w.saturating_sub(server_text.chars().count()));
 
             println!(

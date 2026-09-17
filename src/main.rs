@@ -3,40 +3,6 @@
 //! This module serves as the runtime orchestrator for `subject0`. It integrates the
 //! terminal lifecycle, asynchronous event multiplexing, input decoding, and the
 //! frame rendering pipeline.
-//!
-//! ## Key Subsystems
-//!
-//! 1. **Terminal Control & Panic Hygiene**:
-//!    - Initializes Crossterm raw mode, alternate screen buffers, and mouse event capture.
-//!    - Installs a custom panic hook via [`setup_panic_hook`] to guarantee the terminal
-//!      restores standard screen buffers, cursor styles, and raw mode flags if a panic occurs,
-//!      preventing host terminal corruption.
-//!    - Controls hardware cursor rendering modes dynamically via DEC Private Mode Set/Reset
-//!      cursor shape escape sequences ([`set_terminal_cursor_style`]).
-//!
-//! 2. **Asynchronous Actor Multiplexing**:
-//!    - Spawns background language server tasks ([`run_lsp_actor`]) using Tokio channels.
-//!    - Intercepts and merges incoming LSP outbound traffic (diagnostics, completion responses,
-//!      status updates) into the editor buffer model on each event loop tick.
-//!    - Implements an autocompletion ranker that filters candidates based on exact match,
-//!      case-insensitive prefix match, and label length.
-//!
-//! 3. **Input Handling & Spatial Coordinate Translation**:
-//!    - **Keyboard Controller ([`handle_key_event`])**: Decodes raw key events into modal
-//!      state transitions (`Normal`, `Insert`, `Command`, `Visual`), manages multi-key
-//!      chords (e.g., `gg`, `dd`), and drives dialog inputs.
-//!    - **Pointer / Touch Controller ([`handle_mouse_event`])**: Maps mouse clicks and scroll
-//!      wheel events into exact 2D buffer coordinates. Accurately handles soft line-wrapping
-//!      by decomposing wrapped lines into sub-rows to calculate the clicked column and line index.
-//!
-//! 4. **Immediate-Mode UI Rendering Pipeline ([`render_ui`])**:
-//!    - Constructs an immediate-mode layout hierarchy through Ratatui widgets.
-//!    - Renders the file tree sidebar with collapsible directory icons.
-//!    - Renders the main document viewport with dynamic gutter widths, diagnostic severity
-//!      markers, syntax-highlighted code spans, and visual selections.
-//!    - Renders a Powerline-styled status bar and command/diagnostic notification panel.
-//!    - Computes absolute screen coordinates for floating popup overlays (autocomplete dropdown
-//!      and command palette).
 
 mod cmd;
 mod editor;
@@ -45,7 +11,6 @@ mod lsp;
 use std::{
     cmp::Ordering,
     io::{Write, stdout},
-    path::Path,
     time::Duration,
 };
 
@@ -71,38 +36,47 @@ use ratatui::{
 use tokio::sync::mpsc;
 
 use editor::{Editor, Focus, Mode, line_len};
-use lsp::{
-    LspInbound, LspOutbound, LspStatus, SuggestionItem, completion_kind_icon, file_icon_and_color,
-    run_lsp_actor,
-};
+use lsp::{LspOutbound, LspStatus, SuggestionItem, completion_kind_icon, file_icon_and_color};
+
+/// RAII Terminal Guard ensuring the host terminal is reliably restored
+/// to canonical mode regardless of whether the program exits cleanly,
+/// returns a `Result::Err`, or panics.
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn enter() -> Result<Self> {
+        enable_raw_mode()?;
+        let mut out = stdout();
+        execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
+        Ok(Self)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let mut out = stdout();
+        let _ = out.write_all(b"\x1b[0 q");
+        let _ = disable_raw_mode();
+        let _ = execute!(out, LeaveAlternateScreen, DisableMouseCapture);
+        let _ = out.flush();
+    }
+}
 
 /// Configures the terminal hardware cursor geometry based on the active modal editing state.
-///
-/// Sends standard DECSCUSR (DEC Set Cursor Style) ANSI control sequences:
-/// - `\x1b[2 q`: Steady Block cursor (used in [`Mode::Normal`], [`Mode::Command`], and [`Mode::Visual`]).
-/// - `\x1b[6 q`: Steady Bar / I-Beam cursor (used in [`Mode::Insert`]).
 fn set_terminal_cursor_style(mode: Mode) {
     let mut stdout = stdout();
     match mode {
         Mode::Normal | Mode::Command | Mode::Visual { .. } => {
-            let _ = stdout.write_all(b"\x1b[2 q"); // Block
+            let _ = stdout.write_all(b"\x1b[2 q"); // Steady Block
         }
         Mode::Insert => {
-            let _ = stdout.write_all(b"\x1b[6 q"); // Thin Bar
+            let _ = stdout.write_all(b"\x1b[6 q"); // Steady Bar / I-Beam
         }
     }
     let _ = stdout.flush();
 }
 
-/// Registers a panic hook to clean up the terminal before the process aborts.
-///
-/// In raw mode, terminal standard I/O handles do not process line feeds or echo characters
-/// conventionally. If an unhandled panic occurs while raw mode or alternate screen buffers
-/// are active, the user's shell becomes unresponsive. This hook resets:
-/// 1. Hardware cursor style to default (`\x1b[0 q`).
-/// 2. Raw mode (restoring canonical line input and echoing).
-/// 3. Alternate screen buffer (reverting to primary shell buffer).
-/// 4. Mouse reporting protocols.
+/// Registers a secondary panic hook ensuring screen recovery during thread unwinding.
 fn setup_panic_hook() {
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -110,46 +84,57 @@ fn setup_panic_hook() {
         let _ = out.write_all(b"\x1b[0 q");
         let _ = disable_raw_mode();
         let _ = execute!(out, LeaveAlternateScreen, DisableMouseCapture);
+        let _ = out.flush();
         hook(info);
     }));
 }
 
+/// Safely truncates a string by Unicode scalar count without slicing mid-codepoint.
+fn safe_truncate(s: &str, max_chars: usize) -> String {
+    if s.chars().count() > max_chars {
+        let mut result: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+        result.push('…');
+        result
+    } else {
+        s.to_string()
+    }
+}
+
+/// Calculates the visual column width of a rope line taking expanded tabs into account.
+fn visual_line_len(rope: &ropey::Rope, line_idx: usize) -> usize {
+    if line_idx >= rope.len_lines() {
+        return 0;
+    }
+    let line = rope.line(line_idx);
+    let mut len = 0;
+    for ch in line.chars() {
+        if ch == '\n' || ch == '\r' {
+            continue;
+        }
+        if ch == '\t' {
+            len += 4;
+        } else {
+            len += 1;
+        }
+    }
+    len
+}
+
 // === Application Lifecycle & Event Loop ===
 
-/// Application entry point initializing terminal subsystems and running the event loop.
-///
-/// # Control Flow
-/// 1. Configures terminal panic safety hooks and enables raw mode + alternate screen buffer.
-/// 2. Parses command-line arguments to load an initial file path into [`Editor`].
-/// 3. Spawns the LSP actor task if the target file extension has an associated server.
-/// 4. Enters the main event loop:
-///    - Drains non-blocking messages from the LSP outbound channel.
-///    - Filters, sorts, and limits completion suggestions.
-///    - Draws the current frame using [`render_ui`].
-///    - Polls crossterm for key and mouse input events with a 20ms timeout.
-/// 5. Restores original terminal state on exit.
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 1. Parse command-line flags before initializing terminal screen
     let cli_args = cmd::CliArgs::parse();
 
     setup_panic_hook();
-    enable_raw_mode()?;
-    let mut stdout = stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
+    let _guard = TerminalGuard::enter()?;
+    let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
 
     let target_path = cli_args.path.clone();
     let mut editor = Editor::new(target_path.as_ref())?;
 
-    // Apply CLI flag overrides
     if cli_args.ignore_config {
-        // Reset in-memory preferences, but keep the already-resolved
-        // `source_path` so that if the user later saves config mid-session
-        // (e.g. via the SaveConfig palette command), it still writes to the
-        // correct project-anchored `.subject0` location rather than losing
-        // track of where it should go.
         editor.config = editor::AppConfig {
             preferred_lsps: std::collections::HashMap::new(),
             line_wrap: true,
@@ -167,7 +152,6 @@ async fn main() -> Result<()> {
     let (lsp_out_tx, mut lsp_out_rx) = mpsc::unbounded_channel::<LspOutbound>();
     editor.lsp_out_tx = Some(lsp_out_tx.clone());
 
-    // Dynamic Multi-LSP Resolution (only spawn for files, not directories)
     if let Some(path) = &target_path
         && path.is_file()
     {
@@ -176,9 +160,14 @@ async fn main() -> Result<()> {
 
     set_terminal_cursor_style(editor.mode);
 
+    let mut needs_redraw = true;
+
     while !editor.should_quit {
+        let mut received_lsp_msg = false;
+
         // Drain incoming messages emitted by the background LSP actor.
         while let Ok(msg) = lsp_out_rx.try_recv() {
+            received_lsp_msg = true;
             match msg {
                 LspOutbound::Status(s) => {
                     let was_ready = matches!(s, LspStatus::Ready(_));
@@ -192,12 +181,10 @@ async fn main() -> Result<()> {
                 }
                 LspOutbound::Diagnostics(d) => editor.diagnostics = d,
                 LspOutbound::Completions { req_id, items } => {
-                    // Only process completions corresponding to the latest request sequence.
                     if req_id == editor.lsp_req_id && !items.is_empty() {
                         let prefix = editor.current_word_prefix();
                         let prefix_lower = prefix.to_lowercase();
 
-                        // 1. Filter candidates containing the current prefix substring.
                         let mut filtered: Vec<SuggestionItem> = items
                             .into_iter()
                             .filter(|it| {
@@ -206,7 +193,6 @@ async fn main() -> Result<()> {
                             })
                             .collect();
 
-                        // 2. Rank candidates: Exact match > Prefix match > Shortest length.
                         filtered.sort_by(|a, b| {
                             let a_lbl = &a.label;
                             let b_lbl = &b.label;
@@ -231,7 +217,6 @@ async fn main() -> Result<()> {
                             a_lbl.len().cmp(&b_lbl.len())
                         });
 
-                        // 3. Limit to the top 100 entries to prevent frame-rendering latency.
                         filtered.truncate(100);
 
                         if filtered.is_empty() {
@@ -247,51 +232,116 @@ async fn main() -> Result<()> {
             }
         }
 
-        editor.spinner_tick = editor.spinner_tick.wrapping_add(1);
+        if received_lsp_msg {
+            needs_redraw = true;
+        }
 
-        // Draw current state onto terminal frame.
-        terminal.draw(|f| render_ui(f, &mut editor))?;
+        let is_loading = matches!(editor.lsp_status, LspStatus::Starting(_));
+        if is_loading {
+            editor.spinner_tick = editor.spinner_tick.wrapping_add(1);
+            needs_redraw = true;
+        }
 
-        // Poll for interactive user input events with a 20ms timeout.
-        if event::poll(Duration::from_millis(20))? {
+        if needs_redraw {
+            terminal.draw(|f| render_ui(f, &mut editor))?;
+            needs_redraw = false;
+        }
+
+        // Event polling: idle sleep when stationary, animated poll when loading.
+        let poll_duration = if is_loading {
+            Duration::from_millis(60)
+        } else {
+            Duration::from_millis(20)
+        };
+
+        if event::poll(poll_duration)? {
             match event::read()? {
-                Event::Key(key) => handle_key_event(&mut editor, key),
-                Event::Mouse(mouse) => handle_mouse_event(&mut editor, mouse, terminal.size()?),
+                Event::Key(key) => {
+                    handle_key_event(&mut editor, key);
+                    needs_redraw = true;
+                }
+                Event::Mouse(mouse) => {
+                    handle_mouse_event(&mut editor, mouse, terminal.size()?);
+                    needs_redraw = true;
+                }
+                Event::Resize(_, _) => {
+                    needs_redraw = true;
+                }
                 _ => {}
             }
         }
     }
 
-    // Reset terminal configuration upon exit.
-    let mut out = std::io::stdout();
-    let _ = out.write_all(b"\x1b[0 q");
-    let _ = disable_raw_mode();
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
     Ok(())
 }
 
 // === Touch & Mouse Handling ===
 
-/// Translates raw mouse and touchscreen interactions into editor actions.
-///
-/// Handles interaction zones in order of spatial precedence:
-/// 1. **Command Palette**: Intercepts clicks on palette items or backdrop clicks to dismiss.
-/// 2. **Statusline Taps**: Toggles mode, file explorer, line wrap, or opens the palette.
-/// 3. **Sidebar File Explorer**: Selects entries, expands directories, or opens files.
-/// 4. **Completion Dropdown**: Handles scroll-wheel selection and item clicks.
-/// 5. **Document Viewport**: Maps clicks and drags to `(cursor_x, cursor_y)`, properly
-///    handling line wrap sub-row calculation, gutter offsets, and viewport bounds.
 fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
     let status_row = size.height.saturating_sub(2);
     let cmd_row = size.height.saturating_sub(1);
     let viewport_top = 1u16;
     let viewport_bottom = size.height.saturating_sub(3);
 
-    // 1. Intercept Command Palette Key Events
+    // 1. Intercept Help Modal (Modal shield prevents fall-through to document)
+    if editor.show_help {
+        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+            let width = 64u16.min(size.width.saturating_sub(4));
+            let height = 22u16.min(size.height.saturating_sub(2));
+            let x = (size.width.saturating_sub(width)) / 2;
+            let y = (size.height.saturating_sub(height)) / 2;
+
+            if mouse.column < x
+                || mouse.column >= x + width
+                || mouse.row < y
+                || mouse.row >= y + height
+            {
+                editor.show_help = false;
+            }
+        }
+        return;
+    }
+
+    // 2. Intercept LSP Server Picker Modal
+    if let Some(picker) = &editor.lsp_picker {
+        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+            let width = 48u16.min(size.width.saturating_sub(2));
+            let height = ((picker.candidates.len() as u16) + 4).min(size.height.saturating_sub(2));
+            let x = (size.width.saturating_sub(width)) / 2;
+            let y = (size.height.saturating_sub(height)) / 2;
+
+            if mouse.column >= x + 1
+                && mouse.column < x + width - 1
+                && mouse.row >= y + 2
+                && mouse.row < y + 2 + picker.candidates.len() as u16
+            {
+                let clicked_idx = (mouse.row - (y + 2)) as usize;
+                if clicked_idx < picker.candidates.len() {
+                    let chosen = picker.candidates[clicked_idx].clone();
+                    let lang_id = picker.language_id.clone();
+                    editor
+                        .config
+                        .preferred_lsps
+                        .insert(lang_id.clone(), chosen.clone());
+                    let _ = editor.config.save();
+                    editor.status_msg = format!("Selected LSP: {chosen} (saved to .subject0)");
+                    if let Some(path) = editor.path.clone() {
+                        editor.start_lsp_server(&path, &lang_id, &chosen);
+                    }
+                    editor.lsp_picker = None;
+                }
+            } else if mouse.column < x
+                || mouse.column >= x + width
+                || mouse.row < y
+                || mouse.row >= y + height
+            {
+                editor.lsp_picker = None;
+            }
+        }
+        return;
+    }
+
+    // 3. Intercept Command Palette Interactions
     if editor.palette.visible {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             let width = 46u16.min(size.width.saturating_sub(2));
@@ -299,18 +349,19 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
             let x = (size.width.saturating_sub(width)) / 2;
             let y = 1u16;
 
-            // Check if click occurred within the list region of the palette window.
-            if mouse.column >= x
-                && mouse.column < x + width
-                && mouse.row >= y + 2
+            // Header prompt occupies y+1, separator occupies y+2. Entries begin at y+3.
+            if mouse.column >= x + 1
+                && mouse.column < x + width - 1
+                && mouse.row >= y + 3
                 && mouse.row < y + height - 1
             {
-                let clicked_row = (mouse.row - (y + 2)) as usize;
+                let clicked_row = (mouse.row - (y + 3)) as usize;
                 let cmds = editor.palette.filtered_commands();
                 let actual_idx = editor.palette.scroll + clicked_row;
                 if actual_idx < cmds.len() {
                     let cmd_id = cmds[actual_idx].id;
                     editor.execute_palette_command(cmd_id);
+                    set_terminal_cursor_style(editor.mode);
                 }
                 return;
             } else if mouse.column < x
@@ -318,7 +369,6 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
                 || mouse.row < y
                 || mouse.row >= y + height
             {
-                // Click occurred outside modal boundary; dismiss palette.
                 editor.palette.visible = false;
                 return;
             }
@@ -326,19 +376,29 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         return;
     }
 
-    // 2. Statusline Taps
+    // 4. Statusline Taps with dynamically measured badge boundaries
     if mouse.row == status_row {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-            if mouse.column <= 9 {
-                // Mode Badge Tap: Toggle between Normal and Insert modes.
-                editor.mode = match editor.mode {
+            let badge_len = match editor.mode {
+                Mode::Normal => 8,
+                Mode::Insert => 8,
+                Mode::Command => 9,
+                Mode::Visual { .. } => 8,
+            } + 1;
+
+            let files_end = badge_len + 10;
+            let wrap_end = files_end + 10;
+            let cmd_end = wrap_end + 9;
+
+            let col = mouse.column as usize;
+            if col <= badge_len {
+                editor.set_mode(match editor.mode {
                     Mode::Normal => Mode::Insert,
                     Mode::Insert | Mode::Command | Mode::Visual { .. } => Mode::Normal,
-                };
+                });
                 set_terminal_cursor_style(editor.mode);
                 editor.completion_visible = false;
-            } else if mouse.column <= 18 {
-                // Sidebar Toggle Button Tap
+            } else if col <= files_end {
                 editor.explorer.visible = !editor.explorer.visible;
                 if editor.explorer.visible {
                     editor.explorer.refresh();
@@ -346,13 +406,11 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
                 } else {
                     editor.focus = Focus::Editor;
                 }
-            } else if mouse.column <= 27 {
-                // Line Wrap Toggle Button Tap
+            } else if col <= wrap_end {
                 editor.line_wrap = !editor.line_wrap;
                 editor.status_msg =
                     format!("Line Wrap: {}", if editor.line_wrap { "ON" } else { "OFF" });
-            } else if mouse.column <= 36 {
-                // Command Palette Shortcut Tap
+            } else if col <= cmd_end {
                 editor.palette.visible = true;
                 editor.palette.query.clear();
                 editor.palette.selected_idx = 0;
@@ -366,7 +424,6 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         return;
     }
 
-    // Determine current sidebar width allocation.
     let explorer_width = if editor.explorer.visible {
         if size.width < 70 {
             (size.width * 7 / 10).max(26).min(size.width)
@@ -377,7 +434,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         0u16
     };
 
-    // 3. File Explorer Sidebar Interactions
+    // 5. File Explorer Sidebar Interactions
     if editor.explorer.visible && mouse.column < explorer_width {
         let max_visible = viewport_bottom.saturating_sub(viewport_top) as usize;
         match mouse.kind {
@@ -414,7 +471,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         return;
     }
 
-    // 4. Completion Dropdown Interactions
+    // 6. Completion Dropdown Interactions
     if editor.completion_visible && !editor.completions.is_empty() {
         if let Some((px, py, pw, ph)) = editor.completion_rect {
             let in_popup = mouse.column >= px
@@ -453,14 +510,13 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
                     _ => return,
                 }
             } else if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-                // Dismiss popup on outside click and permit remaining handlers to process click
                 editor.completion_visible = false;
                 editor.completion_rect = None;
             }
         }
     }
 
-    // 5. Document Viewport Buffer Interactions (Reliable line & sub-row mapping)
+    // 7. Document Viewport Buffer Interactions
     let gutter_digits = editor.rope.len_lines().max(1).to_string().len().max(2);
     let gutter_width = gutter_digits + 4;
     let content_left = explorer_width + 1u16 + gutter_width as u16;
@@ -474,13 +530,12 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
                 let clicked_screen_row = (mouse.row - viewport_top) as usize;
 
                 if editor.line_wrap {
-                    // When wrapping is enabled, iterate lines and calculate visual sub-rows.
                     let mut accumulated_rows = 0;
                     let mut found_line = editor.rope.len_lines().saturating_sub(1);
                     let mut found_col = 0;
 
                     for y in editor.scroll_y..editor.rope.len_lines() {
-                        let l_len = line_len(&editor.rope, y);
+                        let l_len = visual_line_len(&editor.rope, y);
                         let sub_rows = if l_len == 0 {
                             1
                         } else {
@@ -495,7 +550,18 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
                             } else {
                                 0
                             };
-                            found_col = (sub_idx * text_area_width + sub_col).min(l_len);
+                            let raw_line = editor.rope.line(y);
+                            let target_visual_x = sub_idx * text_area_width + sub_col;
+                            let mut current_vx = 0;
+                            let mut resolved_char_idx = 0;
+                            for (c_idx, ch) in raw_line.chars().enumerate() {
+                                if current_vx >= target_visual_x || ch == '\n' || ch == '\r' {
+                                    break;
+                                }
+                                current_vx += if ch == '\t' { 4 } else { 1 };
+                                resolved_char_idx = c_idx + 1;
+                            }
+                            found_col = resolved_char_idx;
                             break;
                         }
                         accumulated_rows += sub_rows;
@@ -504,12 +570,23 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
                     editor.cursor_y = found_line;
                     editor.cursor_x = found_col;
                 } else {
-                    // When wrapping is disabled, 1 terminal row == 1 buffer line.
                     let target_line = (editor.scroll_y + clicked_screen_row)
                         .min(editor.rope.len_lines().saturating_sub(1));
                     editor.cursor_y = target_line;
                     if mouse.column >= content_left {
-                        editor.cursor_x = editor.scroll_x + (mouse.column - content_left) as usize;
+                        let target_visual_x =
+                            editor.scroll_x + (mouse.column - content_left) as usize;
+                        let raw_line = editor.rope.line(target_line);
+                        let mut current_vx = 0;
+                        let mut resolved_char_idx = 0;
+                        for (c_idx, ch) in raw_line.chars().enumerate() {
+                            if current_vx >= target_visual_x || ch == '\n' || ch == '\r' {
+                                break;
+                            }
+                            current_vx += if ch == '\t' { 4 } else { 1 };
+                            resolved_char_idx = c_idx + 1;
+                        }
+                        editor.cursor_x = resolved_char_idx;
                     } else {
                         editor.cursor_x = 0;
                     }
@@ -528,11 +605,13 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
             editor.scroll_y = editor.scroll_y.saturating_sub(3);
             editor.cursor_y = editor.cursor_y.saturating_sub(3);
             editor.clamp_cursor();
+            editor.completion_visible = false;
         }
         MouseEventKind::ScrollDown if editor.scroll_y + 3 < editor.rope.len_lines() => {
             editor.scroll_y += 3;
             editor.cursor_y = (editor.cursor_y + 3).min(editor.rope.len_lines().saturating_sub(1));
             editor.clamp_cursor();
+            editor.completion_visible = false;
         }
         _ => {}
     }
@@ -540,27 +619,15 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
 
 // === Keyboard Controller ===
 
-/// Dispatches raw key events according to the active mode and focus context.
-///
-/// Filters out key release events to prevent duplicate executions on platforms
-/// with the kitty keyboard protocol or enhanced event reporting.
-///
-/// # Routing Priority
-/// 1. Command Palette Navigation (when visible).
-/// 2. Global Shortcuts (`Ctrl-E` for Explorer toggle).
-/// 3. File Explorer Sidebar Navigation (when focused).
-/// 4. Modal Editing Handler:
-///    - [`Mode::Normal`]: Motion commands, multi-key prefixes (`gg`, `dd`), mode transitions.
-///    - [`Mode::Visual`]: Selection manipulation, deletion, yanking.
-///    - [`Mode::Insert`]: Text typing, autocomplete popup control, auto-pairing brackets.
-///    - [`Mode::Command`]: Ex-command input buffering and execution on Enter.
 fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
-    // Filter release events to prevent double-firing in terminals reporting key releases.
     if key.kind == KeyEventKind::Release {
         return;
     }
 
-    // Intercept In-Editor Help Modal Navigation
+    let prev_mode = editor.mode;
+    let max_visible = 6usize;
+
+    // 1. Intercept In-Editor Help Modal Navigation
     if editor.show_help {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q' | '?') => {
@@ -583,14 +650,15 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    let prev_mode = editor.mode;
-    let max_visible = 6usize;
-
-    // Intercept LSP Server Selection Modal
+    // 2. Intercept LSP Server Selection Modal
     if let Some(mut picker) = editor.lsp_picker.take() {
+        if picker.candidates.is_empty() {
+            editor.status_msg = "No LSP candidates available".to_string();
+            return;
+        }
+
         match key.code {
             KeyCode::Esc => {
-                // Dismiss modal
                 editor.status_msg = "LSP selection canceled".to_string();
             }
             KeyCode::Down | KeyCode::Char('j') => {
@@ -599,7 +667,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 picker.selected_idx = if picker.selected_idx == 0 {
-                    picker.candidates.len() - 1
+                    picker.candidates.len().saturating_sub(1)
                 } else {
                     picker.selected_idx - 1
                 };
@@ -618,7 +686,6 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                     editor.start_lsp_server(&path, &picker.language_id, &chosen);
                 }
             }
-
             _ => {
                 editor.lsp_picker = Some(picker);
             }
@@ -626,7 +693,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // 1. Intercept Command Palette Key Events
+    // 3. Intercept Command Palette Key Events
     if editor.palette.visible {
         let cmds = editor.palette.filtered_commands();
         match key.code {
@@ -641,7 +708,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
             KeyCode::Up => {
                 if !cmds.is_empty() {
                     editor.palette.selected_idx = if editor.palette.selected_idx == 0 {
-                        cmds.len() - 1
+                        cmds.len().saturating_sub(1)
                     } else {
                         editor.palette.selected_idx - 1
                     };
@@ -651,6 +718,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                 if !cmds.is_empty() && editor.palette.selected_idx < cmds.len() {
                     let cmd_id = cmds[editor.palette.selected_idx].id;
                     editor.execute_palette_command(cmd_id);
+                    set_terminal_cursor_style(editor.mode);
                 }
             }
             KeyCode::Backspace => {
@@ -666,7 +734,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // Toggle File Explorer: Ctrl-E
+    // 4. Global Shortcuts: Ctrl-E for File Explorer
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('e') {
         editor.explorer.visible = !editor.explorer.visible;
         if editor.explorer.visible {
@@ -678,7 +746,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // Explorer navigation when active
+    // 5. File Explorer Navigation Focus
     if editor.focus == Focus::Explorer && editor.explorer.visible {
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
@@ -711,11 +779,11 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // Editor Buffer Handling
+    // 6. Modal Editing Handler
     match editor.mode {
         Mode::Normal => {
             editor.completion_visible = false;
-            // Evaluate pending multi-character chords (e.g., 'dd', 'gg').
+
             if let Some(pending) = editor.pending_key.take() {
                 let handled = match (pending, key.code) {
                     ('d', KeyCode::Char('d')) => {
@@ -746,22 +814,20 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                     editor.clamp_cursor();
                     return;
                 }
-                // Unmatched chords fall through to process the incoming key in Normal mode
             }
 
             match key.code {
                 KeyCode::Char(' ') => {
-                    // Open Helix-style Space Menu / Command Palette.
                     editor.palette.visible = true;
                     editor.palette.query.clear();
                     editor.palette.selected_idx = 0;
                     editor.palette.scroll = 0;
                 }
                 KeyCode::Char('v') => {
-                    editor.mode = Mode::Visual {
+                    editor.set_mode(Mode::Visual {
                         anchor_x: editor.cursor_x,
                         anchor_y: editor.cursor_y,
-                    };
+                    });
                 }
                 KeyCode::Char('%') => editor.select_all(),
                 KeyCode::Char('y') => editor.yank_selection(),
@@ -771,26 +837,22 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                 KeyCode::Char('o') => editor.insert_line_below(),
                 KeyCode::Char('O') => editor.insert_line_above(),
                 KeyCode::Char('i') => {
-                    editor.snapshot();
-                    editor.mode = Mode::Insert;
+                    editor.set_mode(Mode::Insert);
                 }
                 KeyCode::Char('I') => {
-                    editor.snapshot();
                     editor.cursor_x = 0;
-                    editor.mode = Mode::Insert;
+                    editor.set_mode(Mode::Insert);
                 }
                 KeyCode::Char('a') => {
-                    editor.snapshot();
                     let line_len = editor.current_line_len();
                     if editor.cursor_x < line_len {
                         editor.cursor_x += 1;
                     }
-                    editor.mode = Mode::Insert;
+                    editor.set_mode(Mode::Insert);
                 }
                 KeyCode::Char('A') => {
-                    editor.snapshot();
                     editor.cursor_x = editor.current_line_len();
-                    editor.mode = Mode::Insert;
+                    editor.set_mode(Mode::Insert);
                 }
                 KeyCode::Char('u') => editor.undo(),
                 KeyCode::Char('d') => editor.pending_key = Some('d'),
@@ -800,7 +862,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                     editor.cursor_x = 0;
                 }
                 KeyCode::Char(':') => {
-                    editor.mode = Mode::Command;
+                    editor.set_mode(Mode::Command);
                     editor.command_buffer.clear();
                 }
                 KeyCode::Char('0') => editor.cursor_x = 0,
@@ -832,14 +894,14 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         }
         Mode::Visual { .. } => match key.code {
             KeyCode::Esc => {
-                editor.mode = Mode::Normal;
+                editor.set_mode(Mode::Normal);
             }
             KeyCode::Char('d' | 'x') => {
                 editor.delete_selection();
             }
             KeyCode::Char('c') => {
                 editor.delete_selection();
-                editor.mode = Mode::Insert;
+                editor.set_mode(Mode::Insert);
             }
             KeyCode::Char('y') => {
                 editor.yank_selection();
@@ -868,7 +930,6 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
             _ => {}
         },
         Mode::Insert => {
-            // Priority handling for active autocomplete menu navigation.
             if editor.completion_visible && !editor.completions.is_empty() {
                 match key.code {
                     KeyCode::Down => {
@@ -879,7 +940,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                     }
                     KeyCode::Up => {
                         editor.completion_idx = if editor.completion_idx == 0 {
-                            editor.completions.len() - 1
+                            editor.completions.len().saturating_sub(1)
                         } else {
                             editor.completion_idx - 1
                         };
@@ -900,7 +961,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
 
             match key.code {
                 KeyCode::Esc => {
-                    editor.mode = Mode::Normal;
+                    editor.set_mode(Mode::Normal);
                     editor.completion_visible = false;
                     if editor.cursor_x > 0 && editor.cursor_x >= editor.current_line_len() {
                         editor.cursor_x = editor.cursor_x.saturating_sub(1);
@@ -910,7 +971,6 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                 KeyCode::Enter => editor.insert_newline(),
                 KeyCode::Backspace => editor.backspace(),
                 KeyCode::Tab => {
-                    // Soft tabs: 4 spaces without reviving stale completion popups
                     for _ in 0..4 {
                         editor.insert_char(' ');
                     }
@@ -919,7 +979,6 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                 KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     editor.request_completions();
                 }
-                // Automatic closing bracket and delimiter pairs without firing autocomplete
                 KeyCode::Char('(') => {
                     editor.insert_pair('(', ')');
                     editor.completion_visible = false;
@@ -948,7 +1007,6 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                     }
                     editor.completion_visible = false;
                 }
-                // Step over closing delimiter if already present
                 KeyCode::Char(')') if editor.char_under_cursor() == Some(')') => {
                     editor.cursor_x += 1;
                     editor.completion_visible = false;
@@ -983,7 +1041,6 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                 }
                 KeyCode::Char(c) => {
                     editor.insert_char(c);
-                    // Only request completions on valid identifiers or trigger characters
                     let prefix = editor.current_word_prefix();
                     if c == '.'
                         || c == ':'
@@ -994,7 +1051,6 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                         editor.completion_visible = false;
                     }
                 }
-
                 _ => {}
             }
         }
@@ -1002,19 +1058,30 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
             editor.completion_visible = false;
             match key.code {
                 KeyCode::Esc => {
-                    editor.mode = Mode::Normal;
+                    editor.set_mode(Mode::Normal);
                     editor.command_buffer.clear();
                 }
                 KeyCode::Enter => {
                     editor.execute_command();
                     if editor.mode == Mode::Command {
-                        editor.mode = Mode::Normal;
+                        editor.set_mode(Mode::Normal);
                     }
                 }
                 KeyCode::Backspace => {
                     if editor.command_buffer.pop().is_none() {
-                        editor.mode = Mode::Normal;
+                        editor.set_mode(Mode::Normal);
                     }
+                }
+                KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let trimmed = editor.command_buffer.trim_end();
+                    if let Some(pos) = trimmed.rfind(' ') {
+                        editor.command_buffer.truncate(pos + 1);
+                    } else {
+                        editor.command_buffer.clear();
+                    }
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    editor.command_buffer.clear();
                 }
                 KeyCode::Char(c) => editor.command_buffer.push(c),
                 _ => {}
@@ -1031,29 +1098,9 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
 
 // === UI Render Pipeline ===
 
-/// Renders the complete editor user interface into the Ratatui frame buffer.
-///
-/// # Rendering Layers
-/// 1. **Layout Slicing**: Splits the terminal screen vertically into main workspace,
-///    statusline, and bottom notification/command bar.
-/// 2. **File Explorer (Sidebar)**: Materializes tree entries with Nerd Font glyphs,
-///    indentation lines, and directory expansion indicators.
-/// 3. **Document Viewport**:
-///    - Renders line number gutters with dynamic width based on total line count.
-///    - Highlights syntax using the [`crate::lsp::SyntaxEngine`].
-///    - Handles visual selection backgrounds.
-///    - Emits line wrapping sub-rows with continuation glyphs (`↳`).
-/// 4. **Powerline Status Bar**: Renders mode indicator pill, file and wrap toggles,
-///    diagnostic counts (errors/warnings), LSP status, and cursor coordinates.
-/// 5. **Bottom Area**: Renders `:command` prompts or active-line LSP diagnostics.
-/// 6. **Popup Overlays**:
-///    - Floating autocomplete dropdown anchored beside the editing cursor.
-///    - Centered command palette modal.
-#[allow(clippy::needless_range_loop)]
 fn render_ui(frame: &mut Frame, editor: &mut Editor) {
     let size = frame.area();
 
-    // Divide screen vertically: Workspace | Statusline (1) | Bottom Line (1)
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1063,7 +1110,6 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         ])
         .split(size);
 
-    // Split workspace horizontally if file explorer sidebar is visible.
     let (explorer_area, editor_area) = if editor.explorer.visible {
         let is_mobile = size.width < 70;
         let sidebar_width = if is_mobile {
@@ -1197,7 +1243,6 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
     editor.update_scroll(text_area_width, inner_area.height as usize);
 
-    // Build visible lines: Syntax-highlighted character arrays.
     let mut visible_lines = Vec::new();
     let mut cursor_screen_pos: Option<(u16, u16)> = None;
 
@@ -1238,23 +1283,24 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             }
         }
 
-        // Tokenize through SyntaxEngine preserving Tree-sitter colors.
         let syntax_spans = editor.syntax.highlight_line(&line_str, y);
-        let mut char_styles: Vec<(char, Style)> = Vec::with_capacity(line_str.len() * 2);
+        // Triple maintains: (char, Style, original_buffer_char_index)
+        let mut char_cells: Vec<(char, Style, usize)> = Vec::with_capacity(line_str.len() * 2);
+        let mut char_idx = 0;
         for span in syntax_spans {
             let st = span.style;
             for ch in span.content.chars() {
                 if ch == '\t' {
                     for _ in 0..4 {
-                        char_styles.push((' ', st));
+                        char_cells.push((' ', st, char_idx));
                     }
                 } else {
-                    char_styles.push((ch, st));
+                    char_cells.push((ch, st, char_idx));
                 }
+                char_idx += 1;
             }
         }
 
-        // Map buffer cursor_x to visual screen column considering expanded tabs
         let visual_cursor_x = {
             let mut vx = 0;
             for (idx, ch) in line_str.chars().enumerate() {
@@ -1270,8 +1316,8 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             vx
         };
 
-        if editor.line_wrap && char_styles.len() > text_area_width {
-            let total_chars = char_styles.len();
+        if editor.line_wrap && char_cells.len() > text_area_width {
+            let total_chars = char_cells.len();
             let mut chunk_start = 0;
             let mut is_first_sub = true;
 
@@ -1304,8 +1350,8 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
                 ];
 
                 for col_idx in chunk_start..chunk_end {
-                    let (ch, mut st) = char_styles[col_idx];
-                    if editor.is_char_selected(y, col_idx) {
+                    let (ch, mut st, orig_char_idx) = char_cells[col_idx];
+                    if editor.is_char_selected(y, orig_char_idx) {
                         st = st.bg(Color::Rgb(55, 80, 145)).fg(Color::White);
                     }
                     sub_spans.push(Span::styled(ch.to_string(), st));
@@ -1341,7 +1387,7 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
                 Span::styled(gutter_str, g_style),
             ];
 
-            if char_styles.is_empty() {
+            if char_cells.is_empty() {
                 if is_cursor_line && cursor_screen_pos.is_none() {
                     let cx = inner_area.x + gutter_width as u16;
                     let cy = inner_area.y + current_row;
@@ -1351,13 +1397,13 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
                 let skip_count = if editor.line_wrap { 0 } else { editor.scroll_x };
                 let take_count = text_area_width;
 
-                for (col_idx, (ch, mut st)) in char_styles
+                for (_col_idx, (ch, mut st, orig_char_idx)) in char_cells
                     .into_iter()
                     .enumerate()
                     .skip(skip_count)
                     .take(take_count)
                 {
-                    if editor.is_char_selected(y, col_idx) {
+                    if editor.is_char_selected(y, orig_char_idx) {
                         st = st.bg(Color::Rgb(55, 80, 145)).fg(Color::White);
                     }
                     row_spans.push(Span::styled(ch.to_string(), st));
@@ -1378,7 +1424,6 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         }
     }
 
-    // Fill remaining viewport space with '~' tildes.
     for _ in (current_row as usize)..inner_area.height as usize {
         visible_lines.push(Line::from(vec![
             Span::raw(" "),
@@ -1461,7 +1506,6 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
     let mut status_right_spans = Vec::new();
 
-    // LSP Lifecycle Status Indicator
     match &editor.lsp_status {
         LspStatus::Starting(name) => {
             status_right_spans.push(Span::styled(
@@ -1496,7 +1540,6 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         LspStatus::Disabled => {}
     }
 
-    // Diagnostics Indicators
     if error_count > 0 {
         status_right_spans.push(Span::styled(
             format!("  {error_count} "),
@@ -1536,7 +1579,7 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         main_chunks[1],
     );
 
-    // 4. Diagnostics / Bottom Notification Area
+    // 4. Diagnostics / Command Bar Area
     if editor.mode == Mode::Command {
         let prompt_line = Line::from(vec![
             Span::styled(
@@ -1548,10 +1591,9 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             Span::raw(&editor.command_buffer),
         ]);
         frame.render_widget(Paragraph::new(prompt_line), main_chunks[2]);
-        frame.set_cursor_position(Position::new(
-            (2 + editor.command_buffer.len()) as u16,
-            main_chunks[2].y,
-        ));
+        let cmd_chars = editor.command_buffer.chars().count();
+        let target_x = (2 + cmd_chars).min((frame.area().width.saturating_sub(1)) as usize) as u16;
+        frame.set_cursor_position(Position::new(target_x, main_chunks[2].y));
     } else {
         let active_diag = editor
             .diagnostics
@@ -1584,7 +1626,6 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
         frame.render_widget(Paragraph::new(msg_line), main_chunks[2]);
 
-        // Use exact screen coordinates computed during line rendering
         let (screen_x, screen_y) =
             cursor_screen_pos.unwrap_or((inner_area.x + gutter_width as u16, inner_area.y));
 
@@ -1645,12 +1686,7 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
                 };
 
                 let avail_width = (popup_width as usize).saturating_sub(6);
-                let label_text = if item.label.len() > avail_width {
-                    format!("{}…", &item.label[..avail_width.saturating_sub(1)])
-                } else {
-                    item.label.clone()
-                };
-
+                let label_text = safe_truncate(&item.label, avail_width);
                 let padding = avail_width.saturating_sub(label_text.chars().count());
 
                 list_lines.push(Line::from(vec![
@@ -1747,12 +1783,7 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             };
 
             let avail_title_width = (width as usize).saturating_sub(cmd.shortcut.len() + 8);
-            let display_title = if cmd.title.len() > avail_title_width {
-                format!("{}…", &cmd.title[..avail_title_width.saturating_sub(1)])
-            } else {
-                cmd.title.to_string()
-            };
-
+            let display_title = safe_truncate(cmd.title, avail_title_width);
             let padding = avail_title_width.saturating_sub(display_title.chars().count());
 
             palette_lines.push(Line::from(vec![
@@ -1785,6 +1816,7 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
         frame.render_widget(Paragraph::new(palette_lines).block(p_block), palette_rect);
     }
+
     // 6. Render LSP Picker Modal Overlay
     if let Some(picker) = &editor.lsp_picker {
         let width = 48u16.min(size.width.saturating_sub(2));

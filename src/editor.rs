@@ -16,9 +16,8 @@
 //!    - [`Mode::Visual`]: 2D anchor-to-cursor selection highlighting and bulk manipulation.
 //!
 //! 3. **Undo History Stack**:
-//!    Maintains a ring-bounded history of historical [`Rope`] states (capped at 64 entries).
-//!    Because `Rope` clones share immutable internal B-tree nodes, pushing snapshots avoids
-//!    deep string allocations.
+//!    Maintains a ring-bounded history of historical snapshots paired with cursor coordinates
+//!    (capped at 64 entries).
 //!
 //! 4. **Document & LSP Synchronization**:
 //!    Every buffer mutation increments `doc_version`, synchronizes AST highlights via
@@ -61,21 +60,15 @@ pub struct AppConfig {
 
 impl AppConfig {
     /// Resolves the `.subject0` config path anchored to a specific project
-    /// root, rather than the ambient process working directory. This ensures
-    /// `s0` finds (and later writes back to) the same config file no matter
-    /// which directory the editor happened to be launched from.
-    ///
-    /// Resolution order:
-    /// 1. `<project_root>/.subject0` — if it already exists.
-    /// 2. `$HOME/.subject0` — user-level fallback, if it already exists.
-    /// 3. `<project_root>/.subject0` — default write target for a fresh config.
+    /// root, rather than the ambient process working directory.
     fn resolve_path(project_root: &Path) -> PathBuf {
         let project_cfg = project_root.join(".subject0");
         if project_cfg.exists() {
             return project_cfg;
         }
-        if let Ok(home) = env::var("HOME") {
-            let home_cfg = PathBuf::from(home).join(".subject0");
+        let home = env::var_os("HOME").or_else(|| env::var_os("USERPROFILE"));
+        if let Some(h) = home {
+            let home_cfg = PathBuf::from(h).join(".subject0");
             if home_cfg.exists() {
                 return home_cfg;
             }
@@ -83,10 +76,7 @@ impl AppConfig {
         project_cfg
     }
 
-    /// Loads configuration anchored to `project_root` (the opened file's
-    /// parent directory, or the opened directory itself). Use this instead of
-    /// relying on the process's current working directory so that config
-    /// resolution is stable regardless of where `s0` was launched from.
+    /// Loads configuration anchored to `project_root`.
     pub fn load_from(project_root: &Path) -> Self {
         let path = Self::resolve_path(project_root);
         let mut preferred_lsps = HashMap::new();
@@ -114,11 +104,29 @@ impl AppConfig {
         }
     }
 
+    /// Saves configuration while preserving any external or unrecognized fields in `.subject0`.
     pub fn save(&self) -> Result<()> {
-        let val = json!({
-            "preferred_lsps": self.preferred_lsps,
-            "line_wrap": self.line_wrap,
-        });
+        let mut val = if let Ok(content) = fs::read_to_string(&self.source_path)
+            && let Ok(existing) = serde_json::from_str::<Value>(&content)
+        {
+            existing
+        } else {
+            json!({})
+        };
+
+        if let Some(obj) = val.as_object_mut() {
+            obj.insert("preferred_lsps".to_string(), json!(self.preferred_lsps));
+            obj.insert("line_wrap".to_string(), json!(self.line_wrap));
+        } else {
+            val = json!({
+                "preferred_lsps": self.preferred_lsps,
+                "line_wrap": self.line_wrap,
+            });
+        }
+
+        if let Some(parent) = self.source_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
         fs::write(&self.source_path, serde_json::to_string_pretty(&val)?)?;
         Ok(())
     }
@@ -132,7 +140,7 @@ pub struct LspPicker {
 }
 
 /// Active input mode governing key event interpretation and cursor boundary constraints.
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum Mode {
     /// Navigation and command execution mode. Cursor rests on existing glyphs (`x <= len - 1`).
     Normal,
@@ -150,7 +158,7 @@ pub enum Mode {
 }
 
 /// Identifies which viewport element currently holds keyboard input focus.
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum Focus {
     /// Main code buffer viewport.
     Editor,
@@ -161,7 +169,7 @@ pub enum Focus {
 // === Command Palette Definitions ===
 
 /// Enumeration of all discrete operations dispatchable via the interactive command palette.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CommandId {
     /// Selects the entire text document buffer into a visual range.
     SelectAll,
@@ -187,9 +195,9 @@ pub enum CommandId {
     Undo,
     /// Copies the active visual selection or current line to the internal clipboard.
     Yank,
-    /// Pastes text from the internal clipboard at the current cursor offset.
-    ToggleCase,
     /// Swaps character casing (uppercase <-> lowercase) over selection or character.
+    ToggleCase,
+    /// Pastes text from the internal clipboard at the current cursor offset.
     Paste,
     /// Relocates the cursor to the first character of the first line.
     JumpTop,
@@ -355,7 +363,6 @@ pub struct CommandPalette {
 }
 
 impl CommandPalette {
-    /// Creates a closed, empty command palette instance.
     pub fn new() -> Self {
         Self {
             visible: false,
@@ -365,10 +372,6 @@ impl CommandPalette {
         }
     }
 
-    /// Evaluates `self.query` against [`PALETTE_COMMANDS`] and returns matching candidates.
-    ///
-    /// Matches case-insensitively against both command titles and shortcut strings.
-    /// Returns the complete registry if the query buffer is empty.
     pub fn filtered_commands(&self) -> Vec<&'static PaletteCommand> {
         let q = self.query.to_lowercase();
         PALETTE_COMMANDS
@@ -387,34 +390,23 @@ impl CommandPalette {
 /// Represents a single node (file or directory) within the hierarchical file tree.
 #[derive(Clone, Debug)]
 pub struct FileEntry {
-    /// Full filesystem path to the target node.
     pub path: PathBuf,
-    /// Terminal display name (filename or directory name).
     pub name: String,
-    /// True if the entry represents a directory; false for regular files and symlinks.
     pub is_dir: bool,
-    /// Indentation depth relative to the root directory (0 = root level children).
     pub depth: usize,
-    /// If `is_dir` is true, tracks whether sub-entries are currently materialized.
     pub expanded: bool,
 }
 
 /// Sidebar file tree model supporting dynamic directory expansion and navigation.
 pub struct FileExplorer {
-    /// Base directory path serving as the hierarchy root.
     pub root: PathBuf,
-    /// Flattened display list containing all visible nodes, including expanded subtrees.
     pub entries: Vec<FileEntry>,
-    /// Index within `entries` representing the currently focused row.
     pub selected_idx: usize,
-    /// Vertical viewport scroll offset for the explorer sidebar.
     pub scroll: usize,
-    /// Controls whether the file explorer sidebar is visible.
     pub visible: bool,
 }
 
 impl FileExplorer {
-    /// Constructs a file explorer rooted at the provided filesystem path and reads top-level entries.
     pub fn new<P: AsRef<Path>>(root: P) -> Self {
         let root_buf = root.as_ref().to_path_buf();
         let mut explorer = Self {
@@ -428,16 +420,10 @@ impl FileExplorer {
         explorer
     }
 
-    /// Rescans the root directory, collapsing expanded subtrees and resetting `entries`.
     pub fn refresh(&mut self) {
         self.entries = Self::read_directory(&self.root, 0);
     }
 
-    /// Reads immediate children of `dir`, sorting directories before files, and ignores noise.
-    ///
-    /// Filters out:
-    /// - Hidden files and directories starting with `.` (e.g., `.git`)
-    /// - Build artifact directories (`target`, `node_modules`)
     fn read_directory(dir: &Path, depth: usize) -> Vec<FileEntry> {
         let mut entries = Vec::new();
         if let Ok(read_dir) = fs::read_dir(dir) {
@@ -449,7 +435,6 @@ impl FileExplorer {
                 })
                 .collect();
 
-            // Sort directories before files, then sort alphabetically by filename.
             paths.sort_by(|a, b| {
                 let a_is_dir = a.is_dir();
                 let b_is_dir = b.is_dir();
@@ -482,12 +467,6 @@ impl FileExplorer {
         entries
     }
 
-    /// Toggles the expansion state of a directory entry at `idx`.
-    ///
-    /// - If currently expanded: Traverses forward, counting all descendants with
-    ///   `depth > current_depth`, and removes them from the flattened vector via [`Vec::drain`].
-    /// - If collapsed: Reads the directory contents from disk at `current_depth + 1` and
-    ///   splices them directly following `idx`.
     pub fn toggle_expand(&mut self, idx: usize) {
         if idx >= self.entries.len() || !self.entries[idx].is_dir {
             return;
@@ -506,7 +485,6 @@ impl FileExplorer {
             }
             self.entries.drain(idx + 1..idx + 1 + remove_count);
 
-            // Re-anchor selection if it was pointing to a removed child or downstream entry
             if self.selected_idx > idx && self.selected_idx <= idx + remove_count {
                 self.selected_idx = idx;
             } else if self.selected_idx > idx + remove_count {
@@ -530,7 +508,6 @@ impl FileExplorer {
         }
     }
 
-    /// Adjusts `self.scroll` to keep `self.selected_idx` within the visible vertical window.
     pub fn update_scroll(&mut self, viewport_height: usize) {
         if self.selected_idx < self.scroll {
             self.scroll = self.selected_idx;
@@ -538,6 +515,16 @@ impl FileExplorer {
             self.scroll = self.selected_idx + 1 - viewport_height;
         }
     }
+}
+
+// === Undo Snapshot State ===
+
+/// Historic checkpoint capturing buffer text alongside cursor coordinates.
+#[derive(Clone, Debug)]
+pub struct UndoSnapshot {
+    pub rope: Rope,
+    pub cursor_x: usize,
+    pub cursor_y: usize,
 }
 
 // === Editor Buffer Model ===
@@ -573,8 +560,10 @@ pub struct Editor {
     pub command_buffer: String,
     /// Buffered multi-key sequence prefix (e.g., initial `'g'` in a `"gg"` motion).
     pub pending_key: Option<char>,
-    /// Undo history ring storing previous [`Rope`] states (bounded to 64 snapshots).
-    pub undo_stack: Vec<Rope>,
+    /// Undo history ring storing previous state snapshots (bounded to 64 snapshots).
+    pub undo_stack: Vec<UndoSnapshot>,
+    /// Tracks if an undo checkpoint has been recorded for the ongoing continuous insert run.
+    pub insert_snapshot_taken: bool,
     /// Syntax engine instance driving AST parsing and lexical syntax highlighting.
     pub syntax: SyntaxEngine,
     /// Diagnostics received from the background LSP server mapped to the active document.
@@ -627,11 +616,6 @@ pub struct Editor {
 
 impl Editor {
     /// Instantiates a new editor buffer.
-    ///
-    /// If `path` is provided and points to an existing file, its contents are ingested into
-    /// the [`Rope`] via buffered I/O. Otherwise, an empty rope is initialized. Also sets up
-    /// the syntax engine, initializes the file explorer from the current working directory,
-    /// and resets cursor coordinates.
     pub fn new(path: Option<&PathBuf>) -> Result<Self> {
         let is_dir_target = path.is_some_and(|p| p.is_dir());
 
@@ -668,10 +652,6 @@ impl Editor {
             explorer.visible = true;
         }
 
-        // Anchor config resolution to the project root (the opened file's
-        // parent directory, or the opened directory itself) rather than the
-        // ambient process working directory, so `.subject0` is found and
-        // saved consistently regardless of where `s0` was launched from.
         let config = AppConfig::load_from(&root_dir);
         let initial_wrap = config.line_wrap;
 
@@ -698,6 +678,7 @@ impl Editor {
             command_buffer: String::new(),
             pending_key: None,
             undo_stack: Vec::new(),
+            insert_snapshot_taken: false,
             syntax,
             diagnostics: Vec::new(),
             lsp_status: LspStatus::Disabled,
@@ -721,11 +702,55 @@ impl Editor {
         })
     }
 
+    /// Sets the active mode and manages transactional insert checkpoints.
+    pub fn set_mode(&mut self, mode: Mode) {
+        if self.mode != mode {
+            if matches!(mode, Mode::Insert) {
+                self.insert_snapshot_taken = false;
+            }
+            self.mode = mode;
+            self.clamp_cursor();
+        }
+    }
+
+    /// Ensures an undo snapshot is taken on the first edit of an insertion sequence.
+    fn check_insert_snapshot(&mut self) {
+        if !self.insert_snapshot_taken {
+            self.snapshot();
+            self.insert_snapshot_taken = true;
+        }
+    }
+
+    /// Detects whether the active buffer uses CRLF (`\r\n`) or LF (`\n`) line terminators.
+    pub fn detect_line_ending(&self) -> &'static str {
+        let sample_lines = self.rope.len_lines().min(64);
+        for i in 0..sample_lines {
+            let line = self.rope.line(i);
+            let len = line.len_chars();
+            if len >= 2 && line.char(len - 1) == '\n' && line.char(len - 2) == '\r' {
+                return "\r\n";
+            }
+        }
+        "\n"
+    }
+
+    /// Translates `cursor_x` into a UTF-16 code unit offset for standard LSP compatibility.
+    pub fn cursor_utf16_col(&self) -> usize {
+        if self.cursor_y >= self.rope.len_lines() {
+            return 0;
+        }
+        let line = self.rope.line(self.cursor_y);
+        let mut utf16_count = 0;
+        for (char_idx, ch) in line.chars().enumerate() {
+            if char_idx >= self.cursor_x {
+                break;
+            }
+            utf16_count += ch.len_utf16();
+        }
+        utf16_count
+    }
+
     /// Loads a new file from disk into the current editor buffer.
-    ///
-    /// Replaces the underlying [`Rope`], resets cursor and scroll coordinates, clears the
-    /// undo stack and diagnostics, reconfigures the [`SyntaxEngine`], and sends a
-    /// `textDocument/didOpen` notification over `lsp_tx` if a language server is connected.
     pub fn open_file<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
         let path_buf = path.as_ref().to_path_buf();
         let file = File::open(&path_buf)?;
@@ -737,6 +762,7 @@ impl Editor {
         self.scroll_y = 0;
         self.modified = false;
         self.undo_stack.clear();
+        self.insert_snapshot_taken = false;
         self.diagnostics.clear();
         self.completion_visible = false;
 
@@ -767,6 +793,38 @@ impl Editor {
 
         self.status_msg = format!("Opened {}", path_buf.display());
         Ok(())
+    }
+
+    /// Updates internal path mapping and notifies or spawns LSP instances accordingly.
+    pub fn switch_file_target(&mut self, new_path: PathBuf) {
+        let abs_path = if new_path.is_absolute() {
+            new_path
+        } else if let Ok(cwd) = env::current_dir() {
+            cwd.join(new_path)
+        } else {
+            new_path
+        };
+
+        self.path = Some(abs_path.clone());
+        self.syntax = SyntaxEngine::new(Some(&abs_path));
+        let text = self.rope.to_string();
+        self.syntax.reparse(&text);
+
+        let lang_id = self.syntax.language.lsp_id();
+        if !lang_id.is_empty() && lang_id != "plaintext" {
+            if self.lsp_tx.is_some() && self.active_lsp_lang.as_deref() == Some(lang_id) {
+                if let Some(tx) = &self.lsp_tx {
+                    let _ = tx.send(LspInbound::OpenFile {
+                        path: abs_path,
+                        text,
+                        lang_id: lang_id.to_string(),
+                    });
+                    self.request_semantic_tokens();
+                }
+            } else {
+                self.ensure_lsp_for_file(&abs_path);
+            }
+        }
     }
 
     /// Spawns or configures an LSP server instance matching the target file.
@@ -832,8 +890,6 @@ impl Editor {
     }
 
     /// Dispatches an asynchronous `textDocument/semanticTokens/full` request to the LSP actor.
-    ///
-    /// Bypassed if Tree-sitter is available to prevent LSP responses from overriding AST highlights.
     pub fn request_semantic_tokens(&mut self) {
         if self.syntax.has_treesitter() {
             return;
@@ -846,42 +902,40 @@ impl Editor {
         }
     }
 
-
-    /// Pushes a snapshot of the current [`Rope`] onto `undo_stack`.
-    ///
-    /// History depth is bounded to 64 entries. When capacity is exceeded, the oldest
-    /// snapshot is dropped. Clones of [`Rope`] are cheap $O(1)$ operations due to internal
-    /// structural sharing.
+    /// Pushes a snapshot of the current [`Rope`] and cursor coordinates onto `undo_stack`.
     pub fn snapshot(&mut self) {
         if self.undo_stack.len() >= 64 {
             self.undo_stack.remove(0);
         }
-        self.undo_stack.push(self.rope.clone());
+        self.undo_stack.push(UndoSnapshot {
+            rope: self.rope.clone(),
+            cursor_x: self.cursor_x,
+            cursor_y: self.cursor_y,
+        });
     }
 
     /// Reverts the document rope to the most recent checkpoint on `undo_stack`.
-    ///
-    /// Clamps cursor coordinates to the reverted buffer boundaries and triggers
-    /// re-parsing and LSP change notifications via [`Self::on_buffer_modified`].
     pub fn undo(&mut self) {
         if let Some(prev) = self.undo_stack.pop() {
-            self.rope = prev;
+            self.rope = prev.rope;
+            self.cursor_x = prev.cursor_x;
+            self.cursor_y = prev.cursor_y;
             self.modified = true;
             self.status_msg = "Reverted change".to_string();
+            self.insert_snapshot_taken = false;
             self.clamp_cursor();
             self.on_buffer_modified();
         }
     }
 
-    /// Synchronizes external subsystems following a buffer mutation.
-    ///
-    /// 1. Regenerates AST highlighting caches via [`SyntaxEngine::reparse`].
-    /// 2. Increments [`Self::doc_version`].
-    /// 3. Emits an [`LspInbound::Change`] event to the background LSP actor.
+    /// Synchronizes external subsystems and invalidates stale diagnostics following a mutation.
     pub fn on_buffer_modified(&mut self) {
         let text = self.rope.to_string();
         self.syntax.reparse(&text);
         self.doc_version += 1;
+
+        let max_lines = self.rope.len_lines().max(1);
+        self.diagnostics.retain(|d| d.line < max_lines);
 
         if let Some(tx) = &self.lsp_tx {
             let _ = tx.send(LspInbound::Change {
@@ -892,15 +946,14 @@ impl Editor {
         }
     }
 
-
-    /// Dispatches an asynchronous `textDocument/completion` request to the LSP actor
-    /// corresponding to the current cursor position.
+    /// Dispatches an asynchronous `textDocument/completion` request using UTF-16 coordinates.
     pub fn request_completions(&mut self) {
         if let Some(tx) = &self.lsp_tx {
             self.lsp_req_id += 1;
+            let col = self.cursor_utf16_col();
             let _ = tx.send(LspInbound::Completion {
                 line: self.cursor_y,
-                col: self.cursor_x,
+                col,
                 req_id: self.lsp_req_id,
             });
         }
@@ -928,8 +981,6 @@ impl Editor {
     }
 
     /// Scans backward from `cursor_x` on the current line to extract the active identifier prefix.
-    ///
-    /// Used to compute the text slice to be replaced when accepting an autocomplete candidate.
     pub fn current_word_prefix(&self) -> String {
         if self.cursor_y >= self.rope.len_lines() {
             return String::new();
@@ -953,8 +1004,6 @@ impl Editor {
     }
 
     /// Calculates the half-open linear character range `[start, end)` representing the active visual selection.
-    ///
-    /// Returns `None` if the editor is not in [`Mode::Visual`].
     #[allow(clippy::comparison_chain)]
     pub fn selection_range(&self) -> Option<(usize, usize)> {
         if let Mode::Visual { anchor_x, anchor_y } = self.mode {
@@ -1007,41 +1056,37 @@ impl Editor {
         }
     }
 
-    /// Enters [`Mode::Visual`] spanning the entirety of the buffer from `(0, 0)` to the final character.
+    /// Enters [`Mode::Visual`] spanning the entirety of the buffer.
     pub fn select_all(&mut self) {
         if self.rope.len_chars() == 0 {
             return;
         }
-        self.mode = Mode::Visual {
+        self.set_mode(Mode::Visual {
             anchor_x: 0,
             anchor_y: 0,
-        };
+        });
         self.cursor_y = self.rope.len_lines().saturating_sub(1);
         self.cursor_x = self.current_line_len();
         self.status_msg = "Selected all".to_string();
     }
 
     /// Copies selected text (or the entire current line if no selection is active) into [`Self::clipboard`].
-    ///
-    /// Reverts mode to [`Mode::Normal`].
     pub fn yank_selection(&mut self) {
         if let Some((start, end)) = self.selection_range() {
             if start < end {
                 let slice = self.rope.slice(start..end);
                 self.clipboard = slice.to_string();
-                self.status_msg = format!("Yanked {} chars", self.clipboard.len());
+                self.status_msg = format!("Yanked {} chars", self.clipboard.chars().count());
             }
-        } else {
+        } else if self.cursor_y < self.rope.len_lines() {
             let line = self.rope.line(self.cursor_y);
             self.clipboard = line.to_string();
             self.status_msg = "Yanked line".to_string();
         }
-        self.mode = Mode::Normal;
+        self.set_mode(Mode::Normal);
     }
 
     /// Deletes characters encompassed by the active visual selection, storing them in [`Self::clipboard`].
-    ///
-    /// Records an undo snapshot, repositions the cursor to the deletion origin, and returns to [`Mode::Normal`].
     pub fn delete_selection(&mut self) {
         if let Some((start, end)) = self.selection_range()
             && start < end
@@ -1051,13 +1096,13 @@ impl Editor {
             self.clipboard = slice.to_string();
             self.rope.remove(start..end);
             self.modified = true;
-            self.status_msg = format!("Deleted {} chars", self.clipboard.len());
+            self.status_msg = format!("Deleted {} chars", self.clipboard.chars().count());
 
             let new_cursor_line = self.rope.char_to_line(start);
             let line_start = self.rope.line_to_char(new_cursor_line);
             self.cursor_y = new_cursor_line;
             self.cursor_x = start.saturating_sub(line_start);
-            self.mode = Mode::Normal;
+            self.set_mode(Mode::Normal);
             self.clamp_cursor();
             self.on_buffer_modified();
         }
@@ -1071,7 +1116,7 @@ impl Editor {
         }
 
         self.snapshot();
-        let idx = self.char_index();
+        let idx = self.char_index().min(self.rope.len_chars());
         self.rope.insert(idx, &self.clipboard);
         let end_idx = idx + self.clipboard.chars().count();
         let new_line = self.rope.char_to_line(end_idx);
@@ -1104,33 +1149,33 @@ impl Editor {
                 self.rope.remove(start..end);
                 self.rope.insert(start, &toggled);
                 self.modified = true;
-                self.mode = Mode::Normal;
+                self.set_mode(Mode::Normal);
                 self.on_buffer_modified();
             }
         } else {
-            let idx = self.char_index();
-            if idx < self.rope.len_chars() {
-                self.snapshot();
-                let c = self.rope.char(idx);
-                let toggled = if c.is_uppercase() {
-                    c.to_lowercase().next().unwrap_or(c)
-                } else {
-                    c.to_uppercase().next().unwrap_or(c)
-                };
-                self.rope.remove(idx..=idx);
-                self.rope.insert_char(idx, toggled);
-                self.cursor_x += 1;
-                self.modified = true;
-                self.clamp_cursor();
-                self.on_buffer_modified();
+            let line_len = self.current_line_len();
+            if self.cursor_x < line_len {
+                let idx = self.char_index();
+                if idx < self.rope.len_chars() {
+                    self.snapshot();
+                    let c = self.rope.char(idx);
+                    let toggled = if c.is_uppercase() {
+                        c.to_lowercase().next().unwrap_or(c)
+                    } else {
+                        c.to_uppercase().next().unwrap_or(c)
+                    };
+                    self.rope.remove(idx..=idx);
+                    self.rope.insert_char(idx, toggled);
+                    self.cursor_x += 1;
+                    self.modified = true;
+                    self.clamp_cursor();
+                    self.on_buffer_modified();
+                }
             }
         }
     }
 
     /// Merges the line below the current cursor line onto the current line.
-    ///
-    /// Replaces the newline delimiter and any leading indentation on the next line
-    /// with a single whitespace character.
     pub fn join_lines(&mut self) {
         if self.cursor_y + 1 >= self.rope.len_lines() {
             return;
@@ -1165,7 +1210,12 @@ impl Editor {
         }
         self.rope.insert_char(insert_pos, ' ');
 
+        self.cursor_y = self.rope.char_to_line(insert_pos);
+        let line_start = self.rope.line_to_char(self.cursor_y);
+        self.cursor_x = insert_pos.saturating_sub(line_start);
+
         self.modified = true;
+        self.clamp_cursor();
         self.on_buffer_modified();
         self.status_msg = "Joined lines".to_string();
     }
@@ -1173,6 +1223,7 @@ impl Editor {
     /// Creates an empty line beneath the current line and switches into [`Mode::Insert`].
     pub fn insert_line_below(&mut self) {
         self.snapshot();
+        let le = self.detect_line_ending();
         let indent: String = if self.cursor_y < self.rope.len_lines() {
             self.rope
                 .line(self.cursor_y)
@@ -1204,16 +1255,17 @@ impl Editor {
 
         let insert_idx = line_start + line_len_with_nl;
         let to_insert = if has_newline {
-            format!("{indent}\n")
+            format!("{indent}{le}")
         } else {
-            format!("\n{indent}")
+            format!("{le}{indent}")
         };
 
         self.rope.insert(insert_idx, &to_insert);
         self.cursor_y += 1;
         self.cursor_x = indent.chars().count();
         self.modified = true;
-        self.mode = Mode::Insert;
+        self.set_mode(Mode::Insert);
+        self.insert_snapshot_taken = true;
         self.completion_visible = false;
         self.on_buffer_modified();
     }
@@ -1221,6 +1273,7 @@ impl Editor {
     /// Creates an empty line above the current line and switches into [`Mode::Insert`].
     pub fn insert_line_above(&mut self) {
         self.snapshot();
+        let le = self.detect_line_ending();
         let indent: String = if self.cursor_y < self.rope.len_lines() {
             self.rope
                 .line(self.cursor_y)
@@ -1237,17 +1290,19 @@ impl Editor {
             0
         };
 
-        let to_insert = format!("{indent}\n");
+        let to_insert = format!("{indent}{le}");
         self.rope.insert(idx, &to_insert);
         self.cursor_x = indent.chars().count();
         self.modified = true;
-        self.mode = Mode::Insert;
+        self.set_mode(Mode::Insert);
+        self.insert_snapshot_taken = true;
         self.completion_visible = false;
         self.on_buffer_modified();
     }
 
     /// Inserts a single unicode character at the current cursor offset and advances the cursor.
     pub fn insert_char(&mut self, c: char) {
+        self.check_insert_snapshot();
         let idx = self.char_index();
         self.rope.insert_char(idx, c);
         self.cursor_x += 1;
@@ -1257,6 +1312,7 @@ impl Editor {
 
     /// Inserts an opening and closing delimiter pair, placing the cursor between them.
     pub fn insert_pair(&mut self, open: char, close: char) {
+        self.check_insert_snapshot();
         let idx = self.char_index();
         self.rope.insert_char(idx, open);
         self.rope.insert_char(idx + 1, close);
@@ -1266,11 +1322,9 @@ impl Editor {
     }
 
     /// Inserts a newline character with automatic indentation preservation.
-    ///
-    /// Detects leading whitespace on the active line and replicates it onto the new line.
-    /// If the cursor is positioned directly between `{` and `}`, it expands the block
-    /// across three lines with an additional four spaces of nested indentation.
     pub fn insert_newline(&mut self) {
+        self.check_insert_snapshot();
+        let le = self.detect_line_ending();
         let idx = self.char_index();
         let current_line = if self.cursor_y < self.rope.len_lines() {
             self.rope.line(self.cursor_y).to_string()
@@ -1296,15 +1350,15 @@ impl Editor {
 
         if char_before == Some('{') && char_after == Some('}') {
             let inner_indent = format!("{indent}    ");
-            let to_insert = format!("\n{inner_indent}\n{indent}");
+            let to_insert = format!("{le}{inner_indent}{le}{indent}");
             self.rope.insert(idx, &to_insert);
             self.cursor_y += 1;
             self.cursor_x = inner_indent.chars().count();
         } else {
-            let to_insert = format!("\n{indent}");
+            let to_insert = format!("{le}{indent}");
             self.rope.insert(idx, &to_insert);
             self.cursor_y += 1;
-            self.cursor_x = indent.chars().count();
+            self.cursor_x = inner_indent_len(&indent);
         }
 
         self.modified = true;
@@ -1313,10 +1367,8 @@ impl Editor {
     }
 
     /// Deletes the character before the cursor or handles multi-character boundary conditions.
-    ///
-    /// - If the cursor is between an auto-closed pair (e.g., `()` or `{}`), both are removed.
-    /// - If at the start of a line (`cursor_x == 0`), joins the current line with the previous line.
     pub fn backspace(&mut self) {
+        self.check_insert_snapshot();
         if self.cursor_x > 0 {
             let idx = self.char_index();
             let char_before = self.rope.char(idx - 1);
@@ -1377,9 +1429,6 @@ impl Editor {
     }
 
     /// Applies the selected completion candidate into the buffer.
-    ///
-    /// Replaces the current typed identifier prefix with the candidate's `insert_text`,
-    /// repositions the cursor at the end of the insertion, and dismisses the popup.
     pub fn accept_completion(&mut self) {
         if !self.completion_visible || self.completions.is_empty() {
             return;
@@ -1423,14 +1472,15 @@ impl Editor {
         }
     }
 
-    /// Deletes the entire active line including its trailing newline delimiter and stores it in [`Self::clipboard`].
+    /// Deletes the entire active line and stores it in [`Self::clipboard`].
     pub fn delete_current_line(&mut self) {
         if self.rope.len_lines() == 0 {
             return;
         }
         self.snapshot();
+        let num_lines = self.rope.len_lines();
         let start = self.rope.line_to_char(self.cursor_y);
-        let end = if self.cursor_y + 1 < self.rope.len_lines() {
+        let end = if self.cursor_y + 1 < num_lines {
             self.rope.line_to_char(self.cursor_y + 1)
         } else {
             self.rope.len_chars()
@@ -1439,10 +1489,17 @@ impl Editor {
         if start < end {
             self.clipboard = self.rope.slice(start..end).to_string();
             self.rope.remove(start..end);
-            self.modified = true;
-            self.status_msg = "Cut line".to_string();
-            self.on_buffer_modified();
+        } else if start == end && self.cursor_y > 0 {
+            let prev_line_start = self.rope.line_to_char(self.cursor_y - 1);
+            let line_del = prev_line_start + line_len(&self.rope, self.cursor_y - 1);
+            if line_del < start {
+                self.clipboard = self.rope.slice(line_del..start).to_string();
+                self.rope.remove(line_del..start);
+            }
         }
+        self.modified = true;
+        self.status_msg = "Cut line".to_string();
+        self.on_buffer_modified();
 
         if self.cursor_y >= self.rope.len_lines() && self.cursor_y > 0 {
             self.cursor_y -= 1;
@@ -1450,17 +1507,30 @@ impl Editor {
         self.clamp_cursor();
     }
 
-    /// Flushes the rope buffer out to the underlying file path using buffered I/O.
-    ///
-    /// Clears `modified`, updates `status_msg`, and notifies the LSP actor via [`LspInbound::Save`].
+    /// Safely writes the rope buffer to disk using atomic filesystem renaming.
     pub fn save(&mut self) -> Result<()> {
         if let Some(path) = &self.path {
-            let file = File::create(path)?;
-            let mut writer = BufWriter::new(file);
-            for chunk in self.rope.chunks() {
-                writer.write_all(chunk.as_bytes())?;
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
             }
-            writer.flush()?;
+
+            let file_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("s0_buffer");
+            let tmp_path = path.with_file_name(format!(".{file_name}.s0_tmp"));
+
+            {
+                let file = File::create(&tmp_path)?;
+                let mut writer = BufWriter::new(file);
+                for chunk in self.rope.chunks() {
+                    writer.write_all(chunk.as_bytes())?;
+                }
+                writer.flush()?;
+            }
+
+            fs::rename(&tmp_path, path)?;
+
             self.modified = false;
             self.status_msg = format!("Saved {}", path.display());
 
@@ -1504,10 +1574,10 @@ impl Editor {
             }
             CommandId::QuitForce => self.should_quit = true,
             CommandId::EnterVisual => {
-                self.mode = Mode::Visual {
+                self.set_mode(Mode::Visual {
                     anchor_x: self.cursor_x,
                     anchor_y: self.cursor_y,
-                };
+                });
             }
             CommandId::InsertBelow => self.insert_line_below(),
             CommandId::InsertAbove => self.insert_line_above(),
@@ -1553,15 +1623,6 @@ impl Editor {
     }
 
     /// Evaluates and executes the ex-command string buffered in `command_buffer`.
-    ///
-    /// Supported commands:
-    /// - `:q` - Quit (fails if unsaved changes exist)
-    /// - `:q!` - Force quit discarding changes
-    /// - `:w` - Save buffer
-    /// - `:wq` - Save buffer and quit
-    /// - `:wrap` - Toggle line wrapping
-    /// - `:e`, `:explore` - Toggle sidebar file explorer
-    /// - `:p`, `:menu`, `:commands`, `:pal` - Open interactive command palette
     pub fn execute_command(&mut self) {
         let cmd = self.command_buffer.trim().to_string();
         self.command_buffer.clear();
@@ -1583,21 +1644,13 @@ impl Editor {
             }
             "w" => {
                 if let Some(filename) = arg {
-                    let new_path = PathBuf::from(filename);
-                    self.syntax = SyntaxEngine::new(Some(&new_path));
-                    let text = self.rope.to_string();
-                    self.syntax.reparse(&text);
-                    self.path = Some(new_path);
+                    self.switch_file_target(PathBuf::from(filename));
                 }
                 let _ = self.save();
             }
             "wq" => {
                 if let Some(filename) = arg {
-                    let new_path = PathBuf::from(filename);
-                    self.syntax = SyntaxEngine::new(Some(&new_path));
-                    let text = self.rope.to_string();
-                    self.syntax.reparse(&text);
-                    self.path = Some(new_path);
+                    self.switch_file_target(PathBuf::from(filename));
                 }
                 if self.save().is_ok() {
                     self.should_quit = true;
@@ -1636,10 +1689,6 @@ impl Editor {
     }
 
     /// Enforces modal cursor constraints against buffer boundaries.
-    ///
-    /// - Restricts `cursor_y` to `[0, len_lines - 1]`.
-    /// - In [`Mode::Insert`], restricts `cursor_x` to `[0, line_len]`.
-    /// - In non-insert modes, restricts `cursor_x` to `[0, line_len - 1]`.
     pub fn clamp_cursor(&mut self) {
         let max_lines = self.rope.len_lines().max(1);
         if self.cursor_y >= max_lines {
@@ -1659,7 +1708,7 @@ impl Editor {
 
     /// Recalculates horizontal and vertical scroll offsets so the cursor remains visible.
     pub fn update_scroll(&mut self, width: usize, height: usize) {
-        if height == 0 {
+        if height == 0 || width == 0 {
             return;
         }
 
@@ -1671,7 +1720,6 @@ impl Editor {
             self.scroll_x = 0;
             let effective_width = width.max(1);
 
-            // Calculate the actual visual screen row of the cursor relative to scroll_y
             let calc_cursor_visual_row =
                 |start_y: usize, cursor_y: usize, cursor_x: usize, rope: &Rope| -> usize {
                     let mut rows = 0;
@@ -1695,7 +1743,6 @@ impl Editor {
                     rows + cursor_sub_row
                 };
 
-            // Advance scroll_y as soon as the cursor hits or exceeds the viewport bottom
             while self.scroll_y < self.cursor_y
                 && calc_cursor_visual_row(self.scroll_y, self.cursor_y, self.cursor_x, &self.rope)
                     >= height
@@ -1714,6 +1761,11 @@ impl Editor {
             }
         }
     }
+}
+
+/// Helper function to compute character length for indentation strings.
+fn inner_indent_len(indent: &str) -> usize {
+    indent.chars().count()
 }
 
 /// Calculates the printable character count of a rope line, stripping trailing `\r` and `\n`.

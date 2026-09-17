@@ -14,8 +14,8 @@
 //! 2. **Syntax Highlighting Engine ([`SyntaxEngine`])**:
 //!    A token-level lexical analyzer and tree-sitter parser wrapper that transforms raw buffer
 //!    slices into styled Ratatui [`Span`] sequences for terminal rendering. It provides
-//!    per-language keyword, literal, comment, and identifier highlighting for Rust, Python,
-//!    and Markdown, as well as glyph and color resolution for file trees and completion menus.
+//!    per-language keyword, literal, comment, and identifier highlighting for 100+ languages,
+//!    as well as glyph and color resolution for file trees and completion menus.
 
 use anyhow::{Result, anyhow};
 use ratatui::{
@@ -38,15 +38,11 @@ use tokio::{
 // === LSP Types & Actor Protocol ===
 
 /// Represents a single diagnostic entry emitted by an LSP server.
-///
-/// Diagnostics report errors, warnings, lints, and hints detected by background
-/// language servers (e.g., compiler diagnostic output from `rust-analyzer`).
 #[derive(Debug, Clone)]
 pub struct DiagnosticItem {
     /// Zero-based line number within the buffer where the diagnostic begins.
     pub line: usize,
     /// Zero-based character/column offset within the line where the diagnostic begins.
-    #[allow(dead_code)]
     pub col: usize,
     /// Human-readable diagnostic description or compiler error message.
     pub message: String,
@@ -59,21 +55,15 @@ pub struct DiagnosticItem {
 }
 
 /// An individual code completion candidate returned by the LSP server.
-///
-/// Corresponds to the LSP `CompletionItem` interface, carrying display labels,
-/// insertion text, and categorization metadata used to render popup completion menus.
 #[derive(Debug, Clone)]
 pub struct SuggestionItem {
     /// The primary label displayed in the completion popup menu (e.g., method name).
     pub label: String,
     /// The exact text that should be placed into the buffer if this item is accepted.
-    /// Defaults to [`Self::label`] when the server does not specify an explicit `insertText`.
     pub insert_text: String,
     /// Optional auxiliary information (such as function signature or containing module).
-    #[allow(dead_code)]
     pub detail: Option<String>,
     /// Numeric LSP `CompletionItemKind` discriminant (e.g., `2` for Method, `3` for Function).
-    /// Used by [`completion_kind_icon`] to render appropriate UI glyphs.
     pub kind: u64,
 }
 
@@ -132,43 +122,58 @@ impl CanonicalTokenType {
 
     /// Maps standard Tree-sitter query capture names into unified theme tokens.
     pub fn from_query_capture(capture_name: &str) -> Self {
-        if capture_name.starts_with("keyword")
-            || capture_name.starts_with("repeat")
-            || capture_name.starts_with("conditional")
-            || capture_name.starts_with("include")
+        let name = capture_name.trim_start_matches('@');
+        if name.starts_with("keyword")
+            || name.starts_with("repeat")
+            || name.starts_with("conditional")
+            || name.starts_with("include")
+            || name.starts_with("storage")
+            || name == "exception"
         {
             Self::Keyword
-        } else if capture_name.starts_with("type")
-            || capture_name.starts_with("structure")
-            || capture_name.starts_with("class")
-            || capture_name.starts_with("storageclass")
+        } else if name.starts_with("type")
+            || name.starts_with("structure")
+            || name.starts_with("class")
+            || name.starts_with("storageclass")
+            || name.starts_with("interface")
+            || name.starts_with("enum")
+            || name.starts_with("union")
         {
             Self::Type
-        } else if capture_name.starts_with("function")
-            || capture_name.starts_with("method")
-            || capture_name.starts_with("constructor")
+        } else if name.starts_with("function")
+            || name.starts_with("method")
+            || name.starts_with("constructor")
         {
             Self::Function
-        } else if capture_name.starts_with("variable.parameter") || capture_name == "parameter" {
+        } else if name.starts_with("variable.parameter") || name == "parameter" {
             Self::Parameter
-        } else if capture_name.starts_with("variable") {
+        } else if name.starts_with("variable") {
             Self::Variable
-        } else if capture_name.starts_with("property") || capture_name.starts_with("field") {
+        } else if name.starts_with("property")
+            || name.starts_with("field")
+            || name.starts_with("member")
+        {
             Self::Property
-        } else if capture_name.starts_with("string") || capture_name.starts_with("character") {
+        } else if name.starts_with("string") || name.starts_with("character") {
             Self::String
-        } else if capture_name.starts_with("number")
-            || capture_name.starts_with("float")
-            || capture_name.starts_with("boolean")
+        } else if name.starts_with("number")
+            || name.starts_with("float")
+            || name.starts_with("boolean")
         {
             Self::Number
-        } else if capture_name.starts_with("comment") {
+        } else if name.starts_with("comment") || name.starts_with("doc") {
             Self::Comment
-        } else if capture_name.starts_with("operator") {
+        } else if name.starts_with("operator") {
             Self::Operator
-        } else if capture_name.starts_with("macro") || capture_name.starts_with("attribute") {
+        } else if name.starts_with("macro")
+            || name.starts_with("attribute")
+            || name.starts_with("annotation")
+        {
             Self::Macro
-        } else if capture_name.starts_with("module") || capture_name.starts_with("namespace") {
+        } else if name.starts_with("module")
+            || name.starts_with("namespace")
+            || name.starts_with("package")
+        {
             Self::Namespace
         } else {
             Self::Other
@@ -188,7 +193,6 @@ pub struct SemanticTokenSpan {
 /// Commands and notifications routed from the editor frontend into the background LSP actor.
 pub enum LspInbound {
     /// Broadcasts an edit notification (`textDocument/didChange`) to synchronize document state.
-    /// Uses full-document synchronization (`TextDocumentSyncKind::Full = 1`).
     Change {
         /// Full snapshot of the updated document buffer.
         text: String,
@@ -201,7 +205,7 @@ pub enum LspInbound {
     Completion {
         /// Zero-based line number of the cursor.
         line: usize,
-        /// Zero-based UTF-16 character/column index of the cursor.
+        /// Zero-based character column index of the cursor.
         col: usize,
         /// Correlation identifier used to pair the asynchronous response with this request.
         req_id: i64,
@@ -217,7 +221,7 @@ pub enum LspInbound {
         path: PathBuf,
         /// Complete textual contents of the file at the moment of opening.
         text: String,
-        /// LSP language identifier string (e.g., `"rust"`, `"python"`).
+        /// LSP language identifier string.
         lang_id: String,
     },
 }
@@ -239,13 +243,14 @@ pub enum LspOutbound {
     SemanticTokens { tokens: Vec<SemanticTokenSpan> },
 }
 
+/// Helper function to resolve the user's home directory cross-platform.
+fn get_home_dir() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
 /// Searches the host system to resolve the absolute path to an executable binary.
-///
-/// # Search Order
-/// 1. Each directory entry listed in the system `$PATH` environment variable.
-/// 2. `$HOME/.cargo/bin/<cmd>` (standard location for Rust toolchain binaries like `rust-analyzer`).
-///
-/// Returns `Some(PathBuf)` if an existing file matches `cmd`, or `None` if resolution fails.
 pub fn resolve_binary_path(cmd: &str) -> Option<PathBuf> {
     if let Ok(path_var) = env::var("PATH") {
         for dir in env::split_paths(&path_var) {
@@ -253,21 +258,37 @@ pub fn resolve_binary_path(cmd: &str) -> Option<PathBuf> {
             if candidate.is_file() {
                 return Some(candidate);
             }
+            #[cfg(target_os = "windows")]
+            {
+                let candidate_exe = dir.join(format!("{cmd}.exe"));
+                if candidate_exe.is_file() {
+                    return Some(candidate_exe);
+                }
+                let candidate_cmd = dir.join(format!("{cmd}.cmd"));
+                if candidate_cmd.is_file() {
+                    return Some(candidate_cmd);
+                }
+            }
         }
     }
-    if let Ok(home) = env::var("HOME") {
-        let cargo_bin = PathBuf::from(home).join(".cargo/bin").join(cmd);
+
+    if let Some(home) = get_home_dir() {
+        let cargo_bin = home.join(".cargo/bin").join(cmd);
         if cargo_bin.is_file() {
             return Some(cargo_bin);
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let cargo_bin_exe = home.join(".cargo/bin").join(format!("{cmd}.exe"));
+            if cargo_bin_exe.is_file() {
+                return Some(cargo_bin_exe);
+            }
         }
     }
     None
 }
 
 /// Converts a local filesystem path into an RFC 3986 compliant `file://` URI string.
-///
-/// If `path` is relative, it is resolved against the current working directory before
-/// constructing the URI scheme to ensure language servers receive canonical paths.
 pub fn file_to_uri(path: &Path) -> String {
     let abs = if path.is_absolute() {
         path.to_path_buf()
@@ -285,24 +306,78 @@ pub fn file_to_uri(path: &Path) -> String {
     }
 }
 
+/// Case-insensitive URI matcher supporting Windows drive letter and trailing slash quirks.
+fn uris_match(a: &str, b: &str) -> bool {
+    a.trim_end_matches('/')
+        .eq_ignore_ascii_case(b.trim_end_matches('/'))
+}
+
+/// Maps a UTF-16 code unit offset within a line string into a 0-based character (Unicode scalar) index.
+pub fn utf16_to_char_col(line: &str, utf16_col: usize) -> usize {
+    let mut current_utf16 = 0usize;
+    let mut char_count = 0usize;
+    for c in line.chars() {
+        if current_utf16 >= utf16_col {
+            break;
+        }
+        current_utf16 += c.len_utf16();
+        char_count += 1;
+    }
+    char_count
+}
+
+/// Strips LSP snippet markup (e.g. `${1:foo}` -> `foo`, `$0` -> ``, `\$` -> `$`) into clean plain text.
+pub fn parse_snippet_to_plain_text(snippet: &str) -> String {
+    let mut result = String::with_capacity(snippet.len());
+    let mut chars = snippet.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '$' {
+            if let Some(&'{') = chars.peek() {
+                chars.next();
+                let mut placeholder = String::new();
+                let mut has_colon = false;
+                for ch in chars.by_ref() {
+                    if ch == '}' {
+                        break;
+                    }
+                    if ch == ':' && !has_colon {
+                        has_colon = true;
+                        continue;
+                    }
+                    if has_colon {
+                        placeholder.push(ch);
+                    }
+                }
+                result.push_str(&placeholder);
+            } else if let Some(&next_c) = chars.peek() {
+                if next_c.is_ascii_digit() {
+                    chars.next();
+                } else {
+                    result.push(c);
+                }
+            } else {
+                result.push(c);
+            }
+        } else if c == '\\' {
+            if let Some(&next_c) = chars.peek() {
+                if next_c == '$' || next_c == '}' || next_c == '\\' {
+                    result.push(next_c);
+                    chars.next();
+                } else {
+                    result.push(c);
+                }
+            } else {
+                result.push(c);
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
 
 /// Reads a single framed JSON-RPC message from an asynchronous buffered LSP stream.
-///
-/// # Wire Framing Protocol
-/// Conforms to the LSP Base Protocol framing:
-/// ```text
-/// Content-Length: <byte_count>\r\n
-/// \r\n
-/// <raw_json_payload>
-/// ```
-///
-/// Continues parsing header fields until an empty line (`\r\n`) is encountered,
-/// reads exactly `Content-Length` bytes from the stream, and parses the slice as a
-/// [`serde_json::Value`].
-///
-/// # Errors
-/// Returns an error if the underlying stream closes (EOF), if the `Content-Length`
-/// header is absent, or if the payload contains invalid JSON.
 pub async fn read_lsp_message<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> Result<Value> {
     let mut content_length = 0usize;
     let mut line = String::new();
@@ -321,11 +396,13 @@ pub async fn read_lsp_message<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> Res
         if let Some(val) = trimmed_lower.strip_prefix("content-length:") {
             content_length = val.trim().parse::<usize>()?;
         }
-
     }
 
     if content_length == 0 {
         return Err(anyhow!("Missing Content-Length header"));
+    }
+    if content_length > 100 * 1024 * 1024 {
+        return Err(anyhow!("LSP payload exceeds 100MB limit"));
     }
 
     let mut body = vec![0u8; content_length];
@@ -335,12 +412,6 @@ pub async fn read_lsp_message<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> Res
 }
 
 /// Serializes a JSON payload and transmits it over an asynchronous stream with LSP framing headers.
-///
-/// Generates the standard `Content-Length: <len>\r\n\r\n` prefix, writes the payload bytes,
-/// and flushes the destination writer immediately.
-///
-/// # Errors
-/// Returns an error if JSON serialization fails or an I/O write error occurs on `writer`.
 pub async fn send_lsp_message<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     value: &Value,
@@ -369,32 +440,18 @@ pub fn server_cmd_and_args(cmd: &str) -> (String, Vec<&'static str>) {
         | "vscode-css-language-server"
         | "vscode-json-language-server"
         | "yaml-language-server"
-        | "intelephense" => (cmd.to_string(), vec!["--stdio"]),
+        | "intelephense"
+        | "vtsls"
+        | "docker-langserver" => (cmd.to_string(), vec!["--stdio"]),
         "bash-language-server" => ("bash-language-server".to_string(), vec!["start"]),
         "taplo" => ("taplo".to_string(), vec!["lsp", "stdio"]),
         "dart" => ("dart".to_string(), vec!["language-server"]),
         "omnisharp" => ("omnisharp".to_string(), vec!["-lsp"]),
         _ => (cmd.to_string(), vec![]),
-
     }
 }
 
 /// Background actor responsible for orchestrating an LSP server process session.
-///
-/// # Lifecycle Stages
-/// 1. **Binary Discovery**: Resolves the executable path using [`resolve_binary_path`].
-/// 2. **Process Spawning**: Spawns the child process with piped standard I/O handles.
-/// 3. **Handshake**:
-///    - Dispatches the `initialize` request (request ID `1`) configured with client capabilities
-///      (full sync, completion, diagnostics) and current root URI.
-///    - Awaits the response with matching ID `1`.
-///    - Sends the `initialized` notification.
-/// 4. **Document Ingestion**: Sends an initial `textDocument/didOpen` notification with `initial_text`.
-/// 5. **Event Multiplexing**: Enters a bi-directional `tokio::select!` event loop:
-///    - **Inbound (`rx`)**: Processes changes, saves, completions, and file open events,
-///      serializing them to server stdin.
-///    - **Outbound (`stdout`)**: Consumes incoming JSON-RPC notifications and responses,
-///      extracting diagnostics and completion responses and routing them over `tx`.
 pub async fn run_lsp_actor(
     initial_file: PathBuf,
     initial_lang: String,
@@ -441,7 +498,6 @@ pub async fn run_lsp_actor(
     let root_path =
         env::current_dir().map_or_else(|_| ".".to_string(), |p| p.to_string_lossy().to_string());
 
-    // Construct the standard LSP initialization payload announcing client capabilities.
     let init_req = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -458,7 +514,8 @@ pub async fn run_lsp_actor(
             ],
             "capabilities": {
                 "workspace": {
-                    "workspaceFolders": true
+                    "workspaceFolders": true,
+                    "configuration": true
                 },
                 "textDocument": {
                     "synchronization": {
@@ -466,9 +523,9 @@ pub async fn run_lsp_actor(
                         "change": 1,
                         "save": { "includeText": false }
                     },
-                                        "completion": {
+                    "completion": {
                         "completionItem": {
-                            "snippetSupport": false,
+                            "snippetSupport": true,
                             "commitCharactersSupport": true,
                             "documentationFormat": ["plaintext", "markdown"]
                         }
@@ -505,32 +562,66 @@ pub async fn run_lsp_actor(
     }
 
     let mut server_legend: Vec<String> = Vec::new();
+    let init_timeout = tokio::time::sleep(tokio::time::Duration::from_secs(30));
+    tokio::pin!(init_timeout);
 
-    // Await response to initialization request (id == 1) and extract server legend.
+    // Non-blocking initialization loop with cancellation detection and server request responses.
     loop {
-        if let Ok(msg) = read_lsp_message(&mut stdout).await {
-            if msg.get("id").and_then(Value::as_i64) == Some(1) {
-                if let Some(types_arr) = msg
-                    .get("result")
-                    .and_then(|r| r.get("capabilities"))
-                    .and_then(|c| c.get("semanticTokensProvider"))
-                    .and_then(|p| p.get("legend"))
-                    .and_then(|l| l.get("tokenTypes"))
-                    .and_then(Value::as_array)
-                {
-                    server_legend = types_arr
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(ToString::to_string)
-                        .collect();
-                }
-                break;
+        tokio::select! {
+            _ = &mut init_timeout => {
+                let _ = tx.send(LspOutbound::Status(LspStatus::Error(
+                    "LSP initialization timed out".into(),
+                )));
+                return;
             }
-        } else {
-            let _ = tx.send(LspOutbound::Status(LspStatus::Error(
-                "Init rejected".into(),
-            )));
-            return;
+            inbound = rx.recv() => {
+                if inbound.is_none() {
+                    return;
+                }
+            }
+            msg = read_lsp_message(&mut stdout) => {
+                match msg {
+                    Ok(val) => {
+                        // Respond to server-to-client requests that occur during initialization
+                        if let Some(method) = val.get("method").and_then(Value::as_str) {
+                            if let Some(req_id) = val.get("id") {
+                                let resp = serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": req_id,
+                                    "result": if method == "workspace/configuration" {
+                                        serde_json::json!([])
+                                    } else {
+                                        Value::Null
+                                    }
+                                });
+                                let _ = send_lsp_message(&mut stdin, &resp).await;
+                            }
+                        } else if val.get("id").and_then(Value::as_i64) == Some(1) {
+                            if let Some(types_arr) = val
+                                .get("result")
+                                .and_then(|r| r.get("capabilities"))
+                                .and_then(|c| c.get("semanticTokensProvider"))
+                                .and_then(|p| p.get("legend"))
+                                .and_then(|l| l.get("tokenTypes"))
+                                .and_then(Value::as_array)
+                            {
+                                server_legend = types_arr
+                                    .iter()
+                                    .filter_map(Value::as_str)
+                                    .map(ToString::to_string)
+                                    .collect();
+                            }
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(LspOutbound::Status(LspStatus::Error(
+                            format!("Init failed: {e}"),
+                        )));
+                        return;
+                    }
+                }
+            }
         }
     }
 
@@ -558,7 +649,6 @@ pub async fn run_lsp_actor(
         ];
     }
 
-    // Confirm initialization to server.
     let initialized = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "initialized",
@@ -566,7 +656,6 @@ pub async fn run_lsp_actor(
     });
     let _ = send_lsp_message(&mut stdin, &initialized).await;
 
-    // Ingest the initial document contents via didOpen.
     let did_open = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "textDocument/didOpen",
@@ -631,10 +720,19 @@ pub async fn run_lsp_actor(
                         });
                         let _ = send_lsp_message(&mut stdin, &st_req).await;
                     }
-
                     Some(LspInbound::OpenFile { path, text, lang_id }) => {
-
-                        current_file_uri = file_to_uri(&path);
+                        let new_uri = file_to_uri(&path);
+                        if new_uri != current_file_uri {
+                            let did_close = serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "method": "textDocument/didClose",
+                                "params": {
+                                    "textDocument": { "uri": current_file_uri }
+                                }
+                            });
+                            let _ = send_lsp_message(&mut stdin, &did_close).await;
+                            current_file_uri = new_uri;
+                        }
                         let open_req = serde_json::json!({
                             "jsonrpc": "2.0",
                             "method": "textDocument/didOpen",
@@ -649,33 +747,78 @@ pub async fn run_lsp_actor(
                         });
                         let _ = send_lsp_message(&mut stdin, &open_req).await;
                     }
-                    None => break, // Frontend sender dropped; terminate actor.
+                    None => {
+                        // Graceful LSP shutdown sequence
+                        let shutdown_req = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": 999_999,
+                            "method": "shutdown",
+                            "params": null
+                        });
+                        if send_lsp_message(&mut stdin, &shutdown_req).await.is_ok() {
+                            let shutdown_timeout = tokio::time::sleep(tokio::time::Duration::from_millis(500));
+                            tokio::pin!(shutdown_timeout);
+                            loop {
+                                tokio::select! {
+                                    _ = &mut shutdown_timeout => break,
+                                    msg = read_lsp_message(&mut stdout) => {
+                                        if let Ok(v) = msg {
+                                            if v.get("id").and_then(Value::as_i64) == Some(999_999) {
+                                                break;
+                                            }
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            let exit_notif = serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "method": "exit",
+                                "params": null
+                            });
+                            let _ = send_lsp_message(&mut stdin, &exit_notif).await;
+                        }
+                        break;
+                    }
                 }
             }
             msg = read_lsp_message(&mut stdout) => {
                 if let Ok(json) = msg {
-                                        // Handle diagnostics notifications published by the server.
-                    if json.get("method").and_then(|m| m.as_str()) == Some("textDocument/publishDiagnostics") {
-                        if let Some(params) = json.get("params") {
-                            let diag_uri = params.get("uri").and_then(|u| u.as_str()).unwrap_or("");
-                            if diag_uri == current_file_uri
-                                || diag_uri.trim_end_matches('/') == current_file_uri.trim_end_matches('/')
-                            {
-                                let mut items = Vec::new();
-                                if let Some(diag_array) = params.get("diagnostics").and_then(|d| d.as_array()) {
-                                    for d in diag_array {
-                                        let line = d["range"]["start"]["line"].as_u64().unwrap_or(0) as usize;
-                                        let col = d["range"]["start"]["character"].as_u64().unwrap_or(0) as usize;
-                                        let message = d["message"].as_str().unwrap_or("").to_string();
-                                        let severity = d["severity"].as_u64().unwrap_or(1) as u8;
-                                        items.push(DiagnosticItem { line, col, message, severity });
+                    if let Some(method) = json.get("method").and_then(Value::as_str) {
+                        if method == "textDocument/publishDiagnostics" {
+                            if let Some(params) = json.get("params") {
+                                let diag_uri = params.get("uri").and_then(|u| u.as_str()).unwrap_or("");
+                                if uris_match(diag_uri, &current_file_uri) {
+                                    let mut items = Vec::new();
+                                    if let Some(diag_array) = params.get("diagnostics").and_then(Value::as_array) {
+                                        for d in diag_array {
+                                            let line = d["range"]["start"]["line"].as_u64().unwrap_or(0) as usize;
+                                            let col = d["range"]["start"]["character"].as_u64().unwrap_or(0) as usize;
+                                            let message = d["message"].as_str().unwrap_or("").to_string();
+                                            let severity = d["severity"].as_u64().unwrap_or(1) as u8;
+                                            items.push(DiagnosticItem { line, col, message, severity });
+                                        }
                                     }
+                                    let _ = tx.send(LspOutbound::Diagnostics(items));
                                 }
-                                let _ = tx.send(LspOutbound::Diagnostics(items));
                             }
+                        } else if let Some(req_id) = json.get("id") {
+                            // Answer server requests to unblock the language server engine
+                            let resp = serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": req_id,
+                                "result": if method == "workspace/configuration" {
+                                    serde_json::json!([])
+                                } else if method == "workspace/workspaceFolders" {
+                                    serde_json::json!([{ "uri": root_uri, "name": "root" }])
+                                } else {
+                                    Value::Null
+                                }
+                            });
+                            let _ = send_lsp_message(&mut stdin, &resp).await;
                         }
-                        // Handle completion and semantic tokens responses matching a previously sent request ID.
-                        } else if let Some(resp_id) = json.get("id").and_then(Value::as_i64) {
+                    } else if let Some(resp_id) = json.get("id").and_then(Value::as_i64) {
                         let result_val = json.get("result");
 
                         if let Some(req_type) = pending_requests.remove(&resp_id) {
@@ -684,7 +827,7 @@ pub async fn run_lsp_actor(
                                     let mut tokens = Vec::new();
                                     if let Some(data) = result_val
                                         .and_then(|r| r.get("data"))
-                                        .and_then(|d| d.as_array())
+                                        .and_then(Value::as_array)
                                     {
                                         let ints: Vec<usize> = data
                                             .iter()
@@ -694,7 +837,6 @@ pub async fn run_lsp_actor(
                                         let mut cur_line = 0usize;
                                         let mut cur_char = 0usize;
 
-                                        #[allow(clippy::chunks_exact_to_as_chunks)]
                                         for chunk in ints.chunks_exact(5) {
                                             let delta_line = chunk[0];
                                             let delta_start = chunk[1];
@@ -728,33 +870,45 @@ pub async fn run_lsp_actor(
                                     let mut results = Vec::new();
                                     let items_array = result_val.and_then(|r| {
                                         if r.is_array() {
-                                            Some(r.as_array().unwrap())
+                                            r.as_array()
                                         } else {
-                                            r.get("items").and_then(|it| it.as_array())
+                                            r.get("items").and_then(Value::as_array)
                                         }
                                     });
 
                                     if let Some(arr) = items_array {
                                         for item in arr {
                                             if let Some(label) =
-                                                item.get("label").and_then(|l| l.as_str())
+                                                item.get("label").and_then(Value::as_str)
                                             {
-                                                let insert_text = if let Some(it) = item
+                                                let raw_insert_text = if let Some(it) = item
                                                     .get("insertText")
-                                                    .and_then(|it| it.as_str())
+                                                    .and_then(Value::as_str)
                                                 {
                                                     it.to_string()
                                                 } else if let Some(te) = item.get("textEdit") {
                                                     te.get("newText")
-                                                        .and_then(|nt| nt.as_str())
+                                                        .and_then(Value::as_str)
                                                         .unwrap_or(label)
                                                         .to_string()
                                                 } else {
                                                     label.to_string()
                                                 };
+
+                                                let insert_format = item
+                                                    .get("insertTextFormat")
+                                                    .and_then(Value::as_u64)
+                                                    .unwrap_or(1);
+
+                                                let insert_text = if insert_format == 2 {
+                                                    parse_snippet_to_plain_text(&raw_insert_text)
+                                                } else {
+                                                    raw_insert_text
+                                                };
+
                                                 let detail = item
                                                     .get("detail")
-                                                    .and_then(|d| d.as_str())
+                                                    .and_then(Value::as_str)
                                                     .map(ToString::to_string);
                                                 let kind = item
                                                     .get("kind")
@@ -779,10 +933,7 @@ pub async fn run_lsp_actor(
                             }
                         }
                     }
-
                 } else {
-
-                    // Stream closed or unreadable; notify UI and terminate actor.
                     let _ = tx.send(LspOutbound::Status(LspStatus::Error("Terminated".into())));
                     break;
                 }
@@ -801,8 +952,61 @@ pub struct DynamicGrammar {
 }
 
 impl DynamicGrammar {
-    /// Attempts to locate and load a shared grammar library (`.so`, `.dylib`, or `.dll`)
-    /// and its corresponding `highlights.scm` query from standard user paths.
+    fn grammar_search_dirs() -> Vec<PathBuf> {
+        let mut search_dirs = Vec::new();
+        if let Some(home) = get_home_dir() {
+            search_dirs.push(home.join(".local/share/subject0/grammars"));
+            search_dirs.push(home.join(".config/subject0/grammars"));
+            #[cfg(target_os = "windows")]
+            {
+                if let Ok(appdata) = env::var("LOCALAPPDATA") {
+                    search_dirs.push(PathBuf::from(appdata).join("subject0/grammars"));
+                }
+            }
+        }
+        search_dirs.push(PathBuf::from("./grammars"));
+        search_dirs.push(PathBuf::from("./runtime/grammars"));
+        search_dirs
+    }
+
+    fn query_search_dirs(lang_name: &str) -> Vec<PathBuf> {
+        let mut query_paths = Vec::new();
+        if let Some(home) = get_home_dir() {
+            query_paths.push(
+                home.join(".local/share/subject0/queries")
+                    .join(lang_name)
+                    .join("highlights.scm"),
+            );
+            query_paths.push(
+                home.join(".config/subject0/queries")
+                    .join(lang_name)
+                    .join("highlights.scm"),
+            );
+            #[cfg(target_os = "windows")]
+            {
+                if let Ok(appdata) = env::var("LOCALAPPDATA") {
+                    query_paths.push(
+                        PathBuf::from(appdata)
+                            .join("subject0/queries")
+                            .join(lang_name)
+                            .join("highlights.scm"),
+                    );
+                }
+            }
+        }
+        query_paths.push(
+            PathBuf::from("./queries")
+                .join(lang_name)
+                .join("highlights.scm"),
+        );
+        query_paths.push(
+            PathBuf::from("./runtime/queries")
+                .join(lang_name)
+                .join("highlights.scm"),
+        );
+        query_paths
+    }
+
     pub fn load(lang_name: &str) -> Option<Self> {
         if lang_name.is_empty() {
             return None;
@@ -822,12 +1026,7 @@ impl DynamicGrammar {
             format!("tree-sitter-{lang_name}.{ext}"),
         ];
 
-        let mut search_dirs = Vec::new();
-        if let Ok(home) = env::var("HOME") {
-            search_dirs.push(PathBuf::from(home.clone()).join(".local/share/subject0/grammars"));
-            search_dirs.push(PathBuf::from(home).join(".config/subject0/grammars"));
-        }
-        search_dirs.push(PathBuf::from("./grammars"));
+        let search_dirs = Self::grammar_search_dirs();
 
         for dir in search_dirs {
             for name in &file_candidates {
@@ -844,28 +1043,8 @@ impl DynamicGrammar {
                         let language = unsafe { lang_fn() };
                         let mut parser = tree_sitter::Parser::new();
                         if parser.set_language(&language).is_ok() {
-                            // Load highlights.scm query if present
                             let mut query = None;
-                            let mut query_paths = Vec::new();
-                            if let Ok(home) = env::var("HOME") {
-                                query_paths.push(
-                                    PathBuf::from(home.clone())
-                                        .join(".local/share/subject0/queries")
-                                        .join(lang_name)
-                                        .join("highlights.scm"),
-                                );
-                                query_paths.push(
-                                    PathBuf::from(home)
-                                        .join(".config/subject0/queries")
-                                        .join(lang_name)
-                                        .join("highlights.scm"),
-                                );
-                            }
-                            query_paths.push(
-                                PathBuf::from("./queries")
-                                    .join(lang_name)
-                                    .join("highlights.scm"),
-                            );
+                            let query_paths = Self::query_search_dirs(lang_name);
 
                             for qp in query_paths {
                                 if qp.is_file()
@@ -877,7 +1056,6 @@ impl DynamicGrammar {
                                 }
                             }
 
-                            // Only register Tree-sitter as active if both the parser and highlights query succeeded
                             if query.is_some() {
                                 return Some(Self {
                                     parser,
@@ -885,8 +1063,6 @@ impl DynamicGrammar {
                                     _lib: lib,
                                 });
                             }
-
-
                         }
                     }
                 }
@@ -895,10 +1071,6 @@ impl DynamicGrammar {
         None
     }
 
-    /// Checks whether a compiled grammar shared library for `lang_name` exists
-    /// on disk in any of the standard search locations, without loading it
-    /// (no `dlopen`). Used by the `--health` report so a broken/incompatible
-    /// library can't crash the check — it only confirms presence.
     pub fn grammar_file_path(lang_name: &str) -> Option<PathBuf> {
         if lang_name.is_empty() {
             return None;
@@ -918,12 +1090,7 @@ impl DynamicGrammar {
             format!("tree-sitter-{lang_name}.{ext}"),
         ];
 
-        let mut search_dirs = Vec::new();
-        if let Ok(home) = env::var("HOME") {
-            search_dirs.push(PathBuf::from(home.clone()).join(".local/share/subject0/grammars"));
-            search_dirs.push(PathBuf::from(home).join(".config/subject0/grammars"));
-        }
-        search_dirs.push(PathBuf::from("./grammars"));
+        let search_dirs = Self::grammar_search_dirs();
 
         for dir in search_dirs {
             for name in &file_candidates {
@@ -937,7 +1104,7 @@ impl DynamicGrammar {
     }
 }
 
-// === Syntax Highlighting Engine ===
+// === Supported Languages Specification ===
 
 /// Identifies the source programming/markup language across 100+ languages.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -968,7 +1135,6 @@ pub enum SupportedLanguage {
     Sql,
     Scala,
     Odin,
-    // --- Extended language set ---
     Haskell,
     Elixir,
     Erlang,
@@ -1061,8 +1227,6 @@ impl SupportedLanguage {
             .and_then(|e| e.to_str())
             .unwrap_or("");
 
-        // A handful of build/config files are recognized by exact filename
-        // rather than extension.
         match file_name {
             "Dockerfile" | "Containerfile" => return SupportedLanguage::Dockerfile,
             "Makefile" | "makefile" | "GNUmakefile" => return SupportedLanguage::Makefile,
@@ -1179,7 +1343,6 @@ impl SupportedLanguage {
         }
     }
 
-    /// Human-readable display name, used in the `:health` report and status line.
     pub fn display_name(self) -> &'static str {
         match self {
             SupportedLanguage::Rust => "Rust",
@@ -1346,10 +1509,8 @@ impl SupportedLanguage {
             SupportedLanguage::Zsh => "bash",
             SupportedLanguage::Fish => "fish",
             SupportedLanguage::PowerShell => "powershell",
-            SupportedLanguage::Groovy => "groovy",
-            SupportedLanguage::Gradle => "groovy",
-            SupportedLanguage::ObjectiveC => "objc",
-            SupportedLanguage::ObjectiveCpp => "objc",
+            SupportedLanguage::Groovy | SupportedLanguage::Gradle => "groovy",
+            SupportedLanguage::ObjectiveC | SupportedLanguage::ObjectiveCpp => "objc",
             SupportedLanguage::Cuda => "cuda",
             SupportedLanguage::Glsl => "glsl",
             SupportedLanguage::Hlsl => "hlsl",
@@ -1415,7 +1576,7 @@ impl SupportedLanguage {
             SupportedLanguage::Json => "json",
             SupportedLanguage::Toml => "toml",
             SupportedLanguage::Yaml => "yaml",
-            SupportedLanguage::Bash => "shellscript",
+            SupportedLanguage::Bash | SupportedLanguage::Zsh => "shellscript",
             SupportedLanguage::Lua => "lua",
             SupportedLanguage::Markdown => "markdown",
             SupportedLanguage::Java => "java",
@@ -1440,7 +1601,7 @@ impl SupportedLanguage {
             SupportedLanguage::Clojure => "clojure",
             SupportedLanguage::Nix => "nix",
             SupportedLanguage::Gleam => "gleam",
-            SupportedLanguage::Terraform => "terraform",
+            SupportedLanguage::Terraform | SupportedLanguage::Hcl => "terraform",
             SupportedLanguage::Vue => "vue",
             SupportedLanguage::Svelte => "svelte",
             SupportedLanguage::Astro => "astro",
@@ -1453,11 +1614,9 @@ impl SupportedLanguage {
             SupportedLanguage::Fortran => "fortran",
             SupportedLanguage::D => "d",
             SupportedLanguage::V => "vlang",
-            SupportedLanguage::Zsh => "shellscript",
             SupportedLanguage::Fish => "fish",
             SupportedLanguage::PowerShell => "powershell",
-            SupportedLanguage::Groovy => "groovy",
-            SupportedLanguage::Gradle => "groovy",
+            SupportedLanguage::Groovy | SupportedLanguage::Gradle => "groovy",
             SupportedLanguage::ObjectiveC => "objective-c",
             SupportedLanguage::ObjectiveCpp => "objective-cpp",
             SupportedLanguage::Cuda => "cuda",
@@ -1485,7 +1644,6 @@ impl SupportedLanguage {
             SupportedLanguage::Csv => "csv",
             SupportedLanguage::Properties => "properties",
             SupportedLanguage::EnvFile => "dotenv",
-            SupportedLanguage::Hcl => "hcl",
             SupportedLanguage::Jsonnet => "jsonnet",
             SupportedLanguage::Dhall => "dhall",
             SupportedLanguage::Nginx => "nginx",
@@ -1510,13 +1668,6 @@ impl SupportedLanguage {
         }
     }
 
-    /// Returns candidate language server binary names in priority order.
-    ///
-    /// Entries are the real, verified binary names shipped by each server's
-    /// official distribution as of this writing. Languages with no widely
-    /// adopted standalone LSP implementation return an empty slice, so the
-    /// editor correctly falls back to Tier 1/2 highlighting alone rather than
-    /// claiming a server exists.
     pub fn candidate_servers(self) -> &'static [&'static str] {
         match self {
             SupportedLanguage::Rust => &["rust-analyzer"],
@@ -1585,9 +1736,6 @@ impl SupportedLanguage {
             SupportedLanguage::Haxe => &["haxe-language-server"],
             SupportedLanguage::Pascal => &["pasls"],
             SupportedLanguage::Ada => &["ada_language_server"],
-            SupportedLanguage::Tcl => &[],
-            SupportedLanguage::Makefile => &[],
-
             SupportedLanguage::Cmake => &["neocmakelsp", "cmake-language-server"],
             SupportedLanguage::Dockerfile => &["docker-langserver"],
             SupportedLanguage::GraphQL => &["graphql-lsp"],
@@ -1600,12 +1748,10 @@ impl SupportedLanguage {
             SupportedLanguage::Verilog | SupportedLanguage::VHDL => &["svlangserver", "vhdl_ls"],
             SupportedLanguage::Zephyr => &["dts-lsp"],
             SupportedLanguage::Vala => &["vala-language-server"],
-            SupportedLanguage::Gd => &[],
             _ => &[],
         }
     }
 
-    /// Scans the system for installed candidate servers.
     pub fn installed_servers(self) -> Vec<String> {
         self.candidate_servers()
             .iter()
@@ -1614,8 +1760,6 @@ impl SupportedLanguage {
             .collect()
     }
 
-    /// All supported languages, in a stable order, for use by the `:health`
-    /// report and similar full-listing UI.
     pub fn all() -> &'static [SupportedLanguage] {
         &[
             SupportedLanguage::Rust,
@@ -1726,12 +1870,16 @@ impl SupportedLanguage {
     }
 }
 
+// === Syntax Highlighting Engine ===
+
 /// Core syntax engine coordinating instant lexical highlighting, dynamic tree-sitter AST,
 /// and compiler-grade LSP semantic token overlays.
 pub struct SyntaxEngine {
     pub language: SupportedLanguage,
-    pub dynamic_grammar: Option<DynamicGrammar>,
+    /// Tree must be placed before dynamic_grammar so that the tree is dropped before the
+    /// shared library is unloaded (libloading::Library drop executes dlclose).
     pub tree: Option<tree_sitter::Tree>,
+    pub dynamic_grammar: Option<DynamicGrammar>,
     /// Spatial lookup of Tree-sitter query tokens: line index -> tokens
     pub ts_tokens: std::collections::HashMap<usize, Vec<SemanticTokenSpan>>,
     /// Spatial lookup of LSP semantic tokens: line index -> tokens
@@ -1745,22 +1893,17 @@ impl SyntaxEngine {
 
         Self {
             language,
-            dynamic_grammar,
             tree: None,
+            dynamic_grammar,
             ts_tokens: std::collections::HashMap::new(),
             semantic_tokens: std::collections::HashMap::new(),
         }
     }
 
-        /// Returns true if Tree-sitter grammar and highlights query are active.
     pub fn has_treesitter(&self) -> bool {
         matches!(&self.dynamic_grammar, Some(dg) if dg.query.is_some())
     }
 
-    /// Reparses buffer text using Tree-sitter.
-    ///
-    /// Parses with `None` so Tree-sitter parses freshly on each change.
-    /// Its C engine takes <1ms and guarantees error-tolerant ASTs during active typing.
     pub fn reparse(&mut self, text: &str) {
         if let Some(dg) = &mut self.dynamic_grammar {
             if let Some(query) = &dg.query {
@@ -1823,9 +1966,6 @@ impl SyntaxEngine {
         }
     }
 
-    /// Ingests and indexes decoded LSP semantic tokens by line row.
-    ///
-    /// Ignored if Tree-sitter is available to prevent highlight conflicts.
     pub fn set_semantic_tokens(&mut self, tokens: Vec<SemanticTokenSpan>) {
         if self.has_treesitter() {
             return;
@@ -1836,35 +1976,25 @@ impl SyntaxEngine {
         }
     }
 
-    /// Renders a single row of text into styled Ratatui Spans using a strict 2-tier pipeline:
-    ///
-    /// - Tier 1: Tree-sitter AST (authoritative when grammar library is loaded).
-    /// - Tier 2: LSP Semantic Tokens (applied only when Tree-sitter grammar is absent).
-    /// - Fallback: Clean Plain Text (neutral foreground, zero heuristic guessing).
     pub fn highlight_line(&self, line_text: &str, line_idx: usize) -> Vec<Span<'static>> {
         if line_text.is_empty() {
             return vec![Span::raw("")];
         }
 
-        // Tier 1: Tree-sitter AST is the absolute authority when loaded
         if self.has_treesitter() {
             return self.render_treesitter_line(line_text, line_idx);
         }
 
-        // Tier 2: LSP semantic tokens active only if Tree-sitter is absent
         if !self.semantic_tokens.is_empty() {
             return self.render_semantic_line(line_text, line_idx);
         }
 
-        // Fallback: Clean Plain Text (no regex guessing or color bleeding)
         vec![Span::styled(
             line_text.to_string(),
             Style::default().fg(Color::Rgb(220, 225, 235)),
         )]
     }
 
-
-    /// Renders Tree-sitter tokens with length and capture-specificity ordering.
     fn render_treesitter_line(&self, line_text: &str, line_idx: usize) -> Vec<Span<'static>> {
         let chars: Vec<char> = line_text.chars().collect();
         if chars.is_empty() {
@@ -1895,7 +2025,6 @@ impl SyntaxEngine {
                 }
             };
 
-            // Enclosing AST nodes apply first; specific leaf nodes (keywords, types) apply last
             sorted_tokens.sort_by(|a, b| {
                 b.length
                     .cmp(&a.length)
@@ -1938,7 +2067,6 @@ impl SyntaxEngine {
         spans
     }
 
-    /// Renders compiler-grade semantic tokens when Tree-sitter grammar is not installed.
     fn render_semantic_line(&self, line_text: &str, line_idx: usize) -> Vec<Span<'static>> {
         let chars: Vec<char> = line_text.chars().collect();
         if chars.is_empty() {
@@ -1953,9 +2081,11 @@ impl SyntaxEngine {
                 if tok.token_type == CanonicalTokenType::Other {
                     continue;
                 }
-                let start = tok.start_col;
-                let end = (start + tok.length).min(chars.len());
-                if start < chars.len() && end > start {
+                let char_start = utf16_to_char_col(line_text, tok.start_col);
+                let char_end = utf16_to_char_col(line_text, tok.start_col + tok.length);
+                let start = char_start.min(chars.len());
+                let end = char_end.min(chars.len());
+                if end > start {
                     let style = Self::style_for_token_type(tok.token_type);
                     for cell in &mut styles[start..end] {
                         *cell = style;
@@ -2008,14 +2138,9 @@ impl SyntaxEngine {
             CanonicalTokenType::Other => Style::default().fg(Color::Rgb(220, 225, 235)),
         }
     }
-
 }
 
 /// Returns the Nerd Font glyph icon and corresponding theme color for a file path.
-///
-/// Inspects the file extension to select appropriate iconography for file trees,
-/// tab headers, and status bars. Defaults to a generic document icon (`"󰈔"`) for
-/// unrecognized extensions.
 pub fn file_icon_and_color(path: Option<&PathBuf>) -> (&'static str, Color) {
     let ext = path
         .and_then(|p| p.extension())
@@ -2054,24 +2179,14 @@ pub fn file_icon_and_color(path: Option<&PathBuf>) -> (&'static str, Color) {
 }
 
 /// Returns the Nerd Font glyph icon and theme color for an LSP `CompletionItemKind`.
-///
-/// Maps numeric completion kinds defined by the Language Server Protocol specification
-/// to visual indicators in the editor's autocomplete popup:
-/// - `2`, `3`: Method / Function (`"󰊕"`)
-/// - `4`: Constructor (`"󰌗"`)
-/// - `5`, `6`: Field / Variable (`"󰫧"`)
-/// - `7`, `8`: Class / Struct (`"󱡠"`)
-/// - `9`: Module / Namespace (`"󰏗"`)
-/// - `14`: Keyword (`"󰌆"`)
-/// - Other: Text / Default (`"󰈚"`)
 pub fn completion_kind_icon(kind: u64) -> (&'static str, Color) {
     match kind {
-        2 | 3 => ("󰊕", Color::Rgb(80, 200, 240)), // Method / Function
-        4 => ("󰌗", Color::Rgb(240, 180, 70)),     // Constructor
-        5 | 6 => ("󰫧", Color::Rgb(250, 210, 90)), // Field / Variable
-        7 | 8 => ("󱡠", Color::Rgb(120, 160, 255)), // Class / Struct
-        9 => ("󰏗", Color::Rgb(140, 220, 120)),    // Module
-        14 => ("󰌆", Color::Rgb(220, 110, 240)),   // Keyword
-        _ => ("󰈚", Color::Rgb(170, 175, 190)),    // Text
+        2 | 3 => ("󰊕", Color::Rgb(80, 200, 240)),
+        4 => ("󰌗", Color::Rgb(240, 180, 70)),
+        5 | 6 => ("󰫧", Color::Rgb(250, 210, 90)),
+        7 | 8 => ("󱡠", Color::Rgb(120, 160, 255)),
+        9 => ("󰏗", Color::Rgb(140, 220, 120)),
+        14 => ("󰌆", Color::Rgb(220, 110, 240)),
+        _ => ("󰈚", Color::Rgb(170, 175, 190)),
     }
 }
