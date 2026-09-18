@@ -64,6 +64,7 @@ serde_json = "1.0"
 # Error handling
 anyhow = "1.0"
 thiserror = "2.0"
+tree-sitter-zig = "1.1.2"
 
 [profile.release]
 opt-level = 3

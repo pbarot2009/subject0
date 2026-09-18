@@ -14,7 +14,7 @@
 //! 3. **LSP Semantic Token Tier**:
 //!    Compiler-accurate semantic token styling for languages without static AST parsers.
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use ratatui::{
     style::{Color, Modifier, Style},
     text::Span,
@@ -1228,6 +1228,7 @@ impl SupportedLanguage {
             SupportedLanguage::Rust => Some(tree_sitter_rust::LANGUAGE.into()),
             SupportedLanguage::C => Some(tree_sitter_c::LANGUAGE.into()),
             SupportedLanguage::Cpp => Some(tree_sitter_cpp::LANGUAGE.into()),
+            SupportedLanguage::Zig => Some(tree_sitter_zig::LANGUAGE.into()),
             SupportedLanguage::Python => Some(tree_sitter_python::LANGUAGE.into()),
             SupportedLanguage::JavaScript => Some(tree_sitter_javascript::LANGUAGE.into()),
             SupportedLanguage::TypeScript => {
@@ -1321,6 +1322,26 @@ impl SupportedLanguage {
                 (preproc_include) @macro
                 (preproc_def) @macro
                 (preproc_directive) @macro
+                "#
+            }
+            SupportedLanguage::Zig => {
+                r#"
+                (identifier) @variable
+                (type_identifier) @type
+                (field_identifier) @property
+                (call_expression function: (identifier) @function)
+                (call_expression function: (field_expression field: (field_identifier) @function))
+                [
+                  "const" "var" "fn" "pub" "return" "if" "else" "switch" "while" "for"
+                  "break" "continue" "defer" "errdefer" "try" "catch" "unreachable"
+                  "test" "usingnamespace" "opaque" "enum" "struct" "union" "error"
+                  "and" "or" "orelse"
+                ] @keyword
+                (line_comment) @comment
+                (string_literal) @string
+                (char_literal) @string
+                (integer_literal) @number
+                (float_literal) @number
                 "#
             }
             SupportedLanguage::Go => {
