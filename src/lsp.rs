@@ -4,7 +4,7 @@
 //!
 //! 1. **LSP Background Actor (`run_lsp_actor`)**:
 //!    Asynchronous, non-blocking Tokio task managing the language server child process
-//!    over JSON-RPC 2.0 with HTTP-style `Content-Length` framing[span_0](start_span)[span_0](end_span).
+//!    over JSON-RPC 2.0 with HTTP-style `Content-Length` framing.
 //!
 //! 2. **Compile-Time Static Syntax Engine ([`SyntaxEngine`])**:
 //!    Statically linked Tree-sitter parsers and built-in queries for primary languages
@@ -12,9 +12,9 @@
 //!    All tokens are styled dynamically against the active [`Theme`].
 //!
 //! 3. **LSP Semantic Token Tier**:
-//!    Compiler-accurate semantic token styling for languages without static AST parsers[span_1](start_span)[span_1](end_span).
+//!    Compiler-accurate semantic token styling for languages without static AST parsers.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use ratatui::{
     style::{Color, Modifier, Style},
     text::Span,
@@ -38,7 +38,7 @@ use crate::theme::Theme;
 
 // === LSP Types & Actor Protocol ===
 
-/// Represents a single diagnostic entry emitted by an LSP server[span_2](start_span)[span_2](end_span).
+/// Represents a single diagnostic entry emitted by an LSP server.
 #[derive(Debug, Clone)]
 pub struct DiagnosticItem {
     pub line: usize,
@@ -47,7 +47,7 @@ pub struct DiagnosticItem {
     pub severity: u8,
 }
 
-/// An individual code completion candidate returned by the LSP server[span_3](start_span)[span_3](end_span).
+/// An individual code completion candidate returned by the LSP server.
 #[derive(Debug, Clone)]
 pub struct SuggestionItem {
     pub label: String,
@@ -56,7 +56,7 @@ pub struct SuggestionItem {
     pub kind: u64,
 }
 
-/// Operational lifecycle state of the LSP server process[span_4](start_span)[span_4](end_span).
+/// Operational lifecycle state of the LSP server process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LspStatus {
     Disabled,
@@ -66,7 +66,7 @@ pub enum LspStatus {
     Error(String),
 }
 
-/// Canonical semantic classification mapping server legends and queries into unified theme tokens[span_5](start_span)[span_5](end_span).
+/// Canonical semantic classification mapping server legends and queries into unified theme tokens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanonicalTokenType {
     Keyword,
@@ -168,7 +168,7 @@ impl CanonicalTokenType {
     }
 }
 
-/// A single decoded semantic token span positioned in buffer coordinates[span_6](start_span)[span_6](end_span).
+/// A single decoded semantic token span positioned in buffer coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SemanticTokenSpan {
     pub line: usize,
@@ -177,7 +177,7 @@ pub struct SemanticTokenSpan {
     pub token_type: CanonicalTokenType,
 }
 
-/// Inbound messages routed to the background LSP actor[span_7](start_span)[span_7](end_span).
+/// Inbound messages routed to the background LSP actor.
 pub enum LspInbound {
     Change {
         text: String,
@@ -199,7 +199,7 @@ pub enum LspInbound {
     },
 }
 
-/// Outbound messages received from the background LSP actor[span_8](start_span)[span_8](end_span).
+/// Outbound messages received from the background LSP actor.
 pub enum LspOutbound {
     Status(LspStatus),
     Diagnostics(Vec<DiagnosticItem>),
@@ -305,7 +305,7 @@ pub fn resolve_binary_path(cmd: &str) -> Option<PathBuf> {
     None
 }
 
-/// Converts local path to an RFC 3986 `file://` URI string[span_9](start_span)[span_9](end_span).
+/// Converts local path to an RFC 3986 `file://` URI string.
 pub fn file_to_uri(path: &Path) -> String {
     let abs = if path.is_absolute() {
         path.to_path_buf()

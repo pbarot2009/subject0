@@ -4,5 +4,5 @@
     "python": "pyright",
     "rust": "rust-analyzer"
   },
-  "theme": "rose-pine"
+  "theme": "gruvbox-dark"
 }

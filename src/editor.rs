@@ -4,17 +4,17 @@
 //!
 //! 1. **Text Storage & Mutability ([`ropey::Rope`])**:
 //!    Buffer contents are stored as a chunked, reference-counted B-tree rope with $O(\log N)$
-//!    mutations and $O(1)$ copy-on-write structural sharing for undo/redo snapshots[span_0](start_span)[span_0](end_span).
+//!    mutations and $O(1)$ copy-on-write structural sharing for undo/redo snapshots.
 //!
 //! 2. **Modal Editing State Machine ([`Mode`])**:
-//!    Implements modal key semantics across `Normal`, `Insert`, `Command`, and `Visual` states[span_1](start_span)[span_1](end_span).
+//!    Implements modal key semantics across `Normal`, `Insert`, `Command`, and `Visual` states.
 //!
 //! 3. **Theming & Visual Customization**:
 //!    Maintains active [`Theme`] state and persists user color scheme choices to `.subject0`.
 //!
 //! 4. **Incremental Syntax Engine, Diagnostics Sync & Data Protection**:
 //!    Maintains AST highlighting trees, shifts diagnostic positions on row mutations,
-//!    tracks a bidirectional undo/redo ring, and protects unsaved buffers against file explorer wipes[span_2](start_span)[span_2](end_span).
+//!    tracks a bidirectional undo/redo ring, and protects unsaved buffers against file explorer wipes.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -25,23 +25,23 @@ use std::{
 };
 
 use crate::lsp::{
-    run_lsp_actor, subject0_config_dir, DiagnosticItem, LspInbound, LspOutbound, LspStatus,
-    SuggestionItem, SyntaxEngine,
+    DiagnosticItem, LspInbound, LspOutbound, LspStatus, SuggestionItem, SyntaxEngine,
+    run_lsp_actor, subject0_config_dir,
 };
 use crate::theme::Theme;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use ropey::Rope;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-/// Persistent editor configuration stored in `.subject0`[span_3](start_span)[span_3](end_span).
+/// Persistent editor configuration stored in `.subject0`.
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     pub preferred_lsps: HashMap<String, String>,
     pub line_wrap: bool,
     pub theme: String,
-    /// Resolved absolute path to the `.subject0` configuration file[span_4](start_span)[span_4](end_span).
+    /// Resolved absolute path to the `.subject0` configuration file.
     pub source_path: PathBuf,
 }
 
@@ -135,14 +135,14 @@ pub struct ThemePicker {
     pub selected_idx: usize,
 }
 
-/// Interactive modal state when multiple language servers are detected for a language[span_5](start_span)[span_5](end_span).
+/// Interactive modal state when multiple language servers are detected for a language.
 pub struct LspPicker {
     pub language_id: String,
     pub candidates: Vec<String>,
     pub selected_idx: usize,
 }
 
-/// Active modal editing state[span_6](start_span)[span_6](end_span).
+/// Active modal editing state.
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum Mode {
     Normal,
@@ -151,7 +151,7 @@ pub enum Mode {
     Visual { anchor_x: usize, anchor_y: usize },
 }
 
-/// Identifies which viewport element currently holds keyboard input focus[span_7](start_span)[span_7](end_span).
+/// Identifies which viewport element currently holds keyboard input focus.
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum Focus {
     Editor,
@@ -757,7 +757,7 @@ impl Editor {
         utf16_count
     }
 
-    /// Loads a new file from disk into the current editor buffer, protecting against unsaved modifications[span_8](start_span)[span_8](end_span).
+    /// Loads a new file from disk into the current editor buffer, protecting against unsaved modifications.
     pub fn open_file<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
         if self.modified {
             return Err(anyhow!(
@@ -912,7 +912,7 @@ impl Editor {
         }
     }
 
-    /// Pushes current buffer state into the undo stack and clears redo history[span_9](start_span)[span_9](end_span).
+    /// Pushes current buffer state into the undo stack and clears redo history.
     pub fn snapshot(&mut self) {
         if self.undo_stack.len() >= 64 {
             self.undo_stack.remove(0);
@@ -925,7 +925,7 @@ impl Editor {
         self.redo_stack.clear();
     }
 
-    /// Reverts the document rope to the most recent checkpoint on `undo_stack`[span_10](start_span)[span_10](end_span).
+    /// Reverts the document rope to the most recent checkpoint on `undo_stack`.
     pub fn undo(&mut self) {
         if let Some(prev) = self.undo_stack.pop() {
             if self.redo_stack.len() >= 64 {

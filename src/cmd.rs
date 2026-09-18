@@ -10,7 +10,7 @@ use std::{
     process,
 };
 
-use crate::lsp::{resolve_binary_path, DynamicGrammar, SupportedLanguage};
+use crate::lsp::{DynamicGrammar, SupportedLanguage, resolve_binary_path};
 
 /// Parsed command-line arguments.
 #[derive(Debug, Default, Clone)]
