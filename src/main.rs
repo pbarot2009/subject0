@@ -372,36 +372,56 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         return;
     }
 
-    // 4. Intercept Command Palette Interactions
+    // 4. Intercept Command Palette Interactions (Click + Scroll support)
     if editor.palette.visible {
-        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-            let width = 46u16.min(size.width.saturating_sub(2));
-            let height = 12u16.min(size.height.saturating_sub(2));
-            let x = (size.width.saturating_sub(width)) / 2;
-            let y = 1u16;
+        let width = 46u16.min(size.width.saturating_sub(2));
+        let height = 12u16.min(size.height.saturating_sub(2));
+        let x = (size.width.saturating_sub(width)) / 2;
+        let y = 1u16;
 
-            if mouse.column >= x + 1
-                && mouse.column < x + width - 1
-                && mouse.row >= y + 3
-                && mouse.row < y + height - 1
-            {
-                let clicked_row = (mouse.row - (y + 3)) as usize;
-                let cmds = editor.palette.filtered_commands();
-                let actual_idx = editor.palette.scroll + clicked_row;
-                if actual_idx < cmds.len() {
-                    let cmd_id = cmds[actual_idx].id;
-                    editor.execute_palette_command(cmd_id);
-                    set_terminal_cursor_style(editor.mode);
+        let in_palette = mouse.column >= x
+            && mouse.column < x + width
+            && mouse.row >= y
+            && mouse.row < y + height;
+
+        let cmds = editor.palette.filtered_commands();
+        match mouse.kind {
+            MouseEventKind::ScrollDown if in_palette => {
+                if !cmds.is_empty() {
+                    editor.palette.selected_idx = (editor.palette.selected_idx + 1) % cmds.len();
                 }
                 return;
-            } else if mouse.column < x
-                || mouse.column >= x + width
-                || mouse.row < y
-                || mouse.row >= y + height
-            {
-                editor.palette.visible = false;
+            }
+            MouseEventKind::ScrollUp if in_palette => {
+                if !cmds.is_empty() {
+                    editor.palette.selected_idx = if editor.palette.selected_idx == 0 {
+                        cmds.len().saturating_sub(1)
+                    } else {
+                        editor.palette.selected_idx - 1
+                    };
+                }
                 return;
             }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if mouse.column >= x + 1
+                    && mouse.column < x + width - 1
+                    && mouse.row >= y + 3
+                    && mouse.row < y + height - 1
+                {
+                    let clicked_row = (mouse.row - (y + 3)) as usize;
+                    let actual_idx = editor.palette.scroll + clicked_row;
+                    if actual_idx < cmds.len() {
+                        let cmd_id = cmds[actual_idx].id;
+                        editor.execute_palette_command(cmd_id);
+                        set_terminal_cursor_style(editor.mode);
+                    }
+                    return;
+                } else if !in_palette {
+                    editor.palette.visible = false;
+                    return;
+                }
+            }
+            _ => {}
         }
         return;
     }
@@ -417,7 +437,8 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
             } + 1;
 
             let files_end = badge_len + 10;
-            let wrap_end = files_end + 10;
+            let wrap_badge_len = if editor.line_wrap { 8 } else { 10 };
+            let wrap_end = files_end + wrap_badge_len;
             let cmd_end = wrap_end + 9;
 
             let col = mouse.column as usize;
@@ -549,7 +570,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         }
     }
 
-    // 8. Document Viewport Buffer Interactions (Gutter width = line_digits + 5)
+    // 8. Document Viewport Buffer Interactions
     let gutter_digits = editor.rope.len_lines().max(1).to_string().len().max(2);
     let gutter_width = gutter_digits + 5;
     let content_left = explorer_width + 1u16 + gutter_width as u16;
@@ -788,7 +809,20 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                 editor.palette.query.pop();
                 editor.palette.selected_idx = 0;
             }
-            KeyCode::Char(c) => {
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                editor.palette.query.clear();
+                editor.palette.selected_idx = 0;
+            }
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let trimmed = editor.palette.query.trim_end();
+                if let Some(pos) = trimmed.rfind(' ') {
+                    editor.palette.query.truncate(pos + 1);
+                } else {
+                    editor.palette.query.clear();
+                }
+                editor.palette.selected_idx = 0;
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 editor.palette.query.push(c);
                 editor.palette.selected_idx = 0;
             }
@@ -850,9 +884,19 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         Mode::Normal => {
             editor.completion_visible = false;
 
-            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
-                editor.redo();
-                return;
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                match key.code {
+                    KeyCode::Char('r') => {
+                        editor.redo();
+                        return;
+                    }
+                    KeyCode::Char(' ') => {
+                        editor.set_mode(Mode::Insert);
+                        editor.request_completions();
+                        return;
+                    }
+                    _ => {}
+                }
             }
 
             if let Some(pending) = editor.pending_key.take() {
@@ -864,6 +908,8 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                     ('g', KeyCode::Char('g')) => {
                         editor.cursor_y = 0;
                         editor.cursor_x = 0;
+                        editor.scroll_y = 0;
+                        editor.scroll_x = 0;
                         true
                     }
                     ('g', KeyCode::Char('h')) => {
@@ -881,10 +927,11 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                     }
                     _ => false,
                 };
-                if handled || key.code == KeyCode::Esc {
+                if handled {
                     editor.clamp_cursor();
                     return;
                 }
+                // If unhandled multi-key combination, fall through so second key evaluates normally
             }
 
             match key.code {
@@ -929,7 +976,13 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                 KeyCode::Char('d') => editor.pending_key = Some('d'),
                 KeyCode::Char('g') => editor.pending_key = Some('g'),
                 KeyCode::Char('G') => {
-                    editor.cursor_y = editor.rope.len_lines().saturating_sub(1);
+                    let max_lines = editor.rope.len_lines().max(1);
+                    editor.cursor_y = max_lines - 1;
+                    editor.cursor_x = 0;
+                }
+                KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    let max_lines = editor.rope.len_lines().max(1);
+                    editor.cursor_y = max_lines - 1;
                     editor.cursor_x = 0;
                 }
                 KeyCode::Char(':') => {
@@ -963,43 +1016,101 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                 _ => {}
             }
         }
-        Mode::Visual { .. } => match key.code {
-            KeyCode::Esc => {
-                editor.set_mode(Mode::Normal);
-            }
-            KeyCode::Char('d' | 'x') => {
-                editor.delete_selection();
-            }
-            KeyCode::Char('c') => {
-                editor.delete_selection();
-                editor.set_mode(Mode::Insert);
-            }
-            KeyCode::Char('y') => {
-                editor.yank_selection();
-            }
-            KeyCode::Char('~') => {
-                editor.toggle_case();
-            }
-            KeyCode::Char('%') => {
-                editor.select_all();
-            }
-            KeyCode::Char('h') | KeyCode::Left => {
-                editor.cursor_x = editor.cursor_x.saturating_sub(1);
-            }
-            KeyCode::Char('l') | KeyCode::Right => {
-                let max = editor.current_line_len().saturating_sub(1);
-                if editor.cursor_x < max {
-                    editor.cursor_x += 1;
+        Mode::Visual { .. } => {
+            if let Some(pending) = editor.pending_key.take() {
+                let handled = match (pending, key.code) {
+                    ('g', KeyCode::Char('g')) => {
+                        editor.cursor_y = 0;
+                        editor.cursor_x = 0;
+                        editor.scroll_y = 0;
+                        editor.scroll_x = 0;
+                        true
+                    }
+                    ('g', KeyCode::Char('e')) => {
+                        editor.cursor_y = editor.rope.len_lines().saturating_sub(1);
+                        editor.cursor_x = editor.current_line_len();
+                        true
+                    }
+                    _ => false,
+                };
+                if handled {
+                    editor.clamp_cursor();
+                    return;
                 }
             }
-            KeyCode::Char('k') | KeyCode::Up => {
-                editor.cursor_y = editor.cursor_y.saturating_sub(1);
+
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('v') => {
+                    editor.set_mode(Mode::Normal);
+                }
+                KeyCode::Char('d' | 'x') => {
+                    editor.delete_selection();
+                }
+                KeyCode::Char('c') => {
+                    editor.delete_selection();
+                    editor.set_mode(Mode::Insert);
+                }
+                KeyCode::Char('y') => {
+                    editor.yank_selection();
+                }
+                KeyCode::Char('p') => {
+                    editor.paste();
+                }
+                KeyCode::Char('~') => {
+                    editor.toggle_case();
+                }
+                KeyCode::Char('%') => {
+                    editor.select_all();
+                }
+                KeyCode::Char('0') => {
+                    editor.cursor_x = 0;
+                }
+                KeyCode::Char('$') => {
+                    editor.cursor_x = editor.current_line_len();
+                }
+                KeyCode::Char('g') => {
+                    editor.pending_key = Some('g');
+                }
+                KeyCode::Char('G') => {
+                    let max_lines = editor.rope.len_lines().max(1);
+                    editor.cursor_y = max_lines - 1;
+                    editor.cursor_x = editor.current_line_len();
+                }
+                KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    let max_lines = editor.rope.len_lines().max(1);
+                    editor.cursor_y = max_lines - 1;
+                    editor.cursor_x = editor.current_line_len();
+                }
+                KeyCode::Char(' ') => {
+                    editor.palette.visible = true;
+                    editor.palette.query.clear();
+                    editor.palette.selected_idx = 0;
+                    editor.palette.scroll = 0;
+                }
+                KeyCode::Char(':') => {
+                    editor.set_mode(Mode::Command);
+                    editor.command_buffer.clear();
+                }
+                KeyCode::Char('h') | KeyCode::Left => {
+                    editor.cursor_x = editor.cursor_x.saturating_sub(1);
+                }
+                KeyCode::Char('l') | KeyCode::Right => {
+                    let max = editor.current_line_len();
+                    if editor.cursor_x < max {
+                        editor.cursor_x += 1;
+                    }
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    editor.cursor_y = editor.cursor_y.saturating_sub(1);
+                }
+                KeyCode::Char('j') | KeyCode::Down
+                    if editor.cursor_y + 1 < editor.rope.len_lines() =>
+                {
+                    editor.cursor_y += 1;
+                }
+                _ => {}
             }
-            KeyCode::Char('j') | KeyCode::Down if editor.cursor_y + 1 < editor.rope.len_lines() => {
-                editor.cursor_y += 1;
-            }
-            _ => {}
-        },
+        }
         Mode::Insert => {
             if editor.completion_visible && !editor.completions.is_empty() {
                 match key.code {
@@ -2158,7 +2269,7 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
                 Span::styled("Quit editor (force quit without saving)", c_desc),
             ]),
             Line::from(vec![
-                Span::styled("  :wq            ", c_key),
+                Span::styled("  :wq, :wq!      ", c_key),
                 Span::styled("Save and exit", c_desc),
             ]),
             Line::from(vec![

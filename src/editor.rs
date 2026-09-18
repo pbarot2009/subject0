@@ -167,6 +167,7 @@ pub enum CommandId {
     ToggleWrap,
     Save,
     SaveQuit,
+    Quit,
     QuitForce,
     EnterVisual,
     InsertBelow,
@@ -224,6 +225,12 @@ pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
         shortcut: ":wq",
         icon: "󰆘",
         id: CommandId::SaveQuit,
+    },
+    PaletteCommand {
+        title: "Quit Editor",
+        shortcut: ":q",
+        icon: "󰈆",
+        id: CommandId::Quit,
     },
     PaletteCommand {
         title: "Force Quit",
@@ -578,6 +585,7 @@ pub struct Editor {
     pub line_wrap: bool,
     pub clipboard: String,
     pub modified: bool,
+    pub saved_undo_len: usize,
     pub status_msg: String,
     pub command_buffer: String,
     pub pending_key: Option<char>,
@@ -676,6 +684,7 @@ impl Editor {
 
             clipboard: String::new(),
             modified: false,
+            saved_undo_len: 0,
             status_msg,
             command_buffer: String::new(),
             pending_key: None,
@@ -774,6 +783,7 @@ impl Editor {
         self.scroll_x = 0;
         self.scroll_y = 0;
         self.modified = false;
+        self.saved_undo_len = 0;
         self.undo_stack.clear();
         self.redo_stack.clear();
         self.insert_snapshot_taken = false;
@@ -916,6 +926,7 @@ impl Editor {
     pub fn snapshot(&mut self) {
         if self.undo_stack.len() >= 64 {
             self.undo_stack.remove(0);
+            self.saved_undo_len = self.saved_undo_len.saturating_sub(1);
         }
         self.undo_stack.push(UndoSnapshot {
             rope: self.rope.clone(),
@@ -940,7 +951,7 @@ impl Editor {
             self.rope = prev.rope;
             self.cursor_x = prev.cursor_x;
             self.cursor_y = prev.cursor_y;
-            self.modified = true;
+            self.modified = self.undo_stack.len() != self.saved_undo_len;
             self.status_msg = "Reverted change".to_string();
             self.insert_snapshot_taken = false;
             self.clamp_cursor();
@@ -955,6 +966,7 @@ impl Editor {
         if let Some(next) = self.redo_stack.pop() {
             if self.undo_stack.len() >= 64 {
                 self.undo_stack.remove(0);
+                self.saved_undo_len = self.saved_undo_len.saturating_sub(1);
             }
             self.undo_stack.push(UndoSnapshot {
                 rope: self.rope.clone(),
@@ -965,7 +977,7 @@ impl Editor {
             self.rope = next.rope;
             self.cursor_x = next.cursor_x;
             self.cursor_y = next.cursor_y;
-            self.modified = true;
+            self.modified = self.undo_stack.len() != self.saved_undo_len;
             self.status_msg = "Redone change".to_string();
             self.insert_snapshot_taken = false;
             self.clamp_cursor();
@@ -975,10 +987,19 @@ impl Editor {
         }
     }
 
-    /// Shifts diagnostic coordinates down when lines are added above them.
+    /// Shifts diagnostic coordinates down when lines are added strictly below them.
     fn shift_diagnostics_down(&mut self, after_line: usize, count: usize) {
         for d in &mut self.diagnostics {
             if d.line > after_line {
+                d.line += count;
+            }
+        }
+    }
+
+    /// Shifts diagnostic coordinates down when lines are inserted at or above them.
+    fn shift_diagnostics_down_from(&mut self, from_line: usize, count: usize) {
+        for d in &mut self.diagnostics {
+            if d.line >= from_line {
                 d.line += count;
             }
         }
@@ -1170,13 +1191,58 @@ impl Editor {
         }
 
         self.snapshot();
-        let idx = self.char_index().min(self.rope.len_chars());
-        self.rope.insert(idx, &self.clipboard);
-        let end_idx = idx + self.clipboard.chars().count();
-        let new_line = self.rope.char_to_line(end_idx);
-        let line_start = self.rope.line_to_char(new_line);
-        self.cursor_y = new_line;
-        self.cursor_x = end_idx.saturating_sub(line_start);
+
+        if let Some((start, end)) = self.selection_range() {
+            if start < end {
+                self.rope.remove(start..end);
+                self.rope.insert(start, &self.clipboard);
+                let end_idx = start + self.clipboard.chars().count();
+                let new_line = self.rope.char_to_line(end_idx);
+                let line_start = self.rope.line_to_char(new_line);
+                self.cursor_y = new_line;
+                self.cursor_x = end_idx.saturating_sub(line_start);
+                self.set_mode(Mode::Normal);
+                self.modified = true;
+                self.clamp_cursor();
+                self.on_buffer_modified();
+                self.status_msg = "Pasted from clipboard".to_string();
+                return;
+            }
+        }
+
+        if self.clipboard.ends_with('\n') {
+            let insert_line = self.cursor_y + 1;
+            let num_lines = self.rope.len_lines();
+            let insert_idx = if insert_line < num_lines {
+                self.rope.line_to_char(insert_line)
+            } else {
+                self.rope.len_chars()
+            };
+
+            let text = if insert_idx == self.rope.len_chars()
+                && self.rope.len_chars() > 0
+                && self.rope.char(self.rope.len_chars() - 1) != '\n'
+            {
+                let le = self.detect_line_ending();
+                format!("{le}{}", self.clipboard.trim_end_matches(['\r', '\n']))
+            } else {
+                self.clipboard.clone()
+            };
+
+            self.rope.insert(insert_idx, &text);
+            self.shift_diagnostics_down(self.cursor_y, text.lines().count().max(1));
+            self.cursor_y = (self.cursor_y + 1).min(self.rope.len_lines().saturating_sub(1));
+            self.cursor_x = 0;
+        } else {
+            let idx = self.char_index().min(self.rope.len_chars());
+            self.rope.insert(idx, &self.clipboard);
+            let end_idx = idx + self.clipboard.chars().count();
+            let new_line = self.rope.char_to_line(end_idx);
+            let line_start = self.rope.line_to_char(new_line);
+            self.cursor_y = new_line;
+            self.cursor_x = end_idx.saturating_sub(line_start);
+        }
+
         self.modified = true;
         self.clamp_cursor();
         self.on_buffer_modified();
@@ -1345,7 +1411,7 @@ impl Editor {
 
         let to_insert = format!("{indent}{le}");
         self.rope.insert(idx, &to_insert);
-        self.shift_diagnostics_down(self.cursor_y.saturating_sub(1), 1);
+        self.shift_diagnostics_down_from(self.cursor_y, 1);
         self.cursor_x = indent.chars().count();
         self.modified = true;
         self.set_mode(Mode::Insert);
@@ -1617,6 +1683,7 @@ impl Editor {
             }
 
             self.modified = false;
+            self.saved_undo_len = self.undo_stack.len();
             self.status_msg = format!("Saved {}", path.display());
 
             if let Some(tx) = &self.lsp_tx {
@@ -1649,10 +1716,18 @@ impl Editor {
                     format!("Line Wrap: {}", if self.line_wrap { "ON" } else { "OFF" });
             }
             CommandId::Save => {
-                let _ = self.save();
+                if let Err(e) = self.save() {
+                    self.status_msg = format!("Error saving: {e}");
+                }
             }
-            CommandId::SaveQuit => {
-                if self.save().is_ok() {
+            CommandId::SaveQuit => match self.save() {
+                Ok(()) => self.should_quit = true,
+                Err(e) => self.status_msg = format!("Error saving: {e}"),
+            },
+            CommandId::Quit => {
+                if self.modified {
+                    self.status_msg = "Unsaved changes! Use :q! to force quit".to_string();
+                } else {
                     self.should_quit = true;
                 }
             }
@@ -1674,12 +1749,18 @@ impl Editor {
             CommandId::JumpTop => {
                 self.cursor_y = 0;
                 self.cursor_x = 0;
+                self.scroll_y = 0;
+                self.scroll_x = 0;
             }
             CommandId::JumpBottom => {
-                self.cursor_y = self.rope.len_lines().saturating_sub(1);
+                let max_lines = self.rope.len_lines().max(1);
+                self.cursor_y = max_lines - 1;
                 self.cursor_x = 0;
             }
-            CommandId::TriggerCompletion => self.request_completions(),
+            CommandId::TriggerCompletion => {
+                self.set_mode(Mode::Insert);
+                self.request_completions();
+            }
             CommandId::SelectLsp => {
                 let installed = self.syntax.language.installed_servers();
                 if installed.is_empty() {
@@ -1721,9 +1802,10 @@ impl Editor {
         let cmd = self.command_buffer.trim().to_string();
         self.command_buffer.clear();
 
-        let mut parts = cmd.split_whitespace();
-        let action = parts.next().unwrap_or("");
-        let arg = parts.next();
+        let (action, arg) = match cmd.find(char::is_whitespace) {
+            Some(idx) => (&cmd[..idx], Some(cmd[idx..].trim())),
+            None => (cmd.as_str(), None),
+        };
 
         match action {
             "q" => {
@@ -1737,17 +1819,20 @@ impl Editor {
                 self.should_quit = true;
             }
             "w" => {
-                if let Some(filename) = arg {
+                if let Some(filename) = arg.filter(|s| !s.is_empty()) {
                     self.switch_file_target(PathBuf::from(filename));
                 }
-                let _ = self.save();
+                if let Err(e) = self.save() {
+                    self.status_msg = format!("Error saving: {e}");
+                }
             }
-            "wq" => {
-                if let Some(filename) = arg {
+            "wq" | "wq!" => {
+                if let Some(filename) = arg.filter(|s| !s.is_empty()) {
                     self.switch_file_target(PathBuf::from(filename));
                 }
-                if self.save().is_ok() {
-                    self.should_quit = true;
+                match self.save() {
+                    Ok(()) => self.should_quit = true,
+                    Err(e) => self.status_msg = format!("Error saving: {e}"),
                 }
             }
             "wrap" => {
@@ -1756,7 +1841,7 @@ impl Editor {
                     format!("Line Wrap: {}", if self.line_wrap { "ON" } else { "OFF" });
             }
             "theme" | "colorscheme" => {
-                if let Some(name) = arg {
+                if let Some(name) = arg.filter(|s| !s.is_empty()) {
                     self.set_theme(name);
                 } else {
                     let cur_idx = Theme::all()
@@ -1768,7 +1853,29 @@ impl Editor {
                     });
                 }
             }
+            "u" | "undo" => self.undo(),
             "redo" => self.redo(),
+            "lsp" => {
+                let installed = self.syntax.language.installed_servers();
+                if installed.is_empty() {
+                    self.status_msg = "No installed LSP found for this file".to_string();
+                } else {
+                    self.lsp_picker = Some(LspPicker {
+                        language_id: self.syntax.language.lsp_id().to_string(),
+                        candidates: installed,
+                        selected_idx: 0,
+                    });
+                }
+            }
+            "cfg" => {
+                self.config.line_wrap = self.line_wrap;
+                self.config.theme = self.theme.name.to_string();
+                if self.config.save().is_ok() {
+                    self.status_msg = "Config saved to .subject0".to_string();
+                } else {
+                    self.status_msg = "Failed to write .subject0".to_string();
+                }
+            }
             "e" | "explore" => {
                 self.explorer.visible = !self.explorer.visible;
                 if self.explorer.visible {
@@ -1804,8 +1911,8 @@ impl Editor {
 
         let line_len = self.current_line_len();
         let max_x = match self.mode {
-            Mode::Insert => line_len,
-            Mode::Normal | Mode::Command | Mode::Visual { .. } => line_len.saturating_sub(1),
+            Mode::Insert | Mode::Visual { .. } => line_len,
+            Mode::Normal | Mode::Command => line_len.saturating_sub(1),
         };
 
         if self.cursor_x > max_x {
@@ -1813,9 +1920,15 @@ impl Editor {
         }
     }
 
+    /// Fast $O(1)$ linear viewport updater that guarantees instant response on large files.
     pub fn update_scroll(&mut self, width: usize, height: usize) {
         if height == 0 || width == 0 {
             return;
+        }
+
+        let total_lines = self.rope.len_lines().max(1);
+        if self.cursor_y >= total_lines {
+            self.cursor_y = total_lines - 1;
         }
 
         if self.cursor_y < self.scroll_y {
@@ -1826,44 +1939,55 @@ impl Editor {
             self.scroll_x = 0;
             let effective_width = width.max(1);
 
-            let calc_cursor_visual_row =
-                |start_y: usize, cursor_y: usize, cursor_x: usize, rope: &Rope| -> usize {
-                    let mut rows = 0;
-                    for y in start_y..cursor_y {
-                        let len = line_len(rope, y);
-                        let line_rows = if len == 0 {
-                            1
-                        } else {
-                            len.div_ceil(effective_width)
-                        };
-                        rows += line_rows;
-                    }
-                    let cur_len = line_len(rope, cursor_y);
-                    let cur_rows = if cur_len == 0 {
-                        1
-                    } else {
-                        cur_len.div_ceil(effective_width)
-                    };
-                    let cursor_sub_row =
-                        (cursor_x / effective_width).min(cur_rows.saturating_sub(1));
-                    rows + cursor_sub_row
-                };
+            let line_visual_rows = |y: usize, rope: &Rope| -> usize {
+                if y >= rope.len_lines() {
+                    return 1;
+                }
+                let len = line_len(rope, y);
+                if len == 0 {
+                    1
+                } else {
+                    len.div_ceil(effective_width)
+                }
+            };
 
-            while self.scroll_y < self.cursor_y
-                && calc_cursor_visual_row(self.scroll_y, self.cursor_y, self.cursor_x, &self.rope)
-                    >= height
-            {
-                self.scroll_y += 1;
+            let cur_line_rows = line_visual_rows(self.cursor_y, &self.rope);
+            let cur_sub_row =
+                (self.cursor_x / effective_width).min(cur_line_rows.saturating_sub(1));
+
+            // Fast check: sum rows from scroll_y to cursor_y bounded to (height + 1)
+            let mut visual_rows_down = 0;
+            for y in self.scroll_y..self.cursor_y {
+                visual_rows_down += line_visual_rows(y, &self.rope);
+                if visual_rows_down >= height {
+                    break;
+                }
+            }
+            visual_rows_down += cur_sub_row;
+
+            if visual_rows_down >= height {
+                let mut accumulated = cur_sub_row + 1;
+                let mut new_top = self.cursor_y;
+
+                while new_top > 0 && accumulated < height {
+                    let prev_rows = line_visual_rows(new_top - 1, &self.rope);
+                    if accumulated + prev_rows > height {
+                        break;
+                    }
+                    accumulated += prev_rows;
+                    new_top -= 1;
+                }
+                self.scroll_y = new_top;
             }
         } else {
             if self.cursor_y >= self.scroll_y + height {
-                self.scroll_y = self.cursor_y - height + 1;
+                self.scroll_y = self.cursor_y.saturating_sub(height - 1);
             }
 
             if self.cursor_x < self.scroll_x {
                 self.scroll_x = self.cursor_x;
             } else if self.cursor_x >= self.scroll_x + width {
-                self.scroll_x = self.cursor_x - width + 1;
+                self.scroll_x = self.cursor_x.saturating_sub(width - 1);
             }
         }
     }
