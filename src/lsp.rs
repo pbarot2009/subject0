@@ -1,29 +1,30 @@
-//! # Language Server Protocol (LSP) Client & Syntax Highlighting Subsystem
+//! # Language Server Protocol (LSP) Client & High-Performance Syntax Engine
 //!
-//! This module implements the language intelligence and code appearance layers for the
-//! `subject0` editor. It is split into two primary components:
+//! This module implements language intelligence and code styling for `subject0`:
 //!
 //! 1. **LSP Background Actor (`run_lsp_actor`)**:
-//!    An asynchronous, non-blocking Tokio task that manages the lifecycle of a language server
-//!    process (e.g., `rust-analyzer`, `pyright`). It communicates with the server over standard
-//!    I/O using JSON-RPC 2.0 framed with HTTP-style `Content-Length` headers, conforming to the
-//!    Language Server Protocol specification. Communication between the editor UI event loop
-//!    and this background actor occurs over unbounded Tokio MPSC channels via [`LspInbound`]
-//!    and [`LspOutbound`] messages.
+//!    Asynchronous, non-blocking Tokio task managing the language server child process
+//!    over JSON-RPC 2.0 with HTTP-style `Content-Length` framing.
 //!
-//! 2. **Syntax Highlighting Engine ([`SyntaxEngine`])**:
-//!    A token-level lexical analyzer and tree-sitter parser wrapper that transforms raw buffer
-//!    slices into styled Ratatui [`Span`] sequences for terminal rendering. It provides
-//!    per-language keyword, literal, comment, and identifier highlighting for 100+ languages,
-//!    as well as glyph and color resolution for file trees and completion menus.
+//! 2. **Compile-Time Static Syntax Engine ([`SyntaxEngine`])**:
+//!    Statically linked Tree-sitter parsers and built-in queries for primary languages
+//!    (Rust, C, C++, Python, Go, JS, TS, Bash, JSON, TOML, YAML, HTML, CSS, Markdown, Java).
+//!    Parses cleanly without runtime compilers or JIT dependencies.
+//!
+//! 3. **LSP Semantic Token Tier**:
+//!    Accurate compiler-provided semantic tokens for secondary or unsupported languages.
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use ratatui::{
     style::{Color, Modifier, Style},
     text::Span,
 };
+
+use tree_sitter::StreamingIterator;
+
 use serde_json::Value;
 use std::{
+    collections::HashMap,
     env, fs,
     path::{Path, PathBuf},
     process::Stdio,
@@ -40,49 +41,32 @@ use tokio::{
 /// Represents a single diagnostic entry emitted by an LSP server.
 #[derive(Debug, Clone)]
 pub struct DiagnosticItem {
-    /// Zero-based line number within the buffer where the diagnostic begins.
     pub line: usize,
-    /// Zero-based character/column offset within the line where the diagnostic begins.
     pub col: usize,
-    /// Human-readable diagnostic description or compiler error message.
     pub message: String,
-    /// LSP severity indicator:
-    /// - `1`: Error
-    /// - `2`: Warning
-    /// - `3`: Information
-    /// - `4`: Hint
     pub severity: u8,
 }
 
 /// An individual code completion candidate returned by the LSP server.
 #[derive(Debug, Clone)]
 pub struct SuggestionItem {
-    /// The primary label displayed in the completion popup menu (e.g., method name).
     pub label: String,
-    /// The exact text that should be placed into the buffer if this item is accepted.
     pub insert_text: String,
-    /// Optional auxiliary information (such as function signature or containing module).
     pub detail: Option<String>,
-    /// Numeric LSP `CompletionItemKind` discriminant (e.g., `2` for Method, `3` for Function).
     pub kind: u64,
 }
 
-/// Represents the current operational lifecycle state of the LSP server process.
+/// Operational lifecycle state of the LSP server process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LspStatus {
-    /// The LSP feature is disabled or not configured for the active buffer.
     Disabled,
-    /// The specified language server binary executable could not be resolved on the host.
     NotFound(String),
-    /// The server binary was located and spawned; the initialization handshake is underway.
     Starting(String),
-    /// The initialization handshake is complete, and the server is ready to handle requests.
     Ready(String),
-    /// An unrecoverable I/O or protocol error occurred, or the process terminated abnormally.
     Error(String),
 }
 
-/// Canonical semantic classification mapping server legends into unified editor colors.
+/// Canonical semantic classification mapping server legends and queries into unified theme tokens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanonicalTokenType {
     Keyword,
@@ -97,6 +81,7 @@ pub enum CanonicalTokenType {
     Operator,
     Macro,
     Namespace,
+    Tag,
     Other,
 }
 
@@ -116,11 +101,11 @@ impl CanonicalTokenType {
             "operator" => Self::Operator,
             "macro" | "attribute" => Self::Macro,
             "namespace" | "module" | "package" => Self::Namespace,
+            "tag" => Self::Tag,
             _ => Self::Other,
         }
     }
 
-    /// Maps standard Tree-sitter query capture names into unified theme tokens.
     pub fn from_query_capture(capture_name: &str) -> Self {
         let name = capture_name.trim_start_matches('@');
         if name.starts_with("keyword")
@@ -175,6 +160,8 @@ impl CanonicalTokenType {
             || name.starts_with("package")
         {
             Self::Namespace
+        } else if name.starts_with("tag") {
+            Self::Tag
         } else {
             Self::Other
         }
@@ -190,105 +177,135 @@ pub struct SemanticTokenSpan {
     pub token_type: CanonicalTokenType,
 }
 
-/// Commands and notifications routed from the editor frontend into the background LSP actor.
+/// Inbound messages routed to the background LSP actor.
 pub enum LspInbound {
-    /// Broadcasts an edit notification (`textDocument/didChange`) to synchronize document state.
     Change {
-        /// Full snapshot of the updated document buffer.
         text: String,
-        /// Monotonically increasing document version identifier.
         version: i64,
     },
-    /// Informs the language server that the active file has been persisted to disk (`textDocument/didSave`).
     Save,
-    /// Requests autocomplete items at a given buffer position (`textDocument/completion`).
     Completion {
-        /// Zero-based line number of the cursor.
         line: usize,
-        /// Zero-based character column index of the cursor.
         col: usize,
-        /// Correlation identifier used to pair the asynchronous response with this request.
         req_id: i64,
     },
-    /// Requests semantic highlighting tokens (`textDocument/semanticTokens/full`).
     SemanticTokens {
-        /// Correlation identifier used to pair the asynchronous response with this request.
         req_id: i64,
     },
-    /// Switches the active document context or notifies the server of an opened file (`textDocument/didOpen`).
     OpenFile {
-        /// Absolute or relative path to the newly opened file.
         path: PathBuf,
-        /// Complete textual contents of the file at the moment of opening.
         text: String,
-        /// LSP language identifier string.
         lang_id: String,
     },
 }
 
-/// Notifications and response payloads routed from the background LSP actor to the editor frontend.
+/// Outbound messages received from the background LSP actor.
 pub enum LspOutbound {
-    /// An update regarding the child process status or lifecycle transition.
     Status(LspStatus),
-    /// Set of diagnostics published by the server (`textDocument/publishDiagnostics`).
     Diagnostics(Vec<DiagnosticItem>),
-    /// Completion suggestions matching a prior [`LspInbound::Completion`] request.
     Completions {
-        /// Request correlation ID matching the ID provided during the request dispatch.
         req_id: i64,
-        /// List of completion candidates parsed from the server's response.
         items: Vec<SuggestionItem>,
     },
-    /// Semantic tokens decoded from `textDocument/semanticTokens/full`.
-    SemanticTokens { tokens: Vec<SemanticTokenSpan> },
+    SemanticTokens {
+        tokens: Vec<SemanticTokenSpan>,
+    },
 }
 
-/// Helper function to resolve the user's home directory cross-platform.
-fn get_home_dir() -> Option<PathBuf> {
-    env::var_os("HOME")
-        .or_else(|| env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
+// === Cross-Platform Path & Directory Resolution ===
+
+/// Locates standard data directory honoring Termux, XDG, macOS, and Windows conventions.
+pub fn subject0_data_dir() -> PathBuf {
+    if let Ok(custom) = env::var("SUBJECT0_DATA_DIR") {
+        return PathBuf::from(custom);
+    }
+    if let Some(data) = dirs::data_local_dir() {
+        return data.join("subject0");
+    }
+    if let Ok(prefix) = env::var("PREFIX") {
+        return PathBuf::from(prefix).join("share/subject0");
+    }
+    dirs::home_dir()
+        .map(|h| h.join(".local/share/subject0"))
+        .unwrap_or_else(|| PathBuf::from("./.subject0_data"))
 }
 
-/// Searches the host system to resolve the absolute path to an executable binary.
+/// Locates standard config directory honoring Termux, XDG, macOS, and Windows conventions.
+pub fn subject0_config_dir() -> PathBuf {
+    if let Ok(custom) = env::var("SUBJECT0_CONFIG_DIR") {
+        return PathBuf::from(custom);
+    }
+    if let Some(cfg) = dirs::config_dir() {
+        return cfg.join("subject0");
+    }
+    if let Ok(prefix) = env::var("PREFIX") {
+        return PathBuf::from(prefix).join("etc/subject0");
+    }
+    dirs::home_dir()
+        .map(|h| h.join(".config/subject0"))
+        .unwrap_or_else(|| PathBuf::from("./.subject0_cfg"))
+}
+
+/// Resolves an executable binary path across Android Termux, Linux, macOS, and Windows.
 pub fn resolve_binary_path(cmd: &str) -> Option<PathBuf> {
-    if let Ok(path_var) = env::var("PATH") {
-        for dir in env::split_paths(&path_var) {
-            let candidate = dir.join(cmd);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-            #[cfg(target_os = "windows")]
-            {
-                let candidate_exe = dir.join(format!("{cmd}.exe"));
-                if candidate_exe.is_file() {
-                    return Some(candidate_exe);
-                }
-                let candidate_cmd = dir.join(format!("{cmd}.cmd"));
-                if candidate_cmd.is_file() {
-                    return Some(candidate_cmd);
-                }
-            }
-        }
+    if let Ok(path) = which::which(cmd) {
+        return Some(path);
     }
 
-    if let Some(home) = get_home_dir() {
-        let cargo_bin = home.join(".cargo/bin").join(cmd);
-        if cargo_bin.is_file() {
-            return Some(cargo_bin);
+    let mut search_dirs = Vec::new();
+
+    if let Some(home) = dirs::home_dir() {
+        search_dirs.push(home.join(".cargo/bin"));
+        search_dirs.push(home.join(".local/bin"));
+        search_dirs.push(home.join("bin"));
+        search_dirs.push(home.join(".npm-global/bin"));
+        search_dirs.push(home.join("go/bin"));
+    }
+
+    if let Ok(prefix) = env::var("PREFIX") {
+        search_dirs.push(PathBuf::from(prefix).join("bin"));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(local_app) = env::var("LOCALAPPDATA") {
+            let base = PathBuf::from(local_app);
+            search_dirs.push(base.join("Programs"));
+            search_dirs.push(base.join("Microsoft/WindowsApps"));
+        }
+        if let Some(home) = dirs::home_dir() {
+            search_dirs.push(home.join("scoop/shims"));
+        }
+        search_dirs.push(PathBuf::from("C:\\ProgramData\\chocolatey\\bin"));
+    }
+
+    #[cfg(unix)]
+    {
+        search_dirs.push(PathBuf::from("/usr/local/bin"));
+        search_dirs.push(PathBuf::from("/opt/homebrew/bin"));
+        search_dirs.push(PathBuf::from("/usr/bin"));
+    }
+
+    for dir in search_dirs {
+        let candidate = dir.join(cmd);
+        if candidate.is_file() {
+            return Some(candidate);
         }
         #[cfg(target_os = "windows")]
         {
-            let cargo_bin_exe = home.join(".cargo/bin").join(format!("{cmd}.exe"));
-            if cargo_bin_exe.is_file() {
-                return Some(cargo_bin_exe);
+            for ext in &["exe", "cmd", "bat", "ps1"] {
+                let c = dir.join(format!("{cmd}.{ext}"));
+                if c.is_file() {
+                    return Some(c);
+                }
             }
         }
     }
+
     None
 }
 
-/// Converts a local filesystem path into an RFC 3986 compliant `file://` URI string.
+/// Converts local path to an RFC 3986 `file://` URI string.
 pub fn file_to_uri(path: &Path) -> String {
     let abs = if path.is_absolute() {
         path.to_path_buf()
@@ -306,13 +323,11 @@ pub fn file_to_uri(path: &Path) -> String {
     }
 }
 
-/// Case-insensitive URI matcher supporting Windows drive letter and trailing slash quirks.
 fn uris_match(a: &str, b: &str) -> bool {
     a.trim_end_matches('/')
         .eq_ignore_ascii_case(b.trim_end_matches('/'))
 }
 
-/// Maps a UTF-16 code unit offset within a line string into a 0-based character (Unicode scalar) index.
 pub fn utf16_to_char_col(line: &str, utf16_col: usize) -> usize {
     let mut current_utf16 = 0usize;
     let mut char_count = 0usize;
@@ -326,7 +341,6 @@ pub fn utf16_to_char_col(line: &str, utf16_col: usize) -> usize {
     char_count
 }
 
-/// Strips LSP snippet markup (e.g. `${1:foo}` -> `foo`, `$0` -> ``, `\$` -> `$`) into clean plain text.
 pub fn parse_snippet_to_plain_text(snippet: &str) -> String {
     let mut result = String::with_capacity(snippet.len());
     let mut chars = snippet.chars().peekable();
@@ -377,7 +391,8 @@ pub fn parse_snippet_to_plain_text(snippet: &str) -> String {
     result
 }
 
-/// Reads a single framed JSON-RPC message from an asynchronous buffered LSP stream.
+// === JSON-RPC LSP Framing ===
+
 pub async fn read_lsp_message<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> Result<Value> {
     let mut content_length = 0usize;
     let mut line = String::new();
@@ -402,7 +417,7 @@ pub async fn read_lsp_message<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> Res
         return Err(anyhow!("Missing Content-Length header"));
     }
     if content_length > 100 * 1024 * 1024 {
-        return Err(anyhow!("LSP payload exceeds 100MB limit"));
+        return Err(anyhow!("LSP payload exceeds 100MB safety limit"));
     }
 
     let mut body = vec![0u8; content_length];
@@ -411,7 +426,6 @@ pub async fn read_lsp_message<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> Res
     Ok(val)
 }
 
-/// Serializes a JSON payload and transmits it over an asynchronous stream with LSP framing headers.
 pub async fn send_lsp_message<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     value: &Value,
@@ -424,7 +438,6 @@ pub async fn send_lsp_message<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
-/// Resolves the actual binary name and standard arguments for an LSP command.
 pub fn server_cmd_and_args(cmd: &str) -> (String, Vec<&'static str>) {
     match cmd {
         "pyright" => {
@@ -451,7 +464,8 @@ pub fn server_cmd_and_args(cmd: &str) -> (String, Vec<&'static str>) {
     }
 }
 
-/// Background actor responsible for orchestrating an LSP server process session.
+// === Asynchronous LSP Background Actor ===
+
 pub async fn run_lsp_actor(
     initial_file: PathBuf,
     initial_lang: String,
@@ -471,6 +485,7 @@ pub async fn run_lsp_actor(
     let mut cmd_builder = TokioCommand::new(bin_path);
     cmd_builder.args(&args);
     cmd_builder.kill_on_drop(true);
+
     let mut child = match cmd_builder
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -492,8 +507,7 @@ pub async fn run_lsp_actor(
         Err(_) => "file://.".to_string(),
     };
     let mut current_file_uri = file_to_uri(&initial_file);
-    let mut pending_requests: std::collections::HashMap<i64, &'static str> =
-        std::collections::HashMap::new();
+    let mut pending_requests: HashMap<i64, &'static str> = HashMap::new();
 
     let root_path =
         env::current_dir().map_or_else(|_| ".".to_string(), |p| p.to_string_lossy().to_string());
@@ -506,17 +520,9 @@ pub async fn run_lsp_actor(
             "processId": std::process::id(),
             "rootPath": root_path,
             "rootUri": root_uri,
-            "workspaceFolders": [
-                {
-                    "uri": root_uri,
-                    "name": "root"
-                }
-            ],
+            "workspaceFolders": [{ "uri": root_uri, "name": "root" }],
             "capabilities": {
-                "workspace": {
-                    "workspaceFolders": true,
-                    "configuration": true
-                },
+                "workspace": { "workspaceFolders": true, "configuration": true },
                 "textDocument": {
                     "synchronization": {
                         "openClose": true,
@@ -530,9 +536,7 @@ pub async fn run_lsp_actor(
                             "documentationFormat": ["plaintext", "markdown"]
                         }
                     },
-                    "publishDiagnostics": {
-                        "relatedInformation": true
-                    },
+                    "publishDiagnostics": { "relatedInformation": true },
                     "semanticTokens": {
                         "requests": { "full": true },
                         "tokenTypes": [
@@ -541,22 +545,18 @@ pub async fn run_lsp_actor(
                             "property", "enumMember", "function", "method",
                             "macro", "keyword", "comment", "string", "number", "operator"
                         ],
-                        "tokenModifiers": [
-                            "declaration", "definition", "readonly", "static", "defaultLibrary"
-                        ],
+                        "tokenModifiers": ["declaration", "definition", "readonly", "static", "defaultLibrary"],
                         "formats": ["relative"]
                     }
                 }
             },
-            "initializationOptions": {
-                "checkOnSave": true
-            }
+            "initializationOptions": { "checkOnSave": true }
         }
     });
 
     if send_lsp_message(&mut stdin, &init_req).await.is_err() {
         let _ = tx.send(LspOutbound::Status(LspStatus::Error(
-            "Init request failed".into(),
+            "Init handshake write failed".into(),
         )));
         return;
     }
@@ -565,12 +565,11 @@ pub async fn run_lsp_actor(
     let init_timeout = tokio::time::sleep(tokio::time::Duration::from_secs(30));
     tokio::pin!(init_timeout);
 
-    // Non-blocking initialization loop with cancellation detection and server request responses.
     loop {
         tokio::select! {
             _ = &mut init_timeout => {
                 let _ = tx.send(LspOutbound::Status(LspStatus::Error(
-                    "LSP initialization timed out".into(),
+                    "LSP initialization timed out after 30 seconds".into(),
                 )));
                 return;
             }
@@ -582,7 +581,6 @@ pub async fn run_lsp_actor(
             msg = read_lsp_message(&mut stdout) => {
                 match msg {
                     Ok(val) => {
-                        // Respond to server-to-client requests that occur during initialization
                         if let Some(method) = val.get("method").and_then(Value::as_str) {
                             if let Some(req_id) = val.get("id") {
                                 let resp = serde_json::json!({
@@ -671,7 +669,6 @@ pub async fn run_lsp_actor(
     let _ = send_lsp_message(&mut stdin, &did_open).await;
     let _ = tx.send(LspOutbound::Status(LspStatus::Ready(server_cmd)));
 
-    // Main event loop multiplexing frontend commands and server responses.
     loop {
         tokio::select! {
             cmd = rx.recv() => {
@@ -714,9 +711,7 @@ pub async fn run_lsp_actor(
                             "jsonrpc": "2.0",
                             "id": req_id,
                             "method": "textDocument/semanticTokens/full",
-                            "params": {
-                                "textDocument": { "uri": current_file_uri }
-                            }
+                            "params": { "textDocument": { "uri": current_file_uri } }
                         });
                         let _ = send_lsp_message(&mut stdin, &st_req).await;
                     }
@@ -726,9 +721,7 @@ pub async fn run_lsp_actor(
                             let did_close = serde_json::json!({
                                 "jsonrpc": "2.0",
                                 "method": "textDocument/didClose",
-                                "params": {
-                                    "textDocument": { "uri": current_file_uri }
-                                }
+                                "params": { "textDocument": { "uri": current_file_uri } }
                             });
                             let _ = send_lsp_message(&mut stdin, &did_close).await;
                             current_file_uri = new_uri;
@@ -748,7 +741,6 @@ pub async fn run_lsp_actor(
                         let _ = send_lsp_message(&mut stdin, &open_req).await;
                     }
                     None => {
-                        // Graceful LSP shutdown sequence
                         let shutdown_req = serde_json::json!({
                             "jsonrpc": "2.0",
                             "id": 999_999,
@@ -804,7 +796,6 @@ pub async fn run_lsp_actor(
                                 }
                             }
                         } else if let Some(req_id) = json.get("id") {
-                            // Answer server requests to unblock the language server engine
                             let resp = serde_json::json!({
                                 "jsonrpc": "2.0",
                                 "id": req_id,
@@ -942,171 +933,58 @@ pub async fn run_lsp_actor(
     }
 }
 
-// === Dynamic Tree-Sitter Loader via libloading ===
+// === Custom Highlight Query Paths & Dynamic Grammar Stubs ===
 
-/// Encapsulates a dynamically loaded Tree-sitter parser and its compiled highlight query.
-pub struct DynamicGrammar {
-    pub parser: tree_sitter::Parser,
-    pub query: Option<tree_sitter::Query>,
-    _lib: libloading::Library,
+pub fn query_file_path(lang_name: &str) -> Option<PathBuf> {
+    if lang_name.is_empty() {
+        return None;
+    }
+    let dirs = [
+        subject0_config_dir().join("queries").join(lang_name),
+        subject0_data_dir().join("queries").join(lang_name),
+        PathBuf::from("./queries").join(lang_name),
+        PathBuf::from("./runtime/queries").join(lang_name),
+    ];
+
+    for d in &dirs {
+        let p = d.join("highlights.scm");
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
 }
 
+/// Dynamic grammar facade maintaining clean compatibility with `cmd.rs`.
+pub struct DynamicGrammar;
+
 impl DynamicGrammar {
-    fn grammar_search_dirs() -> Vec<PathBuf> {
-        let mut search_dirs = Vec::new();
-        if let Some(home) = get_home_dir() {
-            search_dirs.push(home.join(".local/share/subject0/grammars"));
-            search_dirs.push(home.join(".config/subject0/grammars"));
-            #[cfg(target_os = "windows")]
-            {
-                if let Ok(appdata) = env::var("LOCALAPPDATA") {
-                    search_dirs.push(PathBuf::from(appdata).join("subject0/grammars"));
-                }
-            }
-        }
-        search_dirs.push(PathBuf::from("./grammars"));
-        search_dirs.push(PathBuf::from("./runtime/grammars"));
-        search_dirs
-    }
-
-    fn query_search_dirs(lang_name: &str) -> Vec<PathBuf> {
-        let mut query_paths = Vec::new();
-        if let Some(home) = get_home_dir() {
-            query_paths.push(
-                home.join(".local/share/subject0/queries")
-                    .join(lang_name)
-                    .join("highlights.scm"),
-            );
-            query_paths.push(
-                home.join(".config/subject0/queries")
-                    .join(lang_name)
-                    .join("highlights.scm"),
-            );
-            #[cfg(target_os = "windows")]
-            {
-                if let Ok(appdata) = env::var("LOCALAPPDATA") {
-                    query_paths.push(
-                        PathBuf::from(appdata)
-                            .join("subject0/queries")
-                            .join(lang_name)
-                            .join("highlights.scm"),
-                    );
-                }
-            }
-        }
-        query_paths.push(
-            PathBuf::from("./queries")
-                .join(lang_name)
-                .join("highlights.scm"),
-        );
-        query_paths.push(
-            PathBuf::from("./runtime/queries")
-                .join(lang_name)
-                .join("highlights.scm"),
-        );
-        query_paths
-    }
-
-    pub fn load(lang_name: &str) -> Option<Self> {
-        if lang_name.is_empty() {
-            return None;
-        }
-
-        let ext = if cfg!(target_os = "windows") {
-            "dll"
-        } else if cfg!(target_os = "macos") {
-            "dylib"
-        } else {
-            "so"
-        };
-
-        let file_candidates = [
-            format!("{lang_name}.{ext}"),
-            format!("libtree-sitter-{lang_name}.{ext}"),
-            format!("tree-sitter-{lang_name}.{ext}"),
-        ];
-
-        let search_dirs = Self::grammar_search_dirs();
-
-        for dir in search_dirs {
-            for name in &file_candidates {
-                let p = dir.join(name);
-                if p.is_file()
-                    && let Ok(lib) = unsafe { libloading::Library::new(&p) }
-                {
-                    let symbol_name = format!("tree_sitter_{lang_name}");
-                    let constructor: Result<
-                        libloading::Symbol<unsafe extern "C" fn() -> tree_sitter::Language>,
-                        _,
-                    > = unsafe { lib.get(symbol_name.as_bytes()) };
-                    if let Ok(lang_fn) = constructor {
-                        let language = unsafe { lang_fn() };
-                        let mut parser = tree_sitter::Parser::new();
-                        if parser.set_language(&language).is_ok() {
-                            let mut query = None;
-                            let query_paths = Self::query_search_dirs(lang_name);
-
-                            for qp in query_paths {
-                                if qp.is_file()
-                                    && let Ok(content) = fs::read_to_string(&qp)
-                                    && let Ok(q) = tree_sitter::Query::new(&language, &content)
-                                {
-                                    query = Some(q);
-                                    break;
-                                }
-                            }
-
-                            if query.is_some() {
-                                return Some(Self {
-                                    parser,
-                                    query,
-                                    _lib: lib,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        None
-    }
-
     pub fn grammar_file_path(lang_name: &str) -> Option<PathBuf> {
-        if lang_name.is_empty() {
-            return None;
-        }
+        query_file_path(lang_name)
+    }
 
-        let ext = if cfg!(target_os = "windows") {
-            "dll"
-        } else if cfg!(target_os = "macos") {
-            "dylib"
-        } else {
-            "so"
-        };
+    pub fn download_wasm_grammar(lang_name: &str) -> Result<PathBuf> {
+        let sl = SupportedLanguage::all()
+            .iter()
+            .copied()
+            .find(|l| l.grammar_name() == lang_name || l.lsp_id() == lang_name);
 
-        let file_candidates = [
-            format!("{lang_name}.{ext}"),
-            format!("libtree-sitter-{lang_name}.{ext}"),
-            format!("tree-sitter-{lang_name}.{ext}"),
-        ];
-
-        let search_dirs = Self::grammar_search_dirs();
-
-        for dir in search_dirs {
-            for name in &file_candidates {
-                let p = dir.join(name);
-                if p.is_file() {
-                    return Some(p);
-                }
+        if let Some(lang) = sl {
+            if lang.static_language().is_some() {
+                return Ok(PathBuf::from("built-in"));
             }
         }
-        None
+
+        Err(anyhow!(
+            "Language '{lang_name}' is not in the compiled-in static grammar set.\n\
+             All primary languages (Rust, C, C++, Python, Go, JS, TS, Bash, JSON, TOML, YAML, HTML, CSS, Markdown, Java)\n\
+             are built-in with zero runtime overhead. LSP semantic highlighting is used for all other files."
+        ))
     }
 }
 
 // === Supported Languages Specification ===
 
-/// Identifies the source programming/markup language across 100+ languages.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SupportedLanguage {
     Rust,
@@ -1340,6 +1218,256 @@ impl SupportedLanguage {
             "vala" => SupportedLanguage::Vala,
             "gd" => SupportedLanguage::Gd,
             _ => SupportedLanguage::Plain,
+        }
+    }
+
+    /// Resolves compiled, statically linked grammar for top-tier languages.
+    pub fn static_language(self) -> Option<tree_sitter::Language> {
+        match self {
+            SupportedLanguage::Rust => Some(tree_sitter_rust::LANGUAGE.into()),
+            SupportedLanguage::C => Some(tree_sitter_c::LANGUAGE.into()),
+            SupportedLanguage::Cpp => Some(tree_sitter_cpp::LANGUAGE.into()),
+            SupportedLanguage::Python => Some(tree_sitter_python::LANGUAGE.into()),
+            SupportedLanguage::JavaScript => Some(tree_sitter_javascript::LANGUAGE.into()),
+            SupportedLanguage::TypeScript => {
+                Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            }
+            SupportedLanguage::Go => Some(tree_sitter_go::LANGUAGE.into()),
+            SupportedLanguage::Json => Some(tree_sitter_json::LANGUAGE.into()),
+            SupportedLanguage::Toml => Some(tree_sitter_toml_ng::LANGUAGE.into()),
+            SupportedLanguage::Yaml => Some(tree_sitter_yaml::LANGUAGE.into()),
+            SupportedLanguage::Bash | SupportedLanguage::Zsh => {
+                Some(tree_sitter_bash::LANGUAGE.into())
+            }
+            SupportedLanguage::Html => Some(tree_sitter_html::LANGUAGE.into()),
+            SupportedLanguage::Css => Some(tree_sitter_css::LANGUAGE.into()),
+            SupportedLanguage::Markdown => Some(tree_sitter_md::LANGUAGE.into()),
+            SupportedLanguage::Java => Some(tree_sitter_java::LANGUAGE.into()),
+            _ => None,
+        }
+    }
+
+    /// Built-in highlight queries guaranteeing instant syntax highlighting out of the box.
+    pub fn builtin_highlight_query(self) -> &'static str {
+        match self {
+            SupportedLanguage::Rust => {
+                r#"
+                (identifier) @variable
+                (type_identifier) @type
+                (primitive_type) @type
+                (field_identifier) @property
+                (call_expression function: (identifier) @function)
+                (call_expression function: (field_expression field: (field_identifier) @function))
+                (function_item name: (identifier) @function)
+                (macro_invocation macro: (identifier) @macro)
+                [
+                  "fn" "let" "mut" "pub" "struct" "enum" "impl" "trait" "use" "mod" "crate"
+                  "match" "if" "else" "while" "for" "in" "loop" "return" "break" "continue"
+                  "as" "const" "static" "type" "unsafe" "async" "await" "where" "ref" "move"
+                ] @keyword
+                (line_comment) @comment
+                (block_comment) @comment
+                (string_literal) @string
+                (raw_string_literal) @string
+                (char_literal) @string
+                (integer_literal) @number
+                (float_literal) @number
+                (boolean_literal) @number
+                "#
+            }
+            SupportedLanguage::Python => {
+                r#"
+                (identifier) @variable
+                (call function: (identifier) @function)
+                (call function: (attribute attribute: (identifier) @function))
+                (function_definition name: (identifier) @function)
+                (class_definition name: (identifier) @type)
+                (type (identifier) @type)
+                [
+                  "def" "class" "return" "if" "elif" "else" "for" "while" "break"
+                  "continue" "import" "from" "as" "try" "except" "finally" "raise"
+                  "with" "pass" "lambda" "yield" "global" "nonlocal" "assert" "async" "await"
+                ] @keyword
+                (comment) @comment
+                (string) @string
+                (integer) @number
+                (float) @number
+                (true) @number
+                (false) @number
+                (none) @keyword
+                "#
+            }
+            SupportedLanguage::C | SupportedLanguage::Cpp => {
+                r#"
+                (identifier) @variable
+                (type_identifier) @type
+                (primitive_type) @type
+                (field_identifier) @property
+                (call_expression function: (identifier) @function)
+                (call_expression function: (field_expression field: (field_identifier) @function))
+                (function_declarator declarator: (identifier) @function)
+                [
+                  "if" "else" "switch" "case" "default" "while" "do" "for" "break"
+                  "continue" "return" "goto" "struct" "union" "enum" "typedef"
+                  "sizeof" "static" "extern" "auto" "register" "const" "volatile"
+                  "class" "public" "private" "protected" "virtual" "template" "typename"
+                  "namespace" "using" "new" "delete" "this" "try" "catch" "throw"
+                ] @keyword
+                (comment) @comment
+                (string_literal) @string
+                (char_literal) @string
+                (number_literal) @number
+                (preproc_include) @macro
+                (preproc_def) @macro
+                (preproc_directive) @macro
+                "#
+            }
+            SupportedLanguage::Go => {
+                r#"
+                (identifier) @variable
+                (type_identifier) @type
+                (field_identifier) @property
+                (package_identifier) @namespace
+                (call_expression function: (identifier) @function)
+                (call_expression function: (selector_expression field: (field_identifier) @function))
+                (function_declaration name: (identifier) @function)
+                (method_declaration name: (field_identifier) @function)
+                [
+                  "func" "return" "var" "const" "type" "struct" "interface" "package"
+                  "import" "for" "range" "if" "else" "switch" "case" "default" "select"
+                  "go" "defer" "chan" "map" "break" "continue" "fallthrough"
+                ] @keyword
+                (comment) @comment
+                (raw_string_literal) @string
+                (interpreted_string_literal) @string
+                (int_literal) @number
+                (float_literal) @number
+                "#
+            }
+            SupportedLanguage::JavaScript | SupportedLanguage::TypeScript => {
+                r#"
+                (identifier) @variable
+                (type_identifier) @type
+                (property_identifier) @property
+                (call_expression function: (identifier) @function)
+                (call_expression function: (member_expression property: (property_identifier) @function))
+                (function_declaration name: (identifier) @function)
+                (method_definition name: (property_identifier) @function)
+                [
+                  "function" "const" "let" "var" "return" "if" "else" "switch" "case"
+                  "default" "for" "while" "do" "break" "continue" "try" "catch" "finally"
+                  "throw" "class" "extends" "import" "export" "from" "new"
+                  "this" "super" "async" "await" "yield" "typeof" "instanceof" "void"
+                  "type" "interface" "enum" "namespace" "declare" "abstract" "implements"
+                ] @keyword
+                (comment) @comment
+                (string) @string
+                (template_string) @string
+                (number) @number
+                (true) @number
+                (false) @number
+                (null) @keyword
+                (undefined) @keyword
+                "#
+            }
+            SupportedLanguage::Bash | SupportedLanguage::Zsh => {
+                r#"
+                (variable_name) @variable
+                (command_name) @function
+                [
+                  "if" "then" "else" "elif" "fi" "case" "esac" "for" "while" "until"
+                  "do" "done" "in" "function" "select" "time"
+                ] @keyword
+                (comment) @comment
+                (string) @string
+                (raw_string) @string
+                (number) @number
+                "#
+            }
+            SupportedLanguage::Json => {
+                r#"
+                (pair key: (string) @property)
+                (string) @string
+                (number) @number
+                [ "true" "false" ] @number
+                "null" @keyword
+                "#
+            }
+            SupportedLanguage::Toml => {
+                r#"
+                (table (bare_key) @type)
+                (pair (bare_key) @property)
+                (string) @string
+                (integer) @number
+                (float) @number
+                (boolean) @number
+                (comment) @comment
+                "#
+            }
+            SupportedLanguage::Yaml => {
+                r#"
+                (block_mapping_pair key: (flow_node) @property)
+                (string_scalar) @string
+                (integer_scalar) @number
+                (float_scalar) @number
+                (boolean_scalar) @number
+                (null_scalar) @keyword
+                (comment) @comment
+                "#
+            }
+            SupportedLanguage::Html => {
+                r#"
+                (tag_name) @tag
+                (attribute_name) @property
+                (attribute_value) @string
+                (comment) @comment
+                "#
+            }
+            SupportedLanguage::Css => {
+                r#"
+                (tag_name) @tag
+                (class_name) @type
+                (id_name) @type
+                (property_name) @property
+                (color_value) @number
+                (integer_value) @number
+                (float_value) @number
+                (string_value) @string
+                (comment) @comment
+                "#
+            }
+            SupportedLanguage::Markdown => {
+                r#"
+                (atx_heading) @type
+                (fenced_code_block) @string
+                (link) @property
+                "#
+            }
+            SupportedLanguage::Java => {
+                r#"
+                (identifier) @variable
+                (type_identifier) @type
+                (field_access field: (identifier) @property)
+                (method_invocation name: (identifier) @function)
+                (method_declaration name: (identifier) @function)
+                [
+                  "public" "private" "protected" "class" "interface" "enum" "extends"
+                  "implements" "return" "if" "else" "for" "while" "do" "break" "continue"
+                  "switch" "case" "default" "new" "this" "super" "try" "catch" "finally"
+                  "throw" "throws" "static" "final" "void" "package" "import"
+                ] @keyword
+                (line_comment) @comment
+                (block_comment) @comment
+                (string_literal) @string
+                (decimal_integer_literal) @number
+                (hex_integer_literal) @number
+                (floating_point_literal) @number
+                (true) @number
+                (false) @number
+                (null_literal) @keyword
+                "#
+            }
+            _ => "",
         }
     }
 
@@ -1872,92 +2000,153 @@ impl SupportedLanguage {
 
 // === Syntax Highlighting Engine ===
 
-/// Core syntax engine coordinating instant lexical highlighting, dynamic tree-sitter AST,
-/// and compiler-grade LSP semantic token overlays.
+/// High-speed syntax highlighting engine utilizing compiled AST grammars and LSP semantic overlays.
 pub struct SyntaxEngine {
     pub language: SupportedLanguage,
-    /// Tree must be placed before dynamic_grammar so that the tree is dropped before the
-    /// shared library is unloaded (libloading::Library drop executes dlclose).
+    pub parser: tree_sitter::Parser,
     pub tree: Option<tree_sitter::Tree>,
-    pub dynamic_grammar: Option<DynamicGrammar>,
-    /// Spatial lookup of Tree-sitter query tokens: line index -> tokens
-    pub ts_tokens: std::collections::HashMap<usize, Vec<SemanticTokenSpan>>,
-    /// Spatial lookup of LSP semantic tokens: line index -> tokens
-    pub semantic_tokens: std::collections::HashMap<usize, Vec<SemanticTokenSpan>>,
+    pub query: Option<tree_sitter::Query>,
+    pub ts_tokens: HashMap<usize, Vec<SemanticTokenSpan>>,
+    pub semantic_tokens: HashMap<usize, Vec<SemanticTokenSpan>>,
+    pub has_grammar: bool,
 }
 
 impl SyntaxEngine {
     pub fn new(path: Option<&PathBuf>) -> Self {
         let language = SupportedLanguage::from_path(path);
-        let dynamic_grammar = DynamicGrammar::load(language.grammar_name());
+        let mut parser = tree_sitter::Parser::new();
+        let mut query = None;
+        let mut has_grammar = false;
+
+        if let Some(static_lang) = language.static_language() {
+            if parser.set_language(&static_lang).is_ok() {
+                let query_src = if let Some(qp) = query_file_path(language.grammar_name()) {
+                    fs::read_to_string(qp)
+                        .unwrap_or_else(|_| language.builtin_highlight_query().to_string())
+                } else {
+                    language.builtin_highlight_query().to_string()
+                };
+
+                if let Ok(q) = tree_sitter::Query::new(&static_lang, &query_src) {
+                    query = Some(q);
+                    has_grammar = true;
+                }
+            }
+        }
 
         Self {
             language,
+            parser,
             tree: None,
-            dynamic_grammar,
-            ts_tokens: std::collections::HashMap::new(),
-            semantic_tokens: std::collections::HashMap::new(),
+            query,
+            ts_tokens: HashMap::new(),
+            semantic_tokens: HashMap::new(),
+            has_grammar,
         }
     }
 
     pub fn has_treesitter(&self) -> bool {
-        matches!(&self.dynamic_grammar, Some(dg) if dg.query.is_some())
+        self.has_grammar && self.query.is_some()
     }
 
+    /// Reparses the document without stale node reuse to eliminate tree misalignment issues.
     pub fn reparse(&mut self, text: &str) {
-        if let Some(dg) = &mut self.dynamic_grammar {
-            if let Some(query) = &dg.query {
-                self.tree = dg.parser.parse(text, None);
-                self.ts_tokens.clear();
+        if !self.has_grammar {
+            return;
+        }
 
-                if let Some(tree) = &self.tree {
-                    let mut cursor = tree_sitter::QueryCursor::new();
-                    let text_bytes = text.as_bytes();
-                    let lines: Vec<&str> = text.lines().collect();
+        let Some(query) = &self.query else {
+            return;
+        };
 
-                    let byte_col_to_char_col = |line: &str, byte_col: usize| -> usize {
-                        let safe_col = byte_col.min(line.len());
-                        let mut boundary = safe_col;
-                        while boundary > 0 && !line.is_char_boundary(boundary) {
-                            boundary -= 1;
+        self.tree = self.parser.parse(text, None);
+        self.ts_tokens.clear();
+
+        let Some(tree) = &self.tree else {
+            return;
+        };
+
+        let mut cursor = tree_sitter::QueryCursor::new();
+        let text_bytes = text.as_bytes();
+        let lines: Vec<&str> = text.split('\n').collect();
+
+        let byte_col_to_char_col = |line_str: &str, byte_col: usize| -> usize {
+            let clean = line_str.strip_suffix('\r').unwrap_or(line_str);
+            let mut boundary = byte_col.min(clean.len());
+            while boundary > 0 && !clean.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            clean[..boundary].chars().count()
+        };
+
+        let mut matches = cursor.matches(query, tree.root_node(), text_bytes);
+        while let Some(m) = matches.next() {
+            for capture in m.captures {
+                let node = capture.node;
+                let capture_names = query.capture_names();
+                let capture_idx = capture.index as usize;
+                if capture_idx >= capture_names.len() {
+                    continue;
+                }
+                let capture_name = capture_names[capture_idx];
+                let token_type = CanonicalTokenType::from_query_capture(capture_name);
+
+                if token_type == CanonicalTokenType::Other {
+                    continue;
+                }
+
+                let start_pos = node.start_position();
+                let end_pos = node.end_position();
+
+                if start_pos.row == end_pos.row {
+                    let row = start_pos.row;
+                    if let Some(line_str) = lines.get(row) {
+                        let c_start = byte_col_to_char_col(line_str, start_pos.column);
+                        let c_end = byte_col_to_char_col(line_str, end_pos.column);
+                        let len = c_end.saturating_sub(c_start);
+                        if len > 0 {
+                            self.ts_tokens
+                                .entry(row)
+                                .or_default()
+                                .push(SemanticTokenSpan {
+                                    line: row,
+                                    start_col: c_start,
+                                    length: len,
+                                    token_type,
+                                });
                         }
-                        line[..boundary].chars().count()
-                    };
+                    }
+                } else if matches!(
+                    token_type,
+                    CanonicalTokenType::Comment | CanonicalTokenType::String
+                ) {
+                    for row in start_pos.row..=end_pos.row {
+                        if let Some(line_str) = lines.get(row) {
+                            let clean = line_str.strip_suffix('\r').unwrap_or(line_str);
+                            let byte_start = if row == start_pos.row {
+                                start_pos.column
+                            } else {
+                                0
+                            };
+                            let byte_end = if row == end_pos.row {
+                                end_pos.column
+                            } else {
+                                clean.len()
+                            };
 
-                    for m in cursor.matches(query, tree.root_node(), text_bytes) {
-                        for capture in m.captures {
-                            let node = capture.node;
-                            let start = node.start_position();
-                            let end = node.end_position();
-                            let capture_name = query.capture_names()[capture.index as usize];
-                            let token_type = CanonicalTokenType::from_query_capture(capture_name);
-
-                            if token_type != CanonicalTokenType::Other {
-                                for row in start.row..=end.row {
-                                    let col_start = if row == start.row { start.column } else { 0 };
-                                    let col_end = if row == end.row {
-                                        end.column
-                                    } else {
-                                        lines.get(row).map_or(0, |l| l.len())
-                                    };
-
-                                    if col_end > col_start
-                                        && let Some(line_str) = lines.get(row)
-                                    {
-                                        let char_start = byte_col_to_char_col(line_str, col_start);
-                                        let char_end = byte_col_to_char_col(line_str, col_end);
-                                        if char_end > char_start {
-                                            self.ts_tokens.entry(row).or_default().push(
-                                                SemanticTokenSpan {
-                                                    line: row,
-                                                    start_col: char_start,
-                                                    length: char_end - char_start,
-                                                    token_type,
-                                                },
-                                            );
-                                        }
-                                    }
-                                }
+                            let c_start = byte_col_to_char_col(clean, byte_start);
+                            let c_end = byte_col_to_char_col(clean, byte_end);
+                            let len = c_end.saturating_sub(c_start);
+                            if len > 0 {
+                                self.ts_tokens
+                                    .entry(row)
+                                    .or_default()
+                                    .push(SemanticTokenSpan {
+                                        line: row,
+                                        start_col: c_start,
+                                        length: len,
+                                        token_type,
+                                    });
                             }
                         }
                     }
@@ -2005,7 +2194,7 @@ impl SyntaxEngine {
         let mut styles = vec![default_style; chars.len()];
 
         if let Some(tokens) = self.ts_tokens.get(&line_idx) {
-            let mut sorted_tokens = tokens.clone();
+            let mut sorted = tokens.clone();
 
             let specificity = |t: CanonicalTokenType| -> u8 {
                 match t {
@@ -2015,23 +2204,24 @@ impl SyntaxEngine {
                     CanonicalTokenType::Property => 3,
                     CanonicalTokenType::Parameter => 4,
                     CanonicalTokenType::Namespace => 5,
-                    CanonicalTokenType::Macro => 6,
-                    CanonicalTokenType::Number => 7,
-                    CanonicalTokenType::String => 8,
-                    CanonicalTokenType::Comment => 9,
-                    CanonicalTokenType::Type => 10,
-                    CanonicalTokenType::Function => 11,
-                    CanonicalTokenType::Keyword => 12,
+                    CanonicalTokenType::Tag => 6,
+                    CanonicalTokenType::Macro => 7,
+                    CanonicalTokenType::Number => 8,
+                    CanonicalTokenType::String => 9,
+                    CanonicalTokenType::Comment => 10,
+                    CanonicalTokenType::Type => 11,
+                    CanonicalTokenType::Function => 12,
+                    CanonicalTokenType::Keyword => 13,
                 }
             };
 
-            sorted_tokens.sort_by(|a, b| {
+            sorted.sort_by(|a, b| {
                 b.length
                     .cmp(&a.length)
                     .then_with(|| specificity(a.token_type).cmp(&specificity(b.token_type)))
             });
 
-            for tok in sorted_tokens {
+            for tok in sorted {
                 if tok.token_type == CanonicalTokenType::Other {
                     continue;
                 }
@@ -2132,6 +2322,9 @@ impl SyntaxEngine {
                 .add_modifier(Modifier::BOLD),
             CanonicalTokenType::Operator => Style::default().fg(Color::Rgb(140, 150, 170)),
             CanonicalTokenType::Namespace => Style::default().fg(Color::Rgb(140, 180, 240)),
+            CanonicalTokenType::Tag => Style::default()
+                .fg(Color::Rgb(240, 110, 110))
+                .add_modifier(Modifier::BOLD),
             CanonicalTokenType::Variable => Style::default().fg(Color::Rgb(215, 220, 235)),
             CanonicalTokenType::Parameter => Style::default().fg(Color::Rgb(245, 175, 145)),
             CanonicalTokenType::Property => Style::default().fg(Color::Rgb(160, 205, 245)),
@@ -2140,7 +2333,8 @@ impl SyntaxEngine {
     }
 }
 
-/// Returns the Nerd Font glyph icon and corresponding theme color for a file path.
+// === UI Helpers ===
+
 pub fn file_icon_and_color(path: Option<&PathBuf>) -> (&'static str, Color) {
     let ext = path
         .and_then(|p| p.extension())
@@ -2178,7 +2372,6 @@ pub fn file_icon_and_color(path: Option<&PathBuf>) -> (&'static str, Color) {
     }
 }
 
-/// Returns the Nerd Font glyph icon and theme color for an LSP `CompletionItemKind`.
 pub fn completion_kind_icon(kind: u64) -> (&'static str, Color) {
     match kind {
         2 | 3 => ("󰊕", Color::Rgb(80, 200, 240)),

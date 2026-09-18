@@ -2,7 +2,7 @@
 //!
 //! This module serves as the runtime orchestrator for `subject0`. It integrates the
 //! terminal lifecycle, asynchronous event multiplexing, input decoding, and the
-//! frame rendering pipeline.
+//! frame rendering pipeline[span_1](start_span)[span_1](end_span).
 
 mod cmd;
 mod editor;
@@ -10,7 +10,7 @@ mod lsp;
 
 use std::{
     cmp::Ordering,
-    io::{Write, stdout},
+    io::{stdout, Write},
     time::Duration,
 };
 
@@ -23,24 +23,25 @@ use crossterm::{
         KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
-    Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Position, Rect, Size},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
+    Frame, Terminal,
 };
 use tokio::sync::mpsc;
 
-use editor::{Editor, Focus, Mode, line_len};
-use lsp::{LspOutbound, LspStatus, SuggestionItem, completion_kind_icon, file_icon_and_color};
+use editor::{Editor, Focus, Mode};
+
+use lsp::{completion_kind_icon, file_icon_and_color, LspOutbound, LspStatus, SuggestionItem};
 
 /// RAII Terminal Guard ensuring the host terminal is reliably restored
 /// to canonical mode regardless of whether the program exits cleanly,
-/// returns a `Result::Err`, or panics.
+/// returns a `Result::Err`, or panics[span_2](start_span)[span_2](end_span).
 struct TerminalGuard;
 
 impl TerminalGuard {
@@ -62,21 +63,21 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// Configures the terminal hardware cursor geometry based on the active modal editing state.
+/// Configures the terminal hardware cursor geometry based on the active modal editing state[span_3](start_span)[span_3](end_span).
 fn set_terminal_cursor_style(mode: Mode) {
     let mut stdout = stdout();
     match mode {
         Mode::Normal | Mode::Command | Mode::Visual { .. } => {
-            let _ = stdout.write_all(b"\x1b[2 q"); // Steady Block
+            let _ = stdout.write_all(b"\x1b[2 q"); // Steady Block[span_4](start_span)[span_4](end_span)
         }
         Mode::Insert => {
-            let _ = stdout.write_all(b"\x1b[6 q"); // Steady Bar / I-Beam
+            let _ = stdout.write_all(b"\x1b[6 q"); // Steady Bar / I-Beam[span_5](start_span)[span_5](end_span)
         }
     }
     let _ = stdout.flush();
 }
 
-/// Registers a secondary panic hook ensuring screen recovery during thread unwinding.
+/// Registers a secondary panic hook ensuring screen recovery during thread unwinding[span_6](start_span)[span_6](end_span).
 fn setup_panic_hook() {
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -89,7 +90,7 @@ fn setup_panic_hook() {
     }));
 }
 
-/// Safely truncates a string by Unicode scalar count without slicing mid-codepoint.
+/// Safely truncates a string by Unicode scalar count without slicing mid-codepoint[span_7](start_span)[span_7](end_span).
 fn safe_truncate(s: &str, max_chars: usize) -> String {
     if s.chars().count() > max_chars {
         let mut result: String = s.chars().take(max_chars.saturating_sub(1)).collect();
@@ -100,7 +101,7 @@ fn safe_truncate(s: &str, max_chars: usize) -> String {
     }
 }
 
-/// Calculates the visual column width of a rope line taking expanded tabs into account.
+/// Calculates the visual column width of a rope line taking expanded tabs into account[span_8](start_span)[span_8](end_span).
 fn visual_line_len(rope: &ropey::Rope, line_idx: usize) -> usize {
     if line_idx >= rope.len_lines() {
         return 0;
@@ -152,10 +153,10 @@ async fn main() -> Result<()> {
     let (lsp_out_tx, mut lsp_out_rx) = mpsc::unbounded_channel::<LspOutbound>();
     editor.lsp_out_tx = Some(lsp_out_tx.clone());
 
-    if let Some(path) = &target_path
-        && path.is_file()
-    {
-        editor.ensure_lsp_for_file(path);
+    if let Some(path) = &target_path {
+        if path.is_file() {
+            editor.ensure_lsp_for_file(path);
+        }
     }
 
     set_terminal_cursor_style(editor.mode);
@@ -165,7 +166,7 @@ async fn main() -> Result<()> {
     while !editor.should_quit {
         let mut received_lsp_msg = false;
 
-        // Drain incoming messages emitted by the background LSP actor.
+        // Drain incoming messages emitted by the background LSP actor[span_9](start_span)[span_9](end_span).
         while let Ok(msg) = lsp_out_rx.try_recv() {
             received_lsp_msg = true;
             match msg {
@@ -247,7 +248,6 @@ async fn main() -> Result<()> {
             needs_redraw = false;
         }
 
-        // Event polling: idle sleep when stationary, animated poll when loading.
         let poll_duration = if is_loading {
             Duration::from_millis(60)
         } else {
@@ -283,7 +283,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
     let viewport_top = 1u16;
     let viewport_bottom = size.height.saturating_sub(3);
 
-    // 1. Intercept Help Modal (Modal shield prevents fall-through to document)
+    // 1. Intercept Help Modal (Modal shield prevents fall-through to document)[span_10](start_span)[span_10](end_span)
     if editor.show_help {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             let width = 64u16.min(size.width.saturating_sub(4));
@@ -302,7 +302,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         return;
     }
 
-    // 2. Intercept LSP Server Picker Modal
+    // 2. Intercept LSP Server Picker Modal[span_11](start_span)[span_11](end_span)
     if let Some(picker) = &editor.lsp_picker {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             let width = 48u16.min(size.width.saturating_sub(2));
@@ -341,7 +341,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         return;
     }
 
-    // 3. Intercept Command Palette Interactions
+    // 3. Intercept Command Palette Interactions[span_12](start_span)[span_12](end_span)
     if editor.palette.visible {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             let width = 46u16.min(size.width.saturating_sub(2));
@@ -349,7 +349,6 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
             let x = (size.width.saturating_sub(width)) / 2;
             let y = 1u16;
 
-            // Header prompt occupies y+1, separator occupies y+2. Entries begin at y+3.
             if mouse.column >= x + 1
                 && mouse.column < x + width - 1
                 && mouse.row >= y + 3
@@ -376,7 +375,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         return;
     }
 
-    // 4. Statusline Taps with dynamically measured badge boundaries
+    // 4. Statusline Taps with dynamically measured badge boundaries[span_13](start_span)[span_13](end_span)
     if mouse.row == status_row {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             let badge_len = match editor.mode {
@@ -434,7 +433,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         0u16
     };
 
-    // 5. File Explorer Sidebar Interactions
+    // 5. File Explorer Sidebar Interactions[span_14](start_span)[span_14](end_span)
     if editor.explorer.visible && mouse.column < explorer_width {
         let max_visible = viewport_bottom.saturating_sub(viewport_top) as usize;
         match mouse.kind {
@@ -471,7 +470,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         return;
     }
 
-    // 6. Completion Dropdown Interactions
+    // 6. Completion Dropdown Interactions[span_15](start_span)[span_15](end_span)
     if editor.completion_visible && !editor.completions.is_empty() {
         if let Some((px, py, pw, ph)) = editor.completion_rect {
             let in_popup = mouse.column >= px
@@ -516,7 +515,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         }
     }
 
-    // 7. Document Viewport Buffer Interactions
+    // 7. Document Viewport Buffer Interactions[span_16](start_span)[span_16](end_span)
     let gutter_digits = editor.rope.len_lines().max(1).to_string().len().max(2);
     let gutter_width = gutter_digits + 4;
     let content_left = explorer_width + 1u16 + gutter_width as u16;
@@ -627,7 +626,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
     let prev_mode = editor.mode;
     let max_visible = 6usize;
 
-    // 1. Intercept In-Editor Help Modal Navigation
+    // 1. Intercept In-Editor Help Modal Navigation[span_17](start_span)[span_17](end_span)
     if editor.show_help {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q' | '?') => {
@@ -650,7 +649,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // 2. Intercept LSP Server Selection Modal
+    // 2. Intercept LSP Server Selection Modal[span_18](start_span)[span_18](end_span)
     if let Some(mut picker) = editor.lsp_picker.take() {
         if picker.candidates.is_empty() {
             editor.status_msg = "No LSP candidates available".to_string();
@@ -693,7 +692,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // 3. Intercept Command Palette Key Events
+    // 3. Intercept Command Palette Key Events[span_19](start_span)[span_19](end_span)
     if editor.palette.visible {
         let cmds = editor.palette.filtered_commands();
         match key.code {
@@ -734,7 +733,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // 4. Global Shortcuts: Ctrl-E for File Explorer
+    // 4. Global Shortcuts: Ctrl-E for File Explorer[span_20](start_span)[span_20](end_span)
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('e') {
         editor.explorer.visible = !editor.explorer.visible;
         if editor.explorer.visible {
@@ -746,7 +745,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // 5. File Explorer Navigation Focus
+    // 5. File Explorer Navigation Focus[span_21](start_span)[span_21](end_span)
     if editor.focus == Focus::Explorer && editor.explorer.visible {
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
@@ -779,7 +778,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // 6. Modal Editing Handler
+    // 6. Modal Editing Handler[span_22](start_span)[span_22](end_span)
     match editor.mode {
         Mode::Normal => {
             editor.completion_visible = false;
@@ -1128,7 +1127,7 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         (None, main_chunks[0])
     };
 
-    // 1. Render File Explorer (Sidebar)
+    // 1. Render File Explorer (Sidebar)[span_23](start_span)[span_23](end_span)
     if let Some(exp_rect) = explorer_area {
         let is_focused = editor.focus == Focus::Explorer;
         let border_color = if is_focused {
@@ -1192,7 +1191,7 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         frame.render_widget(Paragraph::new(tree_lines), inner_exp);
     }
 
-    // 2. Render Document Editor Viewport
+    // 2. Render Document Editor Viewport[span_24](start_span)[span_24](end_span)
     let (icon, icon_color) = file_icon_and_color(editor.path.as_ref());
     let file_title = editor.path.as_ref().map_or_else(
         || "unnamed".into(),
@@ -1284,7 +1283,6 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         }
 
         let syntax_spans = editor.syntax.highlight_line(&line_str, y);
-        // Triple maintains: (char, Style, original_buffer_char_index)
         let mut char_cells: Vec<(char, Style, usize)> = Vec::with_capacity(line_str.len() * 2);
         let mut char_idx = 0;
         for span in syntax_spans {
@@ -1436,7 +1434,7 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
     frame.render_widget(Paragraph::new(visible_lines), inner_area);
 
-    // 3. Render Statusline
+    // 3. Render Statusline[span_25](start_span)[span_25](end_span)
     let (badge_text, badge_color) = match editor.mode {
         Mode::Normal => (" NORMAL ", Color::Rgb(80, 140, 255)),
         Mode::Insert => (" INSERT ", Color::Rgb(70, 200, 120)),
@@ -1579,7 +1577,7 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         main_chunks[1],
     );
 
-    // 4. Diagnostics / Command Bar Area
+    // 4. Diagnostics / Command Bar Area[span_26](start_span)[span_26](end_span)
     if editor.mode == Mode::Command {
         let prompt_line = Line::from(vec![
             Span::styled(
@@ -1636,7 +1634,7 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             editor.completion_rect = None;
         }
 
-        // Floating Auto-Complete Dropdown
+        // Floating Auto-Complete Dropdown[span_27](start_span)[span_27](end_span)
         if editor.mode == Mode::Insert
             && editor.completion_visible
             && !editor.completions.is_empty()
@@ -1712,16 +1710,16 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             frame.render_widget(Paragraph::new(list_lines).block(comp_block), popup_rect);
         }
 
-        if editor.focus == Focus::Editor
-            && let Some((cx, cy)) = cursor_screen_pos
-            && cx < inner_area.right()
-            && cy < inner_area.bottom()
-        {
-            frame.set_cursor_position(Position::new(cx, cy));
+        if editor.focus == Focus::Editor {
+            if let Some((cx, cy)) = cursor_screen_pos {
+                if cx < inner_area.right() && cy < inner_area.bottom() {
+                    frame.set_cursor_position(Position::new(cx, cy));
+                }
+            }
         }
     }
 
-    // 5. Render Command Palette Modal
+    // 5. Render Command Palette Modal[span_28](start_span)[span_28](end_span)
     if editor.palette.visible {
         let width = 46u16.min(size.width.saturating_sub(2));
         let height = 12u16.min(size.height.saturating_sub(2));
@@ -1817,7 +1815,7 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         frame.render_widget(Paragraph::new(palette_lines).block(p_block), palette_rect);
     }
 
-    // 6. Render LSP Picker Modal Overlay
+    // 6. Render LSP Picker Modal Overlay[span_29](start_span)[span_29](end_span)
     if let Some(picker) = &editor.lsp_picker {
         let width = 48u16.min(size.width.saturating_sub(2));
         let height = ((picker.candidates.len() as u16) + 4).min(size.height.saturating_sub(2));
@@ -1889,7 +1887,7 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         frame.render_widget(Paragraph::new(lines).block(block), picker_rect);
     }
 
-    // 7. Render In-Editor Help Modal
+    // 7. Render In-Editor Help Modal[span_30](start_span)[span_30](end_span)
     if editor.show_help {
         let width = 64u16.min(size.width.saturating_sub(4));
         let height = 22u16.min(size.height.saturating_sub(2));

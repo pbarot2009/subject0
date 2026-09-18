@@ -32,11 +32,30 @@ tokio = { version = "1.38", features = [
     "time",
 ] }
 
-# Dynamic shared library loading for external tree-sitter grammars
-libloading = "0.8"
+# Cross-platform executable and directory resolution across Termux, Linux, macOS, and Windows
+which = "7.0"
+dirs = "6.0"
 
-# Tree-sitter parser core
-tree-sitter = "0.22"
+# Pure Tree-sitter core & highlight query runtime (no Cranelift / Wasmtime bloat)
+tree-sitter = "0.25"
+tree-sitter-highlight = "0.25"
+
+# Statically compiled, zero-lag grammars for primary languages
+tree-sitter-rust = "0.23"
+tree-sitter-c = "0.23"
+tree-sitter-cpp = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-go = "0.23"
+tree-sitter-json = "0.24"
+tree-sitter-toml-ng = "0.7"
+tree-sitter-yaml = "0.7"
+tree-sitter-bash = "0.23"
+tree-sitter-html = "0.23"
+tree-sitter-css = "0.23"
+tree-sitter-md = "0.3"
+tree-sitter-java = "0.23"
 
 # Serialization for JSON-RPC LSP communication
 serde = { version = "1.0", features = ["derive"] }
@@ -44,6 +63,7 @@ serde_json = "1.0"
 
 # Error handling
 anyhow = "1.0"
+thiserror = "2.0"
 
 [profile.release]
 opt-level = 3
@@ -57,7 +77,6 @@ unused_must_use = "warn"
 unused_qualifications = "warn"
 
 [lints.clippy]
-# Enable pedantic lints as warnings, allowing specific UI/text-editing edge cases
 pedantic = { level = "warn", priority = -1 }
 cast_possible_truncation = "allow"
 cast_sign_loss = "allow"
