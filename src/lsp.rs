@@ -1,27 +1,24 @@
-//! # Language Server Protocol (LSP) Client & High-Performance Syntax Engine
+//! # Language Server Protocol (LSP) Client & Themed Syntax Engine
 //!
 //! This module implements language intelligence and code styling for `subject0`:
 //!
 //! 1. **LSP Background Actor (`run_lsp_actor`)**:
 //!    Asynchronous, non-blocking Tokio task managing the language server child process
-//!    over JSON-RPC 2.0 with HTTP-style `Content-Length` framing.
+//!    over JSON-RPC 2.0 with HTTP-style `Content-Length` framing[span_0](start_span)[span_0](end_span).
 //!
 //! 2. **Compile-Time Static Syntax Engine ([`SyntaxEngine`])**:
 //!    Statically linked Tree-sitter parsers and built-in queries for primary languages
 //!    (Rust, C, C++, Python, Go, JS, TS, Bash, JSON, TOML, YAML, HTML, CSS, Markdown, Java).
-//!    Parses cleanly without runtime compilers or JIT dependencies.
+//!    All tokens are styled dynamically against the active [`Theme`].
 //!
 //! 3. **LSP Semantic Token Tier**:
-//!    Accurate compiler-provided semantic tokens for secondary or unsupported languages.
+//!    Compiler-accurate semantic token styling for languages without static AST parsers[span_1](start_span)[span_1](end_span).
 
 use anyhow::{anyhow, Result};
 use ratatui::{
     style::{Color, Modifier, Style},
     text::Span,
 };
-
-use tree_sitter::StreamingIterator;
-
 use serde_json::Value;
 use std::{
     collections::HashMap,
@@ -35,10 +32,13 @@ use tokio::{
     process::{ChildStdin, Command as TokioCommand},
     sync::mpsc,
 };
+use tree_sitter::StreamingIterator;
+
+use crate::theme::Theme;
 
 // === LSP Types & Actor Protocol ===
 
-/// Represents a single diagnostic entry emitted by an LSP server.
+/// Represents a single diagnostic entry emitted by an LSP server[span_2](start_span)[span_2](end_span).
 #[derive(Debug, Clone)]
 pub struct DiagnosticItem {
     pub line: usize,
@@ -47,7 +47,7 @@ pub struct DiagnosticItem {
     pub severity: u8,
 }
 
-/// An individual code completion candidate returned by the LSP server.
+/// An individual code completion candidate returned by the LSP server[span_3](start_span)[span_3](end_span).
 #[derive(Debug, Clone)]
 pub struct SuggestionItem {
     pub label: String,
@@ -56,7 +56,7 @@ pub struct SuggestionItem {
     pub kind: u64,
 }
 
-/// Operational lifecycle state of the LSP server process.
+/// Operational lifecycle state of the LSP server process[span_4](start_span)[span_4](end_span).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LspStatus {
     Disabled,
@@ -66,7 +66,7 @@ pub enum LspStatus {
     Error(String),
 }
 
-/// Canonical semantic classification mapping server legends and queries into unified theme tokens.
+/// Canonical semantic classification mapping server legends and queries into unified theme tokens[span_5](start_span)[span_5](end_span).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanonicalTokenType {
     Keyword,
@@ -168,7 +168,7 @@ impl CanonicalTokenType {
     }
 }
 
-/// A single decoded semantic token span positioned in buffer coordinates.
+/// A single decoded semantic token span positioned in buffer coordinates[span_6](start_span)[span_6](end_span).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SemanticTokenSpan {
     pub line: usize,
@@ -177,7 +177,7 @@ pub struct SemanticTokenSpan {
     pub token_type: CanonicalTokenType,
 }
 
-/// Inbound messages routed to the background LSP actor.
+/// Inbound messages routed to the background LSP actor[span_7](start_span)[span_7](end_span).
 pub enum LspInbound {
     Change {
         text: String,
@@ -199,7 +199,7 @@ pub enum LspInbound {
     },
 }
 
-/// Outbound messages received from the background LSP actor.
+/// Outbound messages received from the background LSP actor[span_8](start_span)[span_8](end_span).
 pub enum LspOutbound {
     Status(LspStatus),
     Diagnostics(Vec<DiagnosticItem>),
@@ -305,7 +305,7 @@ pub fn resolve_binary_path(cmd: &str) -> Option<PathBuf> {
     None
 }
 
-/// Converts local path to an RFC 3986 `file://` URI string.
+/// Converts local path to an RFC 3986 `file://` URI string[span_9](start_span)[span_9](end_span).
 pub fn file_to_uri(path: &Path) -> String {
     let abs = if path.is_absolute() {
         path.to_path_buf()
@@ -963,6 +963,7 @@ impl DynamicGrammar {
         query_file_path(lang_name)
     }
 
+    #[allow(dead_code)]
     pub fn download_wasm_grammar(lang_name: &str) -> Result<PathBuf> {
         let sl = SupportedLanguage::all()
             .iter()
@@ -1998,9 +1999,10 @@ impl SupportedLanguage {
     }
 }
 
-// === Syntax Highlighting Engine ===
+// === Themed Syntax Highlighting Engine ===
 
-/// High-speed syntax highlighting engine utilizing compiled AST grammars and LSP semantic overlays.
+/// High-speed syntax highlighting engine utilizing compiled AST grammars,
+/// dynamic query resolution, and LSP semantic overlays styled against the active theme.
 pub struct SyntaxEngine {
     pub language: SupportedLanguage,
     pub parser: tree_sitter::Parser,
@@ -2165,32 +2167,43 @@ impl SyntaxEngine {
         }
     }
 
-    pub fn highlight_line(&self, line_text: &str, line_idx: usize) -> Vec<Span<'static>> {
+    /// Renders styled terminal spans for a single line using the active [`Theme`].
+    pub fn highlight_line(
+        &self,
+        line_text: &str,
+        line_idx: usize,
+        theme: &Theme,
+    ) -> Vec<Span<'static>> {
         if line_text.is_empty() {
             return vec![Span::raw("")];
         }
 
         if self.has_treesitter() {
-            return self.render_treesitter_line(line_text, line_idx);
+            return self.render_treesitter_line(line_text, line_idx, theme);
         }
 
         if !self.semantic_tokens.is_empty() {
-            return self.render_semantic_line(line_text, line_idx);
+            return self.render_semantic_line(line_text, line_idx, theme);
         }
 
         vec![Span::styled(
             line_text.to_string(),
-            Style::default().fg(Color::Rgb(220, 225, 235)),
+            Style::default().fg(theme.fg),
         )]
     }
 
-    fn render_treesitter_line(&self, line_text: &str, line_idx: usize) -> Vec<Span<'static>> {
+    fn render_treesitter_line(
+        &self,
+        line_text: &str,
+        line_idx: usize,
+        theme: &Theme,
+    ) -> Vec<Span<'static>> {
         let chars: Vec<char> = line_text.chars().collect();
         if chars.is_empty() {
             return vec![Span::raw("")];
         }
 
-        let default_style = Style::default().fg(Color::Rgb(220, 225, 235));
+        let default_style = Style::default().fg(theme.fg);
         let mut styles = vec![default_style; chars.len()];
 
         if let Some(tokens) = self.ts_tokens.get(&line_idx) {
@@ -2228,7 +2241,7 @@ impl SyntaxEngine {
                 let start = tok.start_col;
                 let end = (start + tok.length).min(chars.len());
                 if start < chars.len() && end > start {
-                    let style = Self::style_for_token_type(tok.token_type);
+                    let style = Self::style_for_token_type(tok.token_type, theme);
                     for cell in &mut styles[start..end] {
                         *cell = style;
                     }
@@ -2257,13 +2270,18 @@ impl SyntaxEngine {
         spans
     }
 
-    fn render_semantic_line(&self, line_text: &str, line_idx: usize) -> Vec<Span<'static>> {
+    fn render_semantic_line(
+        &self,
+        line_text: &str,
+        line_idx: usize,
+        theme: &Theme,
+    ) -> Vec<Span<'static>> {
         let chars: Vec<char> = line_text.chars().collect();
         if chars.is_empty() {
             return vec![Span::raw("")];
         }
 
-        let default_style = Style::default().fg(Color::Rgb(220, 225, 235));
+        let default_style = Style::default().fg(theme.fg);
         let mut styles = vec![default_style; chars.len()];
 
         if let Some(tokens) = self.semantic_tokens.get(&line_idx) {
@@ -2276,7 +2294,7 @@ impl SyntaxEngine {
                 let start = char_start.min(chars.len());
                 let end = char_end.min(chars.len());
                 if end > start {
-                    let style = Self::style_for_token_type(tok.token_type);
+                    let style = Self::style_for_token_type(tok.token_type, theme);
                     for cell in &mut styles[start..end] {
                         *cell = style;
                     }
@@ -2305,30 +2323,30 @@ impl SyntaxEngine {
         spans
     }
 
-    fn style_for_token_type(token_type: CanonicalTokenType) -> Style {
+    fn style_for_token_type(token_type: CanonicalTokenType, theme: &Theme) -> Style {
         match token_type {
             CanonicalTokenType::Keyword => Style::default()
-                .fg(Color::Rgb(220, 110, 240))
+                .fg(theme.syn_keyword)
                 .add_modifier(Modifier::BOLD),
-            CanonicalTokenType::Type => Style::default().fg(Color::Rgb(240, 200, 90)),
-            CanonicalTokenType::Function => Style::default().fg(Color::Rgb(100, 175, 255)),
-            CanonicalTokenType::String => Style::default().fg(Color::Rgb(150, 215, 120)),
-            CanonicalTokenType::Number => Style::default().fg(Color::Rgb(250, 175, 95)),
+            CanonicalTokenType::Type => Style::default().fg(theme.syn_type),
+            CanonicalTokenType::Function => Style::default().fg(theme.syn_function),
+            CanonicalTokenType::String => Style::default().fg(theme.syn_string),
+            CanonicalTokenType::Number => Style::default().fg(theme.syn_number),
             CanonicalTokenType::Comment => Style::default()
-                .fg(Color::Rgb(115, 125, 140))
+                .fg(theme.syn_comment)
                 .add_modifier(Modifier::ITALIC),
             CanonicalTokenType::Macro => Style::default()
-                .fg(Color::Rgb(80, 210, 240))
+                .fg(theme.syn_macro)
                 .add_modifier(Modifier::BOLD),
-            CanonicalTokenType::Operator => Style::default().fg(Color::Rgb(140, 150, 170)),
-            CanonicalTokenType::Namespace => Style::default().fg(Color::Rgb(140, 180, 240)),
+            CanonicalTokenType::Operator => Style::default().fg(theme.syn_operator),
+            CanonicalTokenType::Namespace => Style::default().fg(theme.syn_namespace),
             CanonicalTokenType::Tag => Style::default()
-                .fg(Color::Rgb(240, 110, 110))
+                .fg(theme.syn_tag)
                 .add_modifier(Modifier::BOLD),
-            CanonicalTokenType::Variable => Style::default().fg(Color::Rgb(215, 220, 235)),
-            CanonicalTokenType::Parameter => Style::default().fg(Color::Rgb(245, 175, 145)),
-            CanonicalTokenType::Property => Style::default().fg(Color::Rgb(160, 205, 245)),
-            CanonicalTokenType::Other => Style::default().fg(Color::Rgb(220, 225, 235)),
+            CanonicalTokenType::Variable => Style::default().fg(theme.syn_variable),
+            CanonicalTokenType::Parameter => Style::default().fg(theme.syn_parameter),
+            CanonicalTokenType::Property => Style::default().fg(theme.syn_property),
+            CanonicalTokenType::Other => Style::default().fg(theme.fg),
         }
     }
 }

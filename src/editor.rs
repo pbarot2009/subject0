@@ -4,20 +4,20 @@
 //!
 //! 1. **Text Storage & Mutability ([`ropey::Rope`])**:
 //!    Buffer contents are stored as a chunked, reference-counted B-tree rope with $O(\log N)$
-//!    mutations and $O(1)$ copy-on-write structural sharing for undo snapshots[span_2](start_span)[span_2](end_span).
+//!    mutations and $O(1)$ copy-on-write structural sharing for undo/redo snapshots[span_0](start_span)[span_0](end_span).
 //!
 //! 2. **Modal Editing State Machine ([`Mode`])**:
-//!    Implements modal key semantics across `Normal`, `Insert`, `Command`, and `Visual` states[span_3](start_span)[span_3](end_span).
+//!    Implements modal key semantics across `Normal`, `Insert`, `Command`, and `Visual` states[span_1](start_span)[span_1](end_span).
 //!
-//! 3. **Cross-Platform Directory & Configuration**:
-//!    Standardized configuration loading anchored to workspace roots or platform-specific
-//!    user directories across Termux, Linux, macOS, and Windows.
+//! 3. **Theming & Visual Customization**:
+//!    Maintains active [`Theme`] state and persists user color scheme choices to `.subject0`.
 //!
-//! 4. **Incremental Syntax Engine & LSP Synchronization**:
-//!    Maintains AST highlighting trees and dispatches full-text change events to the LSP actor[span_4](start_span)[span_4](end_span).
+//! 4. **Incremental Syntax Engine, Diagnostics Sync & Data Protection**:
+//!    Maintains AST highlighting trees, shifts diagnostic positions on row mutations,
+//!    tracks a bidirectional undo/redo ring, and protects unsaved buffers against file explorer wipes[span_2](start_span)[span_2](end_span).
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env,
     fs::{self, File},
     io::{BufWriter, Write},
@@ -28,24 +28,24 @@ use crate::lsp::{
     run_lsp_actor, subject0_config_dir, DiagnosticItem, LspInbound, LspOutbound, LspStatus,
     SuggestionItem, SyntaxEngine,
 };
+use crate::theme::Theme;
 
 use anyhow::{anyhow, Result};
 use ropey::Rope;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-/// Persistent editor configuration stored in `.subject0`[span_5](start_span)[span_5](end_span).
+/// Persistent editor configuration stored in `.subject0`[span_3](start_span)[span_3](end_span).
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     pub preferred_lsps: HashMap<String, String>,
     pub line_wrap: bool,
-    /// Resolved absolute path to the `.subject0` configuration file[span_6](start_span)[span_6](end_span).
+    pub theme: String,
+    /// Resolved absolute path to the `.subject0` configuration file[span_4](start_span)[span_4](end_span).
     pub source_path: PathBuf,
 }
 
 impl AppConfig {
-    /// Resolves configuration path, prioritizing project workspace root before
-    /// checking cross-platform standard config locations (XDG, Termux, Windows AppData).
     fn resolve_path(project_root: &Path) -> PathBuf {
         let project_cfg = project_root.join(".subject0");
         if project_cfg.exists() {
@@ -67,11 +67,11 @@ impl AppConfig {
         project_cfg
     }
 
-    /// Loads configuration anchored to `project_root`[span_7](start_span)[span_7](end_span).
     pub fn load_from(project_root: &Path) -> Self {
         let path = Self::resolve_path(project_root);
         let mut preferred_lsps = HashMap::new();
         let mut line_wrap = true;
+        let mut theme = "gruber-darker".to_string();
 
         if let Ok(content) = fs::read_to_string(&path) {
             if let Ok(val) = serde_json::from_str::<Value>(&content) {
@@ -85,17 +85,20 @@ impl AppConfig {
                 if let Some(w) = val.get("line_wrap").and_then(Value::as_bool) {
                     line_wrap = w;
                 }
+                if let Some(t) = val.get("theme").and_then(Value::as_str) {
+                    theme = t.to_string();
+                }
             }
         }
 
         Self {
             preferred_lsps,
             line_wrap,
+            theme,
             source_path: path,
         }
     }
 
-    /// Saves configuration while preserving external or unrecognized fields in `.subject0`[span_8](start_span)[span_8](end_span).
     pub fn save(&self) -> Result<()> {
         let mut val = if let Ok(content) = fs::read_to_string(&self.source_path) {
             if let Ok(existing) = serde_json::from_str::<Value>(&content) {
@@ -110,10 +113,12 @@ impl AppConfig {
         if let Some(obj) = val.as_object_mut() {
             obj.insert("preferred_lsps".to_string(), json!(self.preferred_lsps));
             obj.insert("line_wrap".to_string(), json!(self.line_wrap));
+            obj.insert("theme".to_string(), json!(self.theme));
         } else {
             val = json!({
                 "preferred_lsps": self.preferred_lsps,
                 "line_wrap": self.line_wrap,
+                "theme": self.theme,
             });
         }
 
@@ -125,14 +130,19 @@ impl AppConfig {
     }
 }
 
-/// Interactive modal state when multiple language servers are detected for a language[span_9](start_span)[span_9](end_span).
+/// Interactive modal state when choosing from available color themes.
+pub struct ThemePicker {
+    pub selected_idx: usize,
+}
+
+/// Interactive modal state when multiple language servers are detected for a language[span_5](start_span)[span_5](end_span).
 pub struct LspPicker {
     pub language_id: String,
     pub candidates: Vec<String>,
     pub selected_idx: usize,
 }
 
-/// Active modal editing state[span_10](start_span)[span_10](end_span).
+/// Active modal editing state[span_6](start_span)[span_6](end_span).
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum Mode {
     Normal,
@@ -141,7 +151,7 @@ pub enum Mode {
     Visual { anchor_x: usize, anchor_y: usize },
 }
 
-/// Identifies which viewport element currently holds keyboard input focus[span_11](start_span)[span_11](end_span).
+/// Identifies which viewport element currently holds keyboard input focus[span_7](start_span)[span_7](end_span).
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum Focus {
     Editor,
@@ -163,6 +173,7 @@ pub enum CommandId {
     InsertAbove,
     JoinLines,
     Undo,
+    Redo,
     Yank,
     ToggleCase,
     Paste,
@@ -170,6 +181,7 @@ pub enum CommandId {
     JumpBottom,
     TriggerCompletion,
     SelectLsp,
+    SelectTheme,
     SaveConfig,
     ShowHelp,
 }
@@ -250,6 +262,12 @@ pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
         id: CommandId::Undo,
     },
     PaletteCommand {
+        title: "Redo Change",
+        shortcut: "Ctrl-R",
+        icon: "󰑎",
+        id: CommandId::Redo,
+    },
+    PaletteCommand {
         title: "Yank Selection / Line",
         shortcut: "y",
         icon: "󰅍",
@@ -290,6 +308,12 @@ pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
         shortcut: ":lsp",
         icon: "",
         id: CommandId::SelectLsp,
+    },
+    PaletteCommand {
+        title: "Select Color Theme",
+        shortcut: ":theme",
+        icon: "󰔎",
+        id: CommandId::SelectTheme,
     },
     PaletteCommand {
         title: "Save Config to .subject0",
@@ -368,8 +392,20 @@ impl FileExplorer {
         explorer
     }
 
+    /// Refreshes the explorer tree while preserving expanded folders across refreshes.
     pub fn refresh(&mut self) {
-        self.entries = Self::read_directory(&self.root, 0);
+        let expanded_paths: HashSet<PathBuf> = self
+            .entries
+            .iter()
+            .filter(|e| e.is_dir && e.expanded)
+            .map(|e| e.path.clone())
+            .collect();
+
+        self.entries = Self::read_directory_recursive(&self.root, 0, &expanded_paths);
+
+        if self.selected_idx >= self.entries.len() && !self.entries.is_empty() {
+            self.selected_idx = self.entries.len() - 1;
+        }
     }
 
     fn read_directory(dir: &Path, depth: usize) -> Vec<FileEntry> {
@@ -410,6 +446,59 @@ impl FileExplorer {
                     depth,
                     expanded: false,
                 });
+            }
+        }
+        entries
+    }
+
+    fn read_directory_recursive(
+        dir: &Path,
+        depth: usize,
+        expanded: &HashSet<PathBuf>,
+    ) -> Vec<FileEntry> {
+        let mut entries = Vec::new();
+        if let Ok(read_dir) = fs::read_dir(dir) {
+            let mut paths: Vec<PathBuf> = read_dir
+                .filter_map(|res| res.ok().map(|e| e.path()))
+                .filter(|p| {
+                    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    !name.starts_with('.') && name != "target" && name != "node_modules"
+                })
+                .collect();
+
+            paths.sort_by(|a, b| {
+                let a_is_dir = a.is_dir();
+                let b_is_dir = b.is_dir();
+                if a_is_dir && !b_is_dir {
+                    std::cmp::Ordering::Less
+                } else if !a_is_dir && b_is_dir {
+                    std::cmp::Ordering::Greater
+                } else {
+                    a.file_name().cmp(&b.file_name())
+                }
+            });
+
+            for p in paths {
+                let is_dir = p.is_dir();
+                let name = p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("?")
+                    .to_string();
+                let is_expanded = is_dir && expanded.contains(&p);
+
+                entries.push(FileEntry {
+                    path: p.clone(),
+                    name,
+                    is_dir,
+                    depth,
+                    expanded: is_expanded,
+                });
+
+                if is_expanded {
+                    let mut children = Self::read_directory_recursive(&p, depth + 1, expanded);
+                    entries.append(&mut children);
+                }
             }
         }
         entries
@@ -465,7 +554,7 @@ impl FileExplorer {
     }
 }
 
-// === Undo Snapshot State ===
+// === Undo / Redo Snapshot State ===
 
 #[derive(Clone, Debug)]
 pub struct UndoSnapshot {
@@ -493,6 +582,7 @@ pub struct Editor {
     pub command_buffer: String,
     pub pending_key: Option<char>,
     pub undo_stack: Vec<UndoSnapshot>,
+    pub redo_stack: Vec<UndoSnapshot>,
     pub insert_snapshot_taken: bool,
     pub syntax: SyntaxEngine,
     pub diagnostics: Vec<DiagnosticItem>,
@@ -519,11 +609,12 @@ pub struct Editor {
     pub should_quit: bool,
 
     pub config: AppConfig,
+    pub theme: Theme,
+    pub theme_picker: Option<ThemePicker>,
     pub lsp_picker: Option<LspPicker>,
 }
 
 impl Editor {
-    /// Instantiates a new editor buffer, initializing the hybrid syntax engine[span_12](start_span)[span_12](end_span).
     pub fn new(path: Option<&PathBuf>) -> Result<Self> {
         let is_dir_target = path.is_some_and(|p| p.is_dir());
 
@@ -562,6 +653,7 @@ impl Editor {
 
         let config = AppConfig::load_from(&root_dir);
         let initial_wrap = config.line_wrap;
+        let theme = Theme::from_name(&config.theme);
 
         Ok(Self {
             rope,
@@ -578,6 +670,8 @@ impl Editor {
             scroll_y: 0,
             line_wrap: initial_wrap,
             config,
+            theme,
+            theme_picker: None,
             lsp_picker: None,
 
             clipboard: String::new(),
@@ -586,6 +680,7 @@ impl Editor {
             command_buffer: String::new(),
             pending_key: None,
             undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             insert_snapshot_taken: false,
             syntax,
             diagnostics: Vec::new(),
@@ -608,6 +703,14 @@ impl Editor {
             help_scroll: 0,
             should_quit: false,
         })
+    }
+
+    /// Switches the active color theme and writes it to `.subject0`.
+    pub fn set_theme(&mut self, theme_name: &str) {
+        self.theme = Theme::from_name(theme_name);
+        self.config.theme = self.theme.name.to_string();
+        let _ = self.config.save();
+        self.status_msg = format!("Theme: {}", self.theme.display_name);
     }
 
     pub fn set_mode(&mut self, mode: Mode) {
@@ -654,7 +757,14 @@ impl Editor {
         utf16_count
     }
 
+    /// Loads a new file from disk into the current editor buffer, protecting against unsaved modifications[span_8](start_span)[span_8](end_span).
     pub fn open_file<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        if self.modified {
+            return Err(anyhow!(
+                "Unsaved changes! Save (:w) or force quit (:q!) first"
+            ));
+        }
+
         let path_buf = path.as_ref().to_path_buf();
         let file = File::open(&path_buf)?;
         self.rope = Rope::from_reader(file)?;
@@ -665,6 +775,7 @@ impl Editor {
         self.scroll_y = 0;
         self.modified = false;
         self.undo_stack.clear();
+        self.redo_stack.clear();
         self.insert_snapshot_taken = false;
         self.diagnostics.clear();
         self.completion_visible = false;
@@ -801,6 +912,7 @@ impl Editor {
         }
     }
 
+    /// Pushes current buffer state into the undo stack and clears redo history[span_9](start_span)[span_9](end_span).
     pub fn snapshot(&mut self) {
         if self.undo_stack.len() >= 64 {
             self.undo_stack.remove(0);
@@ -810,10 +922,21 @@ impl Editor {
             cursor_x: self.cursor_x,
             cursor_y: self.cursor_y,
         });
+        self.redo_stack.clear();
     }
 
+    /// Reverts the document rope to the most recent checkpoint on `undo_stack`[span_10](start_span)[span_10](end_span).
     pub fn undo(&mut self) {
         if let Some(prev) = self.undo_stack.pop() {
+            if self.redo_stack.len() >= 64 {
+                self.redo_stack.remove(0);
+            }
+            self.redo_stack.push(UndoSnapshot {
+                rope: self.rope.clone(),
+                cursor_x: self.cursor_x,
+                cursor_y: self.cursor_y,
+            });
+
             self.rope = prev.rope;
             self.cursor_x = prev.cursor_x;
             self.cursor_y = prev.cursor_y;
@@ -822,6 +945,52 @@ impl Editor {
             self.insert_snapshot_taken = false;
             self.clamp_cursor();
             self.on_buffer_modified();
+        } else {
+            self.status_msg = "Already at oldest change".to_string();
+        }
+    }
+
+    /// Steps forward through historical edits using `redo_stack`.
+    pub fn redo(&mut self) {
+        if let Some(next) = self.redo_stack.pop() {
+            if self.undo_stack.len() >= 64 {
+                self.undo_stack.remove(0);
+            }
+            self.undo_stack.push(UndoSnapshot {
+                rope: self.rope.clone(),
+                cursor_x: self.cursor_x,
+                cursor_y: self.cursor_y,
+            });
+
+            self.rope = next.rope;
+            self.cursor_x = next.cursor_x;
+            self.cursor_y = next.cursor_y;
+            self.modified = true;
+            self.status_msg = "Redone change".to_string();
+            self.insert_snapshot_taken = false;
+            self.clamp_cursor();
+            self.on_buffer_modified();
+        } else {
+            self.status_msg = "Already at newest change".to_string();
+        }
+    }
+
+    /// Shifts diagnostic coordinates down when lines are added above them.
+    fn shift_diagnostics_down(&mut self, after_line: usize, count: usize) {
+        for d in &mut self.diagnostics {
+            if d.line > after_line {
+                d.line += count;
+            }
+        }
+    }
+
+    /// Shifts diagnostic coordinates up when a line above them is removed.
+    fn shift_diagnostics_up(&mut self, removed_line: usize) {
+        self.diagnostics.retain(|d| d.line != removed_line);
+        for d in &mut self.diagnostics {
+            if d.line > removed_line {
+                d.line = d.line.saturating_sub(1);
+            }
         }
     }
 
@@ -1093,6 +1262,8 @@ impl Editor {
         }
         self.rope.insert_char(insert_pos, ' ');
 
+        self.shift_diagnostics_up(self.cursor_y + 1);
+
         self.cursor_y = self.rope.char_to_line(insert_pos);
         let line_start = self.rope.line_to_char(self.cursor_y);
         self.cursor_x = insert_pos.saturating_sub(line_start);
@@ -1143,6 +1314,7 @@ impl Editor {
         };
 
         self.rope.insert(insert_idx, &to_insert);
+        self.shift_diagnostics_down(self.cursor_y, 1);
         self.cursor_y += 1;
         self.cursor_x = indent.chars().count();
         self.modified = true;
@@ -1173,6 +1345,7 @@ impl Editor {
 
         let to_insert = format!("{indent}{le}");
         self.rope.insert(idx, &to_insert);
+        self.shift_diagnostics_down(self.cursor_y.saturating_sub(1), 1);
         self.cursor_x = indent.chars().count();
         self.modified = true;
         self.set_mode(Mode::Insert);
@@ -1230,11 +1403,13 @@ impl Editor {
             let inner_indent = format!("{indent}    ");
             let to_insert = format!("{le}{inner_indent}{le}{indent}");
             self.rope.insert(idx, &to_insert);
+            self.shift_diagnostics_down(self.cursor_y, 2);
             self.cursor_y += 1;
             self.cursor_x = inner_indent.chars().count();
         } else {
             let to_insert = format!("{le}{indent}");
             self.rope.insert(idx, &to_insert);
+            self.shift_diagnostics_down(self.cursor_y, 1);
             self.cursor_y += 1;
             self.cursor_x = inner_indent_len(&indent);
         }
@@ -1242,6 +1417,36 @@ impl Editor {
         self.modified = true;
         self.completion_visible = false;
         self.on_buffer_modified();
+    }
+
+    /// Dedents current line by up to 4 spaces or 1 tab.
+    pub fn dedent_current_line(&mut self) {
+        if self.cursor_y >= self.rope.len_lines() {
+            return;
+        }
+        self.check_insert_snapshot();
+        let line_start = self.rope.line_to_char(self.cursor_y);
+        let line = self.rope.line(self.cursor_y);
+        let mut spaces_to_remove = 0;
+        for ch in line.chars() {
+            if ch == '\t' {
+                spaces_to_remove = 1;
+                break;
+            } else if ch == ' ' {
+                spaces_to_remove += 1;
+                if spaces_to_remove == 4 {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        if spaces_to_remove > 0 {
+            self.rope.remove(line_start..line_start + spaces_to_remove);
+            self.cursor_x = self.cursor_x.saturating_sub(spaces_to_remove);
+            self.modified = true;
+            self.on_buffer_modified();
+        }
     }
 
     pub fn backspace(&mut self) {
@@ -1286,6 +1491,8 @@ impl Editor {
             } else if current_line_idx > 0 {
                 self.rope.remove(current_line_idx - 1..current_line_idx);
             }
+
+            self.shift_diagnostics_up(self.cursor_y);
 
             self.cursor_y -= 1;
             self.cursor_x = prev_len;
@@ -1359,6 +1566,7 @@ impl Editor {
             self.rope.len_chars()
         };
 
+        let current_y = self.cursor_y;
         if start < end {
             self.clipboard = self.rope.slice(start..end).to_string();
             self.rope.remove(start..end);
@@ -1370,6 +1578,8 @@ impl Editor {
                 self.rope.remove(line_del..start);
             }
         }
+
+        self.shift_diagnostics_up(current_y);
         self.modified = true;
         self.status_msg = "Cut line".to_string();
         self.on_buffer_modified();
@@ -1380,7 +1590,6 @@ impl Editor {
         self.clamp_cursor();
     }
 
-    /// Saves the buffer with cross-platform atomicity, handling Termux (cross-device links) and Windows file locking.
     pub fn save(&mut self) -> Result<()> {
         if let Some(path) = &self.path {
             if let Some(parent) = path.parent() {
@@ -1402,7 +1611,6 @@ impl Editor {
                 writer.flush()?;
             }
 
-            // Cross-platform save: attempt atomic rename, fallback to copy+remove for Termux/Windows EXDEV quirks
             if let Err(_e) = fs::rename(&tmp_path, path) {
                 fs::copy(&tmp_path, path)?;
                 let _ = fs::remove_file(&tmp_path);
@@ -1459,6 +1667,7 @@ impl Editor {
             CommandId::InsertAbove => self.insert_line_above(),
             CommandId::JoinLines => self.join_lines(),
             CommandId::Undo => self.undo(),
+            CommandId::Redo => self.redo(),
             CommandId::Yank => self.yank_selection(),
             CommandId::Paste => self.paste(),
             CommandId::ToggleCase => self.toggle_case(),
@@ -1483,8 +1692,18 @@ impl Editor {
                     });
                 }
             }
+            CommandId::SelectTheme => {
+                let cur_idx = Theme::all()
+                    .iter()
+                    .position(|t| t.name == self.theme.name)
+                    .unwrap_or(0);
+                self.theme_picker = Some(ThemePicker {
+                    selected_idx: cur_idx,
+                });
+            }
             CommandId::SaveConfig => {
                 self.config.line_wrap = self.line_wrap;
+                self.config.theme = self.theme.name.to_string();
                 if self.config.save().is_ok() {
                     self.status_msg = "Config saved to .subject0".to_string();
                 } else {
@@ -1536,6 +1755,20 @@ impl Editor {
                 self.status_msg =
                     format!("Line Wrap: {}", if self.line_wrap { "ON" } else { "OFF" });
             }
+            "theme" | "colorscheme" => {
+                if let Some(name) = arg {
+                    self.set_theme(name);
+                } else {
+                    let cur_idx = Theme::all()
+                        .iter()
+                        .position(|t| t.name == self.theme.name)
+                        .unwrap_or(0);
+                    self.theme_picker = Some(ThemePicker {
+                        selected_idx: cur_idx,
+                    });
+                }
+            }
+            "redo" => self.redo(),
             "e" | "explore" => {
                 self.explorer.visible = !self.explorer.visible;
                 if self.explorer.visible {

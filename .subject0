@@ -3,5 +3,6 @@
   "preferred_lsps": {
     "python": "pyright",
     "rust": "rust-analyzer"
-  }
+  },
+  "theme": "rose-pine"
 }

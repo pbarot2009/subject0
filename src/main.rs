@@ -1,12 +1,13 @@
 //! # Application Entry Point, Event Loop, & Terminal UI Subsystem
 //!
 //! This module serves as the runtime orchestrator for `subject0`. It integrates the
-//! terminal lifecycle, asynchronous event multiplexing, input decoding, and the
-//! frame rendering pipeline[span_1](start_span)[span_1](end_span).
+//! terminal lifecycle, asynchronous event multiplexing, input decoding, themed frame
+//! rendering, and modal subsystem coordination[span_0](start_span)[span_0](end_span).
 
 mod cmd;
 mod editor;
 mod lsp;
+mod theme;
 
 use std::{
     cmp::Ordering,
@@ -36,12 +37,11 @@ use ratatui::{
 use tokio::sync::mpsc;
 
 use editor::{Editor, Focus, Mode};
-
 use lsp::{completion_kind_icon, file_icon_and_color, LspOutbound, LspStatus, SuggestionItem};
+use theme::Theme;
 
 /// RAII Terminal Guard ensuring the host terminal is reliably restored
-/// to canonical mode regardless of whether the program exits cleanly,
-/// returns a `Result::Err`, or panics[span_2](start_span)[span_2](end_span).
+/// to canonical mode regardless of exit status[span_1](start_span)[span_1](end_span).
 struct TerminalGuard;
 
 impl TerminalGuard {
@@ -63,21 +63,21 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// Configures the terminal hardware cursor geometry based on the active modal editing state[span_3](start_span)[span_3](end_span).
+/// Configures the terminal hardware cursor geometry based on the active modal editing state[span_2](start_span)[span_2](end_span).
 fn set_terminal_cursor_style(mode: Mode) {
     let mut stdout = stdout();
     match mode {
         Mode::Normal | Mode::Command | Mode::Visual { .. } => {
-            let _ = stdout.write_all(b"\x1b[2 q"); // Steady Block[span_4](start_span)[span_4](end_span)
+            let _ = stdout.write_all(b"\x1b[2 q"); // Steady Block[span_3](start_span)[span_3](end_span)
         }
         Mode::Insert => {
-            let _ = stdout.write_all(b"\x1b[6 q"); // Steady Bar / I-Beam[span_5](start_span)[span_5](end_span)
+            let _ = stdout.write_all(b"\x1b[6 q"); // Steady Bar / I-Beam[span_4](start_span)[span_4](end_span)
         }
     }
     let _ = stdout.flush();
 }
 
-/// Registers a secondary panic hook ensuring screen recovery during thread unwinding[span_6](start_span)[span_6](end_span).
+/// Registers a secondary panic hook ensuring screen recovery during thread unwinding[span_5](start_span)[span_5](end_span).
 fn setup_panic_hook() {
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -90,7 +90,7 @@ fn setup_panic_hook() {
     }));
 }
 
-/// Safely truncates a string by Unicode scalar count without slicing mid-codepoint[span_7](start_span)[span_7](end_span).
+/// Safely truncates a string by Unicode scalar count without slicing mid-codepoint[span_6](start_span)[span_6](end_span).
 fn safe_truncate(s: &str, max_chars: usize) -> String {
     if s.chars().count() > max_chars {
         let mut result: String = s.chars().take(max_chars.saturating_sub(1)).collect();
@@ -101,7 +101,7 @@ fn safe_truncate(s: &str, max_chars: usize) -> String {
     }
 }
 
-/// Calculates the visual column width of a rope line taking expanded tabs into account[span_8](start_span)[span_8](end_span).
+/// Calculates visual column width of a line taking expanded tabs into account[span_7](start_span)[span_7](end_span).
 fn visual_line_len(rope: &ropey::Rope, line_idx: usize) -> usize {
     if line_idx >= rope.len_lines() {
         return 0;
@@ -139,8 +139,10 @@ async fn main() -> Result<()> {
         editor.config = editor::AppConfig {
             preferred_lsps: std::collections::HashMap::new(),
             line_wrap: true,
+            theme: "gruber-darker".to_string(),
             source_path: editor.config.source_path.clone(),
         };
+        editor.theme = Theme::gruber_darker();
     }
     if let Some(wrap) = cli_args.line_wrap {
         editor.line_wrap = wrap;
@@ -166,7 +168,6 @@ async fn main() -> Result<()> {
     while !editor.should_quit {
         let mut received_lsp_msg = false;
 
-        // Drain incoming messages emitted by the background LSP actor[span_9](start_span)[span_9](end_span).
         while let Ok(msg) = lsp_out_rx.try_recv() {
             received_lsp_msg = true;
             match msg {
@@ -283,7 +284,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
     let viewport_top = 1u16;
     let viewport_bottom = size.height.saturating_sub(3);
 
-    // 1. Intercept Help Modal (Modal shield prevents fall-through to document)[span_10](start_span)[span_10](end_span)
+    // 1. Intercept Help Modal[span_8](start_span)[span_8](end_span)
     if editor.show_help {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             let width = 64u16.min(size.width.saturating_sub(4));
@@ -302,7 +303,37 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         return;
     }
 
-    // 2. Intercept LSP Server Picker Modal[span_11](start_span)[span_11](end_span)
+    // 2. Intercept Theme Picker Modal
+    if let Some(picker) = &editor.theme_picker {
+        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+            let themes = Theme::all();
+            let width = 48u16.min(size.width.saturating_sub(2));
+            let height = ((themes.len() as u16) + 4).min(size.height.saturating_sub(2));
+            let x = (size.width.saturating_sub(width)) / 2;
+            let y = (size.height.saturating_sub(height)) / 2;
+
+            if mouse.column >= x + 1
+                && mouse.column < x + width - 1
+                && mouse.row >= y + 2
+                && mouse.row < y + 2 + themes.len() as u16
+            {
+                let clicked_idx = (mouse.row - (y + 2)) as usize;
+                if clicked_idx < themes.len() {
+                    editor.set_theme(themes[clicked_idx].name);
+                    editor.theme_picker = None;
+                }
+            } else if mouse.column < x
+                || mouse.column >= x + width
+                || mouse.row < y
+                || mouse.row >= y + height
+            {
+                editor.theme_picker = None;
+            }
+        }
+        return;
+    }
+
+    // 3. Intercept LSP Server Picker Modal[span_9](start_span)[span_9](end_span)
     if let Some(picker) = &editor.lsp_picker {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             let width = 48u16.min(size.width.saturating_sub(2));
@@ -341,7 +372,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         return;
     }
 
-    // 3. Intercept Command Palette Interactions[span_12](start_span)[span_12](end_span)
+    // 4. Intercept Command Palette Interactions[span_10](start_span)[span_10](end_span)
     if editor.palette.visible {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             let width = 46u16.min(size.width.saturating_sub(2));
@@ -375,7 +406,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         return;
     }
 
-    // 4. Statusline Taps with dynamically measured badge boundaries[span_13](start_span)[span_13](end_span)
+    // 5. Statusline Interactions[span_11](start_span)[span_11](end_span)
     if mouse.row == status_row {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             let badge_len = match editor.mode {
@@ -433,7 +464,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         0u16
     };
 
-    // 5. File Explorer Sidebar Interactions[span_14](start_span)[span_14](end_span)
+    // 6. File Explorer Sidebar Interactions[span_12](start_span)[span_12](end_span)
     if editor.explorer.visible && mouse.column < explorer_width {
         let max_visible = viewport_bottom.saturating_sub(viewport_top) as usize;
         match mouse.kind {
@@ -446,10 +477,13 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
                             editor.explorer.toggle_expand(clicked_idx);
                         } else {
                             let path = editor.explorer.entries[clicked_idx].path.clone();
-                            let _ = editor.open_file(path);
-                            editor.focus = Focus::Editor;
-                            if size.width < 70 {
-                                editor.explorer.visible = false;
+                            if let Err(e) = editor.open_file(path) {
+                                editor.status_msg = e.to_string();
+                            } else {
+                                editor.focus = Focus::Editor;
+                                if size.width < 70 {
+                                    editor.explorer.visible = false;
+                                }
                             }
                         }
                     }
@@ -470,7 +504,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         return;
     }
 
-    // 6. Completion Dropdown Interactions[span_15](start_span)[span_15](end_span)
+    // 7. Completion Dropdown Interactions[span_13](start_span)[span_13](end_span)
     if editor.completion_visible && !editor.completions.is_empty() {
         if let Some((px, py, pw, ph)) = editor.completion_rect {
             let in_popup = mouse.column >= px
@@ -515,7 +549,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         }
     }
 
-    // 7. Document Viewport Buffer Interactions[span_16](start_span)[span_16](end_span)
+    // 8. Document Viewport Buffer Interactions[span_14](start_span)[span_14](end_span)
     let gutter_digits = editor.rope.len_lines().max(1).to_string().len().max(2);
     let gutter_width = gutter_digits + 4;
     let content_left = explorer_width + 1u16 + gutter_width as u16;
@@ -626,7 +660,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
     let prev_mode = editor.mode;
     let max_visible = 6usize;
 
-    // 1. Intercept In-Editor Help Modal Navigation[span_17](start_span)[span_17](end_span)
+    // 1. Intercept In-Editor Help Modal Navigation[span_15](start_span)[span_15](end_span)
     if editor.show_help {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q' | '?') => {
@@ -649,7 +683,37 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // 2. Intercept LSP Server Selection Modal[span_18](start_span)[span_18](end_span)
+    // 2. Intercept Theme Picker Modal
+    if let Some(mut picker) = editor.theme_picker.take() {
+        let themes = Theme::all();
+        match key.code {
+            KeyCode::Esc => {
+                editor.status_msg = "Theme selection canceled".to_string();
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                picker.selected_idx = (picker.selected_idx + 1) % themes.len();
+                editor.theme_picker = Some(picker);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                picker.selected_idx = if picker.selected_idx == 0 {
+                    themes.len().saturating_sub(1)
+                } else {
+                    picker.selected_idx - 1
+                };
+                editor.theme_picker = Some(picker);
+            }
+            KeyCode::Enter => {
+                let chosen = themes[picker.selected_idx].name;
+                editor.set_theme(chosen);
+            }
+            _ => {
+                editor.theme_picker = Some(picker);
+            }
+        }
+        return;
+    }
+
+    // 3. Intercept LSP Server Selection Modal[span_16](start_span)[span_16](end_span)
     if let Some(mut picker) = editor.lsp_picker.take() {
         if picker.candidates.is_empty() {
             editor.status_msg = "No LSP candidates available".to_string();
@@ -692,7 +756,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // 3. Intercept Command Palette Key Events[span_19](start_span)[span_19](end_span)
+    // 4. Intercept Command Palette Key Events[span_17](start_span)[span_17](end_span)
     if editor.palette.visible {
         let cmds = editor.palette.filtered_commands();
         match key.code {
@@ -733,7 +797,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // 4. Global Shortcuts: Ctrl-E for File Explorer[span_20](start_span)[span_20](end_span)
+    // 5. Global Shortcuts: Ctrl-E for File Explorer[span_18](start_span)[span_18](end_span)
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('e') {
         editor.explorer.visible = !editor.explorer.visible;
         if editor.explorer.visible {
@@ -745,7 +809,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // 5. File Explorer Navigation Focus[span_21](start_span)[span_21](end_span)
+    // 6. File Explorer Navigation Focus[span_19](start_span)[span_19](end_span)
     if editor.focus == Focus::Explorer && editor.explorer.visible {
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
@@ -765,8 +829,11 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                         editor.explorer.toggle_expand(idx);
                     } else {
                         let path = editor.explorer.entries[idx].path.clone();
-                        let _ = editor.open_file(path);
-                        editor.focus = Focus::Editor;
+                        if let Err(e) = editor.open_file(path) {
+                            editor.status_msg = e.to_string();
+                        } else {
+                            editor.focus = Focus::Editor;
+                        }
                     }
                 }
             }
@@ -778,10 +845,16 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // 6. Modal Editing Handler[span_22](start_span)[span_22](end_span)
+    // 7. Modal Editing Handler[span_20](start_span)[span_20](end_span)
     match editor.mode {
         Mode::Normal => {
             editor.completion_visible = false;
+
+            // Global Normal Mode Hotkeys
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
+                editor.redo();
+                return;
+            }
 
             if let Some(pending) = editor.pending_key.take() {
                 let handled = match (pending, key.code) {
@@ -969,6 +1042,10 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                 }
                 KeyCode::Enter => editor.insert_newline(),
                 KeyCode::Backspace => editor.backspace(),
+                KeyCode::BackTab => {
+                    editor.dedent_current_line();
+                    editor.completion_visible = false;
+                }
                 KeyCode::Tab => {
                     for _ in 0..4 {
                         editor.insert_char(' ');
@@ -1099,6 +1176,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
 
 fn render_ui(frame: &mut Frame, editor: &mut Editor) {
     let size = frame.area();
+    let theme = editor.theme;
 
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -1127,23 +1205,24 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         (None, main_chunks[0])
     };
 
-    // 1. Render File Explorer (Sidebar)[span_23](start_span)[span_23](end_span)
+    // 1. Render File Explorer (Sidebar)[span_21](start_span)[span_21](end_span)
     if let Some(exp_rect) = explorer_area {
         let is_focused = editor.focus == Focus::Explorer;
         let border_color = if is_focused {
-            Color::Rgb(80, 140, 255)
+            theme.border_focused
         } else {
-            Color::Rgb(55, 60, 75)
+            theme.border
         };
 
         let exp_block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(border_color))
+            .style(Style::default().bg(theme.explorer_bg))
             .title(Line::from(vec![Span::styled(
                 " 󰉓 Files ",
                 Style::default()
-                    .fg(Color::Rgb(220, 225, 235))
+                    .fg(theme.explorer_fg)
                     .add_modifier(Modifier::BOLD),
             )]));
 
@@ -1164,9 +1243,9 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
             let (icon, icon_color) = if entry.is_dir {
                 if entry.expanded {
-                    (" ", Color::Rgb(240, 200, 90))
+                    (" ", theme.explorer_dir_expanded)
                 } else {
-                    (" ", Color::Rgb(220, 180, 70))
+                    (" ", theme.explorer_dir)
                 }
             } else {
                 file_icon_and_color(Some(&entry.path))
@@ -1174,11 +1253,11 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
             let item_style = if is_sel {
                 Style::default()
-                    .bg(Color::Rgb(40, 75, 145))
-                    .fg(Color::White)
+                    .bg(theme.explorer_sel_bg)
+                    .fg(theme.explorer_sel_fg)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::Rgb(200, 205, 220))
+                Style::default().fg(theme.explorer_fg)
             };
 
             tree_lines.push(Line::from(vec![
@@ -1191,7 +1270,7 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         frame.render_widget(Paragraph::new(tree_lines), inner_exp);
     }
 
-    // 2. Render Document Editor Viewport[span_24](start_span)[span_24](end_span)
+    // 2. Render Document Editor Viewport[span_22](start_span)[span_22](end_span)
     let (icon, icon_color) = file_icon_and_color(editor.path.as_ref());
     let file_title = editor.path.as_ref().map_or_else(
         || "unnamed".into(),
@@ -1208,12 +1287,10 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         Span::styled(format!("{icon} "), Style::default().fg(icon_color)),
         Span::styled(
             file_title,
-            Style::default()
-                .fg(Color::Rgb(220, 225, 235))
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
         ),
         if editor.modified {
-            Span::styled(" ●", Style::default().fg(Color::Rgb(240, 100, 100)))
+            Span::styled(" ●", Style::default().fg(Color::Rgb(244, 56, 65)))
         } else {
             Span::raw("")
         },
@@ -1224,10 +1301,11 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(if editor.focus == Focus::Editor {
-            Color::Rgb(65, 70, 85)
+            theme.border_focused
         } else {
-            Color::Rgb(45, 50, 60)
+            theme.border
         }))
+        .style(Style::default().bg(theme.bg))
         .title(window_title);
 
     let inner_area = editor_block.inner(editor_area);
@@ -1259,7 +1337,7 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
         let line_diag = editor.diagnostics.iter().find(|d| d.line == y);
         let (diag_marker, diag_style) = match line_diag.map(|d| d.severity) {
-            Some(1) => ("", Style::default().fg(Color::Rgb(240, 90, 90))),
+            Some(1) => ("", Style::default().fg(Color::Rgb(244, 56, 65))),
             Some(2) => ("", Style::default().fg(Color::Rgb(245, 185, 60))),
             Some(_) => ("󰌵", Style::default().fg(Color::Rgb(100, 180, 255))),
             None => (" ", Style::default()),
@@ -1267,10 +1345,10 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
         let gutter_style = if is_cursor_line {
             Style::default()
-                .fg(Color::Yellow)
+                .fg(theme.line_number_active)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Rgb(80, 85, 100))
+            Style::default().fg(theme.line_number)
         };
 
         let line = editor.rope.line(y);
@@ -1282,7 +1360,7 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             }
         }
 
-        let syntax_spans = editor.syntax.highlight_line(&line_str, y);
+        let syntax_spans = editor.syntax.highlight_line(&line_str, y, &theme);
         let mut char_cells: Vec<(char, Style, usize)> = Vec::with_capacity(line_str.len() * 2);
         let mut char_idx = 0;
         for span in syntax_spans {
@@ -1331,7 +1409,7 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
                     (
                         " ",
                         format!("{:>width$} ↳ ", "", width = line_digits),
-                        Style::default().fg(Color::Rgb(65, 70, 85)),
+                        Style::default().fg(theme.line_number),
                     )
                 };
 
@@ -1350,7 +1428,9 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
                 for col_idx in chunk_start..chunk_end {
                     let (ch, mut st, orig_char_idx) = char_cells[col_idx];
                     if editor.is_char_selected(y, orig_char_idx) {
-                        st = st.bg(Color::Rgb(55, 80, 145)).fg(Color::White);
+                        st = st.bg(theme.selection_bg).fg(theme.selection_fg);
+                    } else if is_cursor_line {
+                        st = st.bg(theme.cursor_line_bg);
                     }
                     sub_spans.push(Span::styled(ch.to_string(), st));
                 }
@@ -1402,7 +1482,9 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
                     .take(take_count)
                 {
                     if editor.is_char_selected(y, orig_char_idx) {
-                        st = st.bg(Color::Rgb(55, 80, 145)).fg(Color::White);
+                        st = st.bg(theme.selection_bg).fg(theme.selection_fg);
+                    } else if is_cursor_line {
+                        st = st.bg(theme.cursor_line_bg);
                     }
                     row_spans.push(Span::styled(ch.to_string(), st));
                 }
@@ -1427,24 +1509,24 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             Span::raw(" "),
             Span::styled(
                 format!("{:>width$} │ ", "~", width = line_digits),
-                Style::default().fg(Color::Rgb(50, 55, 68)),
+                Style::default().fg(theme.line_number),
             ),
         ]));
     }
 
     frame.render_widget(Paragraph::new(visible_lines), inner_area);
 
-    // 3. Render Statusline[span_25](start_span)[span_25](end_span)
+    // 3. Render Statusline[span_23](start_span)[span_23](end_span)
     let (badge_text, badge_color) = match editor.mode {
-        Mode::Normal => (" NORMAL ", Color::Rgb(80, 140, 255)),
-        Mode::Insert => (" INSERT ", Color::Rgb(70, 200, 120)),
-        Mode::Command => (" COMMAND ", Color::Rgb(220, 100, 240)),
-        Mode::Visual { .. } => (" VISUAL ", Color::Rgb(240, 160, 60)),
+        Mode::Normal => (" NORMAL ", theme.mode_normal),
+        Mode::Insert => (" INSERT ", theme.mode_insert),
+        Mode::Command => (" COMMAND ", theme.mode_command),
+        Mode::Visual { .. } => (" VISUAL ", theme.mode_visual),
     };
 
-    let bar_bg = Color::Rgb(20, 22, 28);
-    let pill_bg = Color::Rgb(35, 38, 48);
-    let bar_foreground = Color::Rgb(200, 205, 220);
+    let bar_bg = theme.status_bg;
+    let pill_bg = theme.status_pill_bg;
+    let bar_foreground = theme.status_fg;
 
     let error_count = editor
         .diagnostics
@@ -1480,7 +1562,7 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         Span::styled(
             sidebar_toggle_badge,
             Style::default().bg(pill_bg).fg(if editor.explorer.visible {
-                Color::Rgb(100, 180, 255)
+                theme.mode_normal
             } else {
                 bar_foreground
             }),
@@ -1488,14 +1570,14 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         Span::styled(
             wrap_badge,
             Style::default().bg(pill_bg).fg(if editor.line_wrap {
-                Color::Rgb(100, 200, 140)
+                theme.mode_insert
             } else {
-                Color::Rgb(140, 145, 160)
+                theme.line_number
             }),
         ),
         Span::styled(
             " 󰍉 Cmd ",
-            Style::default().bg(pill_bg).fg(Color::Rgb(240, 180, 80)),
+            Style::default().bg(pill_bg).fg(theme.mode_command),
         ),
         Span::styled("", Style::default().bg(bar_bg).fg(pill_bg)),
     ]);
@@ -1510,14 +1592,14 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
                 format!(" {spinner_icon} {name} "),
                 Style::default()
                     .bg(bar_bg)
-                    .fg(Color::Rgb(245, 185, 60))
+                    .fg(theme.mode_command)
                     .add_modifier(Modifier::BOLD),
             ));
         }
         LspStatus::Ready(name) => {
             status_right_spans.push(Span::styled(
                 format!(" 󰄬 {name} "),
-                Style::default().bg(bar_bg).fg(Color::Rgb(100, 200, 140)),
+                Style::default().bg(bar_bg).fg(theme.mode_insert),
             ));
         }
         LspStatus::Error(err) => {
@@ -1525,14 +1607,14 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
                 format!(" 󰅚 LSP: {err} "),
                 Style::default()
                     .bg(bar_bg)
-                    .fg(Color::Rgb(240, 90, 90))
+                    .fg(Color::Rgb(244, 56, 65))
                     .add_modifier(Modifier::BOLD),
             ));
         }
         LspStatus::NotFound(name) => {
             status_right_spans.push(Span::styled(
                 format!(" 󰄰 {name} missing "),
-                Style::default().bg(bar_bg).fg(Color::Rgb(240, 140, 70)),
+                Style::default().bg(bar_bg).fg(theme.mode_command),
             ));
         }
         LspStatus::Disabled => {}
@@ -1541,7 +1623,7 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
     if error_count > 0 {
         status_right_spans.push(Span::styled(
             format!("  {error_count} "),
-            Style::default().bg(bar_bg).fg(Color::Rgb(240, 90, 90)),
+            Style::default().bg(bar_bg).fg(Color::Rgb(244, 56, 65)),
         ));
     }
     if warn_count > 0 {
@@ -1554,8 +1636,8 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
     status_right_spans.extend(vec![
         Span::styled("", Style::default().bg(bar_bg).fg(pill_bg)),
         Span::styled(
-            format!("  {total_lines}L "),
-            Style::default().bg(pill_bg).fg(Color::Rgb(160, 165, 180)),
+            format!(" 󰔎 {} ", theme.display_name),
+            Style::default().bg(pill_bg).fg(bar_foreground),
         ),
         Span::styled("", Style::default().bg(pill_bg).fg(badge_color)),
         Span::styled(
@@ -1577,13 +1659,13 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         main_chunks[1],
     );
 
-    // 4. Diagnostics / Command Bar Area[span_26](start_span)[span_26](end_span)
+    // 4. Diagnostics / Command Bar Area[span_24](start_span)[span_24](end_span)
     if editor.mode == Mode::Command {
         let prompt_line = Line::from(vec![
             Span::styled(
                 " :",
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(theme.mode_command)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(&editor.command_buffer),
@@ -1599,7 +1681,7 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             .find(|d| d.line == editor.cursor_y);
         let msg_line = if let Some(diag) = active_diag {
             let (d_icon, icon_style) = match diag.severity {
-                1 => ("  ", Style::default().fg(Color::Rgb(240, 90, 90))),
+                1 => ("  ", Style::default().fg(Color::Rgb(244, 56, 65))),
                 2 => ("  ", Style::default().fg(Color::Rgb(245, 185, 60))),
                 _ => (" 󰌵 ", Style::default().fg(Color::Rgb(100, 180, 255))),
             };
@@ -1607,18 +1689,13 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
                 Span::styled(d_icon, icon_style),
                 Span::styled(
                     &diag.message,
-                    Style::default()
-                        .fg(Color::Rgb(230, 235, 245))
-                        .add_modifier(Modifier::ITALIC),
+                    Style::default().fg(theme.fg).add_modifier(Modifier::ITALIC),
                 ),
             ])
         } else {
             Line::from(vec![
-                Span::styled(" 󰅂 ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    &editor.status_msg,
-                    Style::default().fg(Color::Rgb(170, 175, 190)),
-                ),
+                Span::styled(" 󰅂 ", Style::default().fg(theme.line_number)),
+                Span::styled(&editor.status_msg, Style::default().fg(theme.status_fg)),
             ])
         };
 
@@ -1634,7 +1711,7 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             editor.completion_rect = None;
         }
 
-        // Floating Auto-Complete Dropdown[span_27](start_span)[span_27](end_span)
+        // Floating Auto-Complete Dropdown[span_25](start_span)[span_25](end_span)
         if editor.mode == Mode::Insert
             && editor.completion_visible
             && !editor.completions.is_empty()
@@ -1670,17 +1747,17 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
                 let (kind_icon, kind_color) = completion_kind_icon(item.kind);
                 let item_bg = if is_sel {
-                    Color::Rgb(40, 75, 145)
+                    theme.popup_sel_bg
                 } else {
-                    Color::Rgb(25, 27, 34)
+                    theme.popup_bg
                 };
                 let text_style = if is_sel {
                     Style::default()
                         .bg(item_bg)
-                        .fg(Color::White)
+                        .fg(theme.popup_sel_fg)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().bg(item_bg).fg(Color::Rgb(215, 220, 230))
+                    Style::default().bg(item_bg).fg(theme.popup_text)
                 };
 
                 let avail_width = (popup_width as usize).saturating_sub(6);
@@ -1700,11 +1777,11 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             let comp_block = Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::Rgb(80, 140, 255)))
-                .style(Style::default().bg(Color::Rgb(25, 27, 34)))
+                .border_style(Style::default().fg(theme.popup_border))
+                .style(Style::default().bg(theme.popup_bg))
                 .title(Line::from(Span::styled(
                     title_info,
-                    Style::default().fg(Color::Rgb(140, 160, 200)),
+                    Style::default().fg(theme.status_fg),
                 )));
 
             frame.render_widget(Paragraph::new(list_lines).block(comp_block), popup_rect);
@@ -1719,7 +1796,7 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         }
     }
 
-    // 5. Render Command Palette Modal[span_28](start_span)[span_28](end_span)
+    // 5. Render Command Palette Modal[span_26](start_span)[span_26](end_span)
     if editor.palette.visible {
         let width = 46u16.min(size.width.saturating_sub(2));
         let height = 12u16.min(size.height.saturating_sub(2));
@@ -1743,20 +1820,20 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             Span::styled(
                 " 󰍉 > ",
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(theme.mode_command)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 &editor.palette.query,
                 Style::default()
-                    .fg(Color::White)
+                    .fg(theme.popup_sel_fg)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("█", Style::default().fg(Color::Rgb(100, 180, 255))),
+            Span::styled("█", Style::default().fg(theme.border_focused)),
         ]));
         palette_lines.push(Line::from(Span::styled(
             "─".repeat((width as usize).saturating_sub(2)),
-            Style::default().fg(Color::Rgb(60, 65, 80)),
+            Style::default().fg(theme.border),
         )));
 
         let scroll_start = editor.palette.scroll;
@@ -1767,17 +1844,17 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             let is_sel = i == editor.palette.selected_idx;
 
             let row_bg = if is_sel {
-                Color::Rgb(40, 75, 145)
+                theme.popup_sel_bg
             } else {
-                Color::Rgb(25, 27, 34)
+                theme.popup_bg
             };
             let title_style = if is_sel {
                 Style::default()
                     .bg(row_bg)
-                    .fg(Color::White)
+                    .fg(theme.popup_sel_fg)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().bg(row_bg).fg(Color::Rgb(215, 220, 230))
+                Style::default().bg(row_bg).fg(theme.popup_text)
             };
 
             let avail_title_width = (width as usize).saturating_sub(cmd.shortcut.len() + 8);
@@ -1786,16 +1863,13 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
             palette_lines.push(Line::from(vec![
                 Span::styled(" ", Style::default().bg(row_bg)),
-                Span::styled(
-                    cmd.icon,
-                    Style::default().bg(row_bg).fg(Color::Rgb(100, 180, 255)),
-                ),
+                Span::styled(cmd.icon, Style::default().bg(row_bg).fg(theme.mode_normal)),
                 Span::styled(" ", Style::default().bg(row_bg)),
                 Span::styled(display_title, title_style),
                 Span::styled(" ".repeat(padding), Style::default().bg(row_bg)),
                 Span::styled(
                     format!(" {} ", cmd.shortcut),
-                    Style::default().bg(row_bg).fg(Color::Rgb(140, 145, 160)),
+                    Style::default().bg(row_bg).fg(theme.line_number),
                 ),
             ]));
         }
@@ -1803,19 +1877,85 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         let p_block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::Rgb(80, 140, 255)))
-            .style(Style::default().bg(Color::Rgb(25, 27, 34)))
+            .border_style(Style::default().fg(theme.popup_border))
+            .style(Style::default().bg(theme.popup_bg))
             .title(Line::from(Span::styled(
                 " 󰍉 Command Palette (Esc to close) ",
                 Style::default()
-                    .fg(Color::Rgb(180, 200, 240))
+                    .fg(theme.popup_text)
                     .add_modifier(Modifier::BOLD),
             )));
 
         frame.render_widget(Paragraph::new(palette_lines).block(p_block), palette_rect);
     }
 
-    // 6. Render LSP Picker Modal Overlay[span_29](start_span)[span_29](end_span)
+    // 6. Render Theme Picker Modal Overlay
+    if let Some(picker) = &editor.theme_picker {
+        let themes = Theme::all();
+        let width = 48u16.min(size.width.saturating_sub(2));
+        let height = ((themes.len() as u16) + 4).min(size.height.saturating_sub(2));
+        let x = (size.width.saturating_sub(width)) / 2;
+        let y = (size.height.saturating_sub(height)) / 2;
+
+        let picker_rect = Rect::new(x, y, width, height);
+        frame.render_widget(Clear, picker_rect);
+
+        let mut lines = Vec::new();
+        lines.push(Line::from(vec![
+            Span::styled(" Select Theme ", Style::default().fg(theme.status_fg)),
+            Span::styled("(Enter to apply):", Style::default().fg(theme.line_number)),
+        ]));
+        lines.push(Line::from(Span::styled(
+            "─".repeat((width as usize).saturating_sub(2)),
+            Style::default().fg(theme.border),
+        )));
+
+        for (idx, t) in themes.iter().enumerate() {
+            let is_sel = idx == picker.selected_idx;
+            let is_active = t.name == editor.theme.name;
+            let bg = if is_sel {
+                theme.popup_sel_bg
+            } else {
+                theme.popup_bg
+            };
+            let style = if is_sel {
+                Style::default()
+                    .bg(bg)
+                    .fg(theme.popup_sel_fg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().bg(bg).fg(theme.popup_text)
+            };
+
+            let mark = if is_active {
+                " 󰄬 "
+            } else if is_sel {
+                " 󰅂 "
+            } else {
+                "   "
+            };
+            lines.push(Line::from(vec![
+                Span::styled(mark, Style::default().bg(bg).fg(theme.mode_normal)),
+                Span::styled(format!("{:<38}", t.display_name), style),
+            ]));
+        }
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.popup_border))
+            .style(Style::default().bg(theme.popup_bg))
+            .title(Line::from(Span::styled(
+                " 󰔎 Color Themes ",
+                Style::default()
+                    .fg(theme.popup_text)
+                    .add_modifier(Modifier::BOLD),
+            )));
+
+        frame.render_widget(Paragraph::new(lines).block(block), picker_rect);
+    }
+
+    // 7. Render LSP Picker Modal Overlay[span_27](start_span)[span_27](end_span)
     if let Some(picker) = &editor.lsp_picker {
         let width = 48u16.min(size.width.saturating_sub(2));
         let height = ((picker.candidates.len() as u16) + 4).min(size.height.saturating_sub(2));
@@ -1827,46 +1967,43 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
         let mut lines = Vec::new();
         lines.push(Line::from(vec![
-            Span::styled(
-                " Detected LSPs for ",
-                Style::default().fg(Color::Rgb(160, 170, 185)),
-            ),
+            Span::styled(" Detected LSPs for ", Style::default().fg(theme.status_fg)),
             Span::styled(
                 &picker.language_id,
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(theme.mode_command)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 " (Select with Enter):",
-                Style::default().fg(Color::Rgb(160, 170, 185)),
+                Style::default().fg(theme.status_fg),
             ),
         ]));
         lines.push(Line::from(Span::styled(
             "─".repeat((width as usize).saturating_sub(2)),
-            Style::default().fg(Color::Rgb(60, 65, 80)),
+            Style::default().fg(theme.border),
         )));
 
         for (idx, candidate) in picker.candidates.iter().enumerate() {
             let is_sel = idx == picker.selected_idx;
             let bg = if is_sel {
-                Color::Rgb(40, 75, 145)
+                theme.popup_sel_bg
             } else {
-                Color::Rgb(25, 27, 34)
+                theme.popup_bg
             };
             let style = if is_sel {
                 Style::default()
                     .bg(bg)
-                    .fg(Color::White)
+                    .fg(theme.popup_sel_fg)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().bg(bg).fg(Color::Rgb(215, 220, 230))
+                Style::default().bg(bg).fg(theme.popup_text)
             };
 
             lines.push(Line::from(vec![
                 Span::styled(
                     if is_sel { " 󰄬 " } else { "   " },
-                    Style::default().bg(bg).fg(Color::Green),
+                    Style::default().bg(bg).fg(theme.mode_insert),
                 ),
                 Span::styled(format!("{candidate:<38}"), style),
             ]));
@@ -1875,19 +2012,19 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::Rgb(100, 180, 255)))
-            .style(Style::default().bg(Color::Rgb(25, 27, 34)))
+            .border_style(Style::default().fg(theme.popup_border))
+            .style(Style::default().bg(theme.popup_bg))
             .title(Line::from(Span::styled(
                 "  Choose Language Server ",
                 Style::default()
-                    .fg(Color::Rgb(180, 200, 240))
+                    .fg(theme.popup_text)
                     .add_modifier(Modifier::BOLD),
             )));
 
         frame.render_widget(Paragraph::new(lines).block(block), picker_rect);
     }
 
-    // 7. Render In-Editor Help Modal[span_30](start_span)[span_30](end_span)
+    // 8. Render In-Editor Help Modal[span_28](start_span)[span_28](end_span)
     if editor.show_help {
         let width = 64u16.min(size.width.saturating_sub(4));
         let height = 22u16.min(size.height.saturating_sub(2));
@@ -1900,31 +2037,28 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         let help_block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::Rgb(100, 180, 255)))
-            .style(Style::default().bg(Color::Rgb(22, 25, 32)))
+            .border_style(Style::default().fg(theme.popup_border))
+            .style(Style::default().bg(theme.popup_bg))
             .title(Line::from(vec![
                 Span::styled(
                     " 󰋖 subject0 Keybindings & Help ",
                     Style::default()
-                        .fg(Color::Rgb(240, 200, 90))
+                        .fg(theme.mode_command)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    "(Esc to close) ",
-                    Style::default().fg(Color::Rgb(140, 145, 160)),
-                ),
+                Span::styled("(Esc to close) ", Style::default().fg(theme.line_number)),
             ]));
 
         let inner_rect = help_block.inner(help_rect);
         frame.render_widget(help_block, help_rect);
 
         let c_sec = Style::default()
-            .fg(Color::Rgb(80, 210, 240))
+            .fg(theme.mode_normal)
             .add_modifier(Modifier::BOLD);
         let c_key = Style::default()
-            .fg(Color::Yellow)
+            .fg(theme.mode_command)
             .add_modifier(Modifier::BOLD);
-        let c_desc = Style::default().fg(Color::Rgb(215, 220, 230));
+        let c_desc = Style::default().fg(theme.popup_text);
 
         let content = vec![
             Line::from(Span::styled("NORMAL MODE MOTIONS", c_sec)),
@@ -1953,8 +2087,12 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
                 Span::styled("Cut current line / character into clipboard", c_desc),
             ]),
             Line::from(vec![
-                Span::styled("  y, p, u        ", c_key),
-                Span::styled("Yank line, Paste clipboard, Undo edit", c_desc),
+                Span::styled("  y, p           ", c_key),
+                Span::styled("Yank line, Paste from clipboard", c_desc),
+            ]),
+            Line::from(vec![
+                Span::styled("  u, Ctrl-R      ", c_key),
+                Span::styled("Undo edit, Redo edit", c_desc),
             ]),
             Line::from(vec![
                 Span::styled("  ~, J           ", c_key),
@@ -1979,8 +2117,8 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
                 Span::styled("Return to Normal mode", c_desc),
             ]),
             Line::from(vec![
-                Span::styled("  Tab            ", c_key),
-                Span::styled("Insert 4 soft spaces (or accept completion)", c_desc),
+                Span::styled("  Tab / Shift-Tab", c_key),
+                Span::styled("Indent 4 spaces / Dedent line", c_desc),
             ]),
             Line::from(vec![
                 Span::styled("  Ctrl-Space     ", c_key),
@@ -1995,6 +2133,10 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             Line::from(vec![
                 Span::styled("  :w [file]      ", c_key),
                 Span::styled("Save buffer to disk", c_desc),
+            ]),
+            Line::from(vec![
+                Span::styled("  :theme [name]  ", c_key),
+                Span::styled("Open theme picker or switch theme", c_desc),
             ]),
             Line::from(vec![
                 Span::styled("  :q, :q!        ", c_key),
