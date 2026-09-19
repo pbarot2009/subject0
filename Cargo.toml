@@ -22,7 +22,7 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 # Text buffer data structure
 ropey = "1.6"
 
-# Asynchronous runtime for LSP communication
+# Asynchronous runtime for LSP communication & child process supervisor
 tokio = { version = "1.38", features = [
     "rt-multi-thread",
     "process",
@@ -36,7 +36,7 @@ tokio = { version = "1.38", features = [
 which = "7.0"
 dirs = "6.0"
 
-# Pure Tree-sitter core & highlight query runtime (no Cranelift / Wasmtime bloat)
+# Pure Tree-sitter core & highlight query runtime
 tree-sitter = "0.25"
 tree-sitter-highlight = "0.25"
 

@@ -1,10 +1,10 @@
 //! # Application Entry Point, Event Loop, & Terminal UI Subsystem
 //!
-//! This module serves as the runtime orchestrator for `subject0`. It integrates the
+//! This module serves as the runtime orchestrator for `subject0`[span_2](start_span)[span_2](end_span). It integrates the
 //! terminal lifecycle, asynchronous event multiplexing, input decoding, themed frame
 //! rendering, and modal subsystem coordination for full Language Server Protocol (LSP)
 //! intelligence (inferred types & parameter inlay hints, hover docs, signature assistance,
-//! definition jumps, formatting, code actions, and symbol outlines)[span_0](start_span)[span_0](end_span).
+//! definition jumps, formatting, code actions, and symbol outlines)[span_3](start_span)[span_3](end_span).
 
 mod cmd;
 mod editor;
@@ -38,17 +38,16 @@ use ratatui::{
 };
 use tokio::sync::mpsc;
 
-use editor::{
-    line_len, CodeActionPicker, Editor, Focus, LocationPicker, Mode, SymbolPicker, ThemePicker,
-};
+use editor::{CodeActionPicker, Editor, Focus, LocationPicker, Mode, SymbolPicker};
 use lsp::{
     completion_kind_icon, file_icon_and_color, symbol_kind_icon, utf16_to_char_col, InlayHintType,
-    LocationItem, LspOutbound, LspStatus, SuggestionItem,
+    LspOutbound, LspStatus, SuggestionItem,
 };
+
 use theme::Theme;
 
 /// RAII Terminal Guard ensuring the host terminal is reliably restored
-/// to canonical mode regardless of exit status[span_1](start_span)[span_1](end_span).
+/// to canonical mode regardless of exit status[span_4](start_span)[span_4](end_span).
 struct TerminalGuard;
 
 impl TerminalGuard {
@@ -70,21 +69,21 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// Configures the terminal hardware cursor geometry based on the active modal editing state[span_2](start_span)[span_2](end_span).
+/// Configures the terminal hardware cursor geometry based on the active modal editing state[span_5](start_span)[span_5](end_span).
 fn set_terminal_cursor_style(mode: Mode) {
     let mut stdout = stdout();
     match mode {
         Mode::Normal | Mode::Command | Mode::Visual { .. } => {
-            let _ = stdout.write_all(b"\x1b[2 q"); // Steady Block[span_3](start_span)[span_3](end_span)
+            let _ = stdout.write_all(b"\x1b[2 q"); // Steady Block[span_6](start_span)[span_6](end_span)
         }
         Mode::Insert => {
-            let _ = stdout.write_all(b"\x1b[6 q"); // Steady Bar / I-Beam[span_4](start_span)[span_4](end_span)
+            let _ = stdout.write_all(b"\x1b[6 q"); // Steady Bar / I-Beam[span_7](start_span)[span_7](end_span)
         }
     }
     let _ = stdout.flush();
 }
 
-/// Registers a secondary panic hook ensuring screen recovery during thread unwinding[span_5](start_span)[span_5](end_span).
+/// Registers a secondary panic hook ensuring screen recovery during thread unwinding[span_8](start_span)[span_8](end_span).
 fn setup_panic_hook() {
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -97,7 +96,7 @@ fn setup_panic_hook() {
     }));
 }
 
-/// Safely truncates a string by Unicode scalar count without slicing mid-codepoint[span_6](start_span)[span_6](end_span).
+/// Safely truncates a string by Unicode scalar count without slicing mid-codepoint[span_9](start_span)[span_9](end_span).
 fn safe_truncate(s: &str, max_chars: usize) -> String {
     if s.chars().count() > max_chars {
         let mut result: String = s.chars().take(max_chars.saturating_sub(1)).collect();
@@ -241,18 +240,15 @@ async fn main() -> Result<()> {
                     }
                 }
                 LspOutbound::Rename { req_id: _, changes } => {
-                    let mut count = 0;
-                    if let Some(cur_path) = editor.path.clone() {
-                        for (p, edits) in &changes {
-                            if p.canonicalize().ok() == cur_path.canonicalize().ok()
-                                || p == &cur_path
-                            {
-                                editor.apply_text_edits(edits);
-                                count += edits.len();
-                            }
+                    match editor.apply_workspace_edits(&changes) {
+                        Ok(count) => {
+                            editor.status_msg =
+                                format!("Renamed symbol ({count} file edits applied)");
+                        }
+                        Err(e) => {
+                            editor.status_msg = format!("Rename failed: {e}");
                         }
                     }
-                    editor.status_msg = format!("Renamed symbol ({count} edits applied)");
                 }
                 LspOutbound::DocumentSymbols { req_id: _, symbols } => {
                     if symbols.is_empty() {
@@ -368,7 +364,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
     let viewport_top = 1u16;
     let viewport_bottom = size.height.saturating_sub(3);
 
-    // Dismiss any active hover card on outside click
+    // Dismiss active hover card on outside click
     if editor.hover_info.is_some() {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             editor.hover_info = None;
@@ -795,24 +791,14 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
             }
             KeyCode::Enter => {
                 if let Some(action) = picker.actions.get(picker.selected_idx) {
-                    if let Some(cur_path) = &editor.path {
-                        let mut found = false;
-                        for (p, edits) in &action.edits {
-                            if p.canonicalize().ok() == cur_path.canonicalize().ok()
-                                || p == cur_path
-                            {
-                                editor.apply_text_edits(edits);
-                                found = true;
-                                break;
-                            }
+                    match editor.apply_workspace_edits(&action.edits) {
+                        Ok(_) => {
+                            editor.status_msg = format!("Applied: {}", action.title);
                         }
-                        if !found && action.edits.len() == 1 {
-                            if let Some(edits) = action.edits.values().next() {
-                                editor.apply_text_edits(edits);
-                            }
+                        Err(e) => {
+                            editor.status_msg = format!("Action application error: {e}");
                         }
                     }
-                    editor.status_msg = format!("Applied: {}", action.title);
                 }
             }
             _ => {
@@ -848,6 +834,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
             KeyCode::Enter => {
                 let filtered = picker.filtered_symbols();
                 if let Some(sym) = filtered.get(picker.selected_idx) {
+                    editor.record_jump_checkpoint();
                     editor.cursor_y = sym.line.min(editor.rope.len_lines().saturating_sub(1));
                     let line_str = editor.rope.line(editor.cursor_y).to_string();
                     editor.cursor_x = utf16_to_char_col(&line_str, sym.col);
@@ -1112,6 +1099,14 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                         editor.redo();
                         return;
                     }
+                    KeyCode::Char('o') => {
+                        editor.jump_backward();
+                        return;
+                    }
+                    KeyCode::Char('i') => {
+                        editor.jump_forward();
+                        return;
+                    }
                     KeyCode::Char(' ') => {
                         editor.set_mode(Mode::Insert);
                         editor.request_completions();
@@ -1162,6 +1157,14 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                     }
                     ('g', KeyCode::Char('a')) => {
                         editor.request_code_actions();
+                        true
+                    }
+                    (']', KeyCode::Char('d')) => {
+                        editor.next_diagnostic();
+                        true
+                    }
+                    ('[', KeyCode::Char('d')) => {
+                        editor.prev_diagnostic();
                         true
                     }
                     _ => false,
@@ -1219,6 +1222,8 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                 KeyCode::Char('u') => editor.undo(),
                 KeyCode::Char('d') => editor.pending_key = Some('d'),
                 KeyCode::Char('g') => editor.pending_key = Some('g'),
+                KeyCode::Char(']') => editor.pending_key = Some(']'),
+                KeyCode::Char('[') => editor.pending_key = Some('['),
                 KeyCode::Char('G') => {
                     let max_lines = editor.rope.len_lines().max(1);
                     editor.cursor_y = max_lines - 1;
@@ -1697,7 +1702,8 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         let (diag_marker, diag_style) = match line_diag.map(|d| d.severity) {
             Some(1) => (" ", Style::default().fg(theme.diag_error)),
             Some(2) => (" ", Style::default().fg(theme.diag_warn)),
-            Some(_) => ("󰌵 ", Style::default().fg(theme.diag_info)),
+            Some(3) => ("󰌵 ", Style::default().fg(theme.diag_info)),
+            Some(_) => ("󰌵 ", Style::default().fg(theme.diag_hint)),
             None => ("  ", Style::default()),
         };
 
@@ -2120,7 +2126,8 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             let (d_icon, icon_style) = match diag.severity {
                 1 => ("  ", Style::default().fg(theme.diag_error)),
                 2 => ("  ", Style::default().fg(theme.diag_warn)),
-                _ => (" 󰌵 ", Style::default().fg(theme.diag_info)),
+                3 => (" 󰌵 ", Style::default().fg(theme.diag_info)),
+                _ => (" 󰌵 ", Style::default().fg(theme.diag_hint)),
             };
             Line::from(vec![
                 Span::styled(d_icon, icon_style),
@@ -2318,7 +2325,6 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
         frame.render_widget(Paragraph::new(doc_lines), inner_card);
     }
-
     // 8. Code Action Picker Modal
     if let Some(picker) = &editor.code_action_picker {
         let width = 56u16.min(size.width.saturating_sub(2));
@@ -2807,8 +2813,8 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
     // 15. Render In-Editor Help Modal
     if editor.show_help {
-        let width = 64u16.min(size.width.saturating_sub(4));
-        let height = 22u16.min(size.height.saturating_sub(2));
+        let width = 66u16.min(size.width.saturating_sub(4));
+        let height = 24u16.min(size.height.saturating_sub(2));
         let x = (size.width.saturating_sub(width)) / 2;
         let y = (size.height.saturating_sub(height)) / 2;
 
@@ -2865,11 +2871,23 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             ]),
             Line::from(vec![
                 Span::styled("  :rn / F2       ", c_key),
-                Span::styled("Rename symbol across project", c_desc),
+                Span::styled("Rename symbol (multi-file project-wide)", c_desc),
             ]),
             Line::from(vec![
                 Span::styled("  :sym / :symbols", c_key),
                 Span::styled("Fuzzy search document symbol outline", c_desc),
+            ]),
+            Line::from(vec![
+                Span::styled("  ]d / [d        ", c_key),
+                Span::styled("Jump to next / previous compiler diagnostic", c_desc),
+            ]),
+            Line::from(vec![
+                Span::styled("  Ctrl-O / Ctrl-I", c_key),
+                Span::styled("Jump backward / forward in navigation history", c_desc),
+            ]),
+            Line::from(vec![
+                Span::styled("  :lsp-restart   ", c_key),
+                Span::styled("Reboot crashed/frozen Language Server", c_desc),
             ]),
             Line::from(vec![
                 Span::styled("  :hints         ", c_key),

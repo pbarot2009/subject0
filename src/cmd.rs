@@ -2,7 +2,7 @@
 //!
 //! Handles command-line arguments, flag decoding (`--help`, `--version`, `--clean`),
 //! jump-to-line specifiers (`+<line>`, `file:line:col`), path resolution across
-//! Termux, Linux, macOS, and Windows, grammar inspection, and language health diagnostics[span_0](start_span)[span_0](end_span).
+//! Termux, Linux, macOS, and Windows, grammar inspection, and language health diagnostics[span_3](start_span)[span_3](end_span).
 
 use std::{
     env,
@@ -10,28 +10,28 @@ use std::{
     process,
 };
 
-use crate::lsp::{resolve_binary_path, DynamicGrammar, SupportedLanguage};
+use crate::lsp::{DynamicGrammar, SupportedLanguage, resolve_binary_path};
 
-/// Parsed command-line arguments[span_1](start_span)[span_1](end_span).
+/// Parsed command-line arguments[span_4](start_span)[span_4](end_span).
 #[derive(Debug, Default, Clone)]
 pub struct CliArgs {
-    /// Path to target file or directory[span_2](start_span)[span_2](end_span).
+    /// Path to target file or directory[span_5](start_span)[span_5](end_span).
     pub path: Option<PathBuf>,
-    /// Optional target line number to jump to on launch (1-based)[span_3](start_span)[span_3](end_span).
+    /// Optional target line number to jump to on launch (1-based)[span_6](start_span)[span_6](end_span).
     pub jump_line: Option<usize>,
-    /// Optional target column number to jump to on launch (1-based)[span_4](start_span)[span_4](end_span).
+    /// Optional target column number to jump to on launch (1-based)[span_7](start_span)[span_7](end_span).
     pub jump_col: Option<usize>,
-    /// Optional override for soft line wrapping[span_5](start_span)[span_5](end_span).
+    /// Optional override for soft line wrapping[span_8](start_span)[span_8](end_span).
     pub line_wrap: Option<bool>,
-    /// When true, ignore `.subject0` configuration file[span_6](start_span)[span_6](end_span).
+    /// When true, ignore `.subject0` configuration file[span_9](start_span)[span_9](end_span).
     pub ignore_config: bool,
 }
 
 impl CliArgs {
-    /// Parses CLI arguments from standard environment args[span_7](start_span)[span_7](end_span).
+    /// Parses CLI arguments from standard environment args[span_10](start_span)[span_10](end_span).
     ///
     /// Intercepts `--help` and `--version` to print directly to stdout and exit
-    /// before terminal raw mode or alternate screen buffers are initialized[span_8](start_span)[span_8](end_span).
+    /// before terminal raw mode or alternate screen buffers are initialized[span_11](start_span)[span_11](end_span).
     pub fn parse() -> Self {
         let raw_args: Vec<String> = env::args().skip(1).collect();
         let mut cli = Self::default();
@@ -94,13 +94,13 @@ impl CliArgs {
                 "-nw" | "--no-wrap" => {
                     cli.line_wrap = Some(false);
                 }
-                // Handle editor line-jump syntax (e.g., +42 or +100)[span_9](start_span)[span_9](end_span)
+                // Handle editor line-jump syntax (e.g., +42 or +100)[span_12](start_span)[span_12](end_span)
                 s if s.starts_with('+') => {
                     if let Ok(line_num) = s[1..].parse::<usize>() {
                         cli.jump_line = Some(line_num);
                     }
                 }
-                // Positional file or directory target[span_10](start_span)[span_10](end_span)
+                // Positional file or directory target[span_13](start_span)[span_13](end_span)
                 s if !s.starts_with('-') => {
                     Self::assign_target_path(&mut cli, s);
                 }
@@ -112,12 +112,12 @@ impl CliArgs {
         cli
     }
 
-    /// Strips enclosing quotes from argument flags[span_11](start_span)[span_11](end_span).
+    /// Strips enclosing quotes from argument flags[span_14](start_span)[span_14](end_span).
     fn clean_lang_arg(raw: &str) -> String {
         raw.trim().trim_matches('\'').trim_matches('"').to_string()
     }
 
-    /// Assigns file path and checks for `path:line:col` or `path:line` format[span_12](start_span)[span_12](end_span).
+    /// Assigns file path and checks for `path:line:col` or `path:line` format across Unix and Windows[span_15](start_span)[span_15](end_span).
     fn assign_target_path(cli: &mut Self, arg: &str) {
         if cli.path.is_some() {
             return;
@@ -129,19 +129,33 @@ impl CliArgs {
             return;
         }
 
-        let parts: Vec<&str> = arg.rsplitn(3, ':').collect();
-        if parts.len() == 3 {
-            if let (Ok(line), Ok(col)) = (parts[1].parse::<usize>(), parts[0].parse::<usize>()) {
-                let candidate = PathBuf::from(parts[2]);
-                cli.path = Some(candidate);
+        // Tokenize from the right to support Windows drive prefixes (e.g. C:\path:line:col)
+        let tokens: Vec<&str> = arg.rsplit(':').collect();
+
+        if tokens.len() >= 3 {
+            if let (Ok(col), Ok(line)) = (tokens[0].parse::<usize>(), tokens[1].parse::<usize>()) {
+                let path_str: String = tokens[2..]
+                    .iter()
+                    .rev()
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(":");
+                cli.path = Some(PathBuf::from(path_str));
                 cli.jump_line = Some(line);
                 cli.jump_col = Some(col);
                 return;
             }
-        } else if parts.len() == 2 {
-            if let Ok(line) = parts[0].parse::<usize>() {
-                let candidate = PathBuf::from(parts[1]);
-                cli.path = Some(candidate);
+        }
+
+        if tokens.len() >= 2 {
+            if let Ok(line) = tokens[0].parse::<usize>() {
+                let path_str: String = tokens[1..]
+                    .iter()
+                    .rev()
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(":");
+                cli.path = Some(PathBuf::from(path_str));
                 cli.jump_line = Some(line);
                 return;
             }
@@ -198,7 +212,7 @@ impl CliArgs {
 
   {b}{blue}󰅂 ARGUMENTS:{r}
       {green}[PATH]{r}             File or folder path {gray}(opens scratch buffer if empty){r}
-      {magenta}[+LINE]{r}            Jump directly to line number {gray}(e.g. +42 or path:42){r}
+      {magenta}[+LINE]{r}            Jump directly to line number {gray}(e.g. +42 or path:42:10){r}
 
   {b}{blue}󰅂 OPTIONS:{r}
       {yellow}-h, --help{r}                Show this formatted help menu and exit
@@ -216,14 +230,16 @@ impl CliArgs {
       {magenta}gr{r}                        Find all references across project
       {magenta}ga{r}                        Trigger available quickfixes & code actions
       {magenta}:fmt{r} / {magenta}Alt-F{r}             Format current buffer via LSP server
-      {magenta}:rn{r}  / {magenta}F2{r}                Rename symbol and references across project
+      {magenta}:rn{r}  / {magenta}F2{r}                Rename symbol across project (multi-file)
       {magenta}:sym{r} / {magenta}:symbols{r}          Search document symbols / function outline
+      {magenta}]d{r}   / {magenta}[d{r}                Jump to next / previous compiler diagnostic
+      {magenta}Ctrl-O{r} / {magenta}Ctrl-I{r}           Jump backward / forward in navigation history
+      {magenta}:lsp-restart{r}             Reboot crashed or frozen Language Server
       {magenta}:hints{r}                   Toggle inline inferred type & parameter hints
 
   {b}{blue}󰅂 EXAMPLES:{r}
-      {gray}# Open a file at line 50:{r}
-      {white}s0 src/main.rs +50{r}
-      {white}s0 src/main.rs:50{r}
+      {gray}# Open a file at line 50, column 10:{r}
+      {white}s0 src/main.rs:50:10{r}
 
       {gray}# Open project directory in the sidebar explorer:{r}
       {white}s0 .{r}
@@ -236,7 +252,7 @@ impl CliArgs {
         );
     }
 
-    /// Renders a bordered card with dynamic padding, guaranteeing border alignment[span_13](start_span)[span_13](end_span).
+    /// Renders a bordered card with dynamic padding, guaranteeing border alignment[span_16](start_span)[span_16](end_span).
     fn print_boxed_card(lines: &[String], min_width: usize) {
         let r = "\x1b[0m";
         let border = "\x1b[38;2;70;75;95m";
@@ -259,7 +275,7 @@ impl CliArgs {
         println!("{border}╰{}╯{r}", "─".repeat(inner_width + 2));
     }
 
-    /// Computes terminal display character width handling escape codes and double-width glyphs[span_14](start_span)[span_14](end_span).
+    /// Computes terminal display character width handling escape codes and double-width glyphs[span_17](start_span)[span_17](end_span).
     fn visible_width(s: &str) -> usize {
         let mut width = 0;
         let mut in_escape = false;
@@ -307,7 +323,7 @@ impl CliArgs {
                 .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     }
 
-    /// Inspects status of a Tree-sitter grammar[span_15](start_span)[span_15](end_span).
+    /// Inspects status of a Tree-sitter grammar[span_18](start_span)[span_18](end_span).
     fn run_grammar_installer(lang: &str, _force: bool) {
         let r = "\x1b[0m";
         let b = "\x1b[1m";
@@ -374,12 +390,14 @@ impl CliArgs {
             format!(" {gray}Rust, C, C++, Zig, Python, JavaScript, TypeScript, Go, JSON,{r}"),
             format!(" {gray}TOML, YAML, Bash, HTML, CSS, Markdown, Java.{r}"),
             String::new(),
-            format!(" {blue}Files for '{canon_lang}' receive full syntax and semantic intelligence via LSP.{r}"),
+            format!(
+                " {blue}Files for '{canon_lang}' receive full syntax and semantic intelligence via LSP.{r}"
+            ),
         ];
         Self::print_boxed_card(&lines, 66);
     }
 
-    /// Prints a comprehensive health report showing static grammars and LSP servers[span_16](start_span)[span_16](end_span).
+    /// Prints a comprehensive health report showing static grammars and LSP servers[span_19](start_span)[span_19](end_span).
     fn run_health_check() {
         let r = "\x1b[0m";
         let b = "\x1b[1m";

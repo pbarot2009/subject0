@@ -1,6 +1,6 @@
 //! # Editor Buffer Model & Application State Engine
 //!
-//! This module forms the central operational core of `subject0`. It manages:
+//! This module forms the central operational core of `subject0`:
 //!
 //! 1. **Text Storage & Mutability ([`ropey::Rope`])**:
 //!    Buffer contents are stored as a chunked, reference-counted B-tree rope with $O(\log N)$
@@ -9,14 +9,16 @@
 //! 2. **Modal Editing State Machine ([`Mode`])**:
 //!    Implements modal key semantics across `Normal`, `Insert`, `Command`, and `Visual` states[span_1](start_span)[span_1](end_span).
 //!
-//! 3. **Full Language Server Protocol (LSP) State Integration**:
-//!    Maintains real-time caches and dispatchers for Inlay Hints (inferred types & parameter names),
-//!    Floating Markdown Hover Cards, Signature Help, Go to Definition & References, Workspace/Document
-//!    Formatting edits, Code Action Quickfixes, Symbol Search, and Identifier Renaming.
+//! 3. **Top-Tier Language Server Protocol (LSP) State Integration**:
+//!    - Multi-file workspace edit dispatcher applying atomic updates across disk and memory.
+//!    - Additional text edits on completion acceptance (auto-imports).
+//!    - Jump history tracking across document definition/reference navigations.
+//!    - Bidirectional diagnostic traversal (`next_diagnostic`, `prev_diagnostic`).
+//!    - Request cancellation and server reboot triggers (`:lsp-restart`).
 //!
 //! 4. **Theming, Diagnostics Sync & Data Protection**:
 //!    Maintains AST highlighting trees, shifts diagnostic positions on row mutations,
-//!    tracks a bidirectional undo/redo ring, and protects unsaved buffers against file explorer wipes[span_2](start_span)[span_2](end_span).
+//!    tracks a bidirectional undo/redo ring, and protects unsaved buffers[span_2](start_span)[span_2](end_span).
 
 use std::{
     collections::{HashMap, HashSet},
@@ -207,6 +209,14 @@ pub enum Focus {
     Explorer,
 }
 
+/// Navigation jump checkpoint for jump-list history.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JumpCheckpoint {
+    pub path: PathBuf,
+    pub line: usize,
+    pub col: usize,
+}
+
 // === Command Palette Definitions ===
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -243,6 +253,11 @@ pub enum CommandId {
     GoToDefinition,
     FindReferences,
     ToggleInlayHints,
+    RestartLsp,
+    NextDiagnostic,
+    PrevDiagnostic,
+    JumpBackward,
+    JumpForward,
 }
 
 #[derive(Clone)]
@@ -285,7 +300,7 @@ pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
         id: CommandId::FindReferences,
     },
     PaletteCommand {
-        title: "Rename Symbol",
+        title: "Rename Symbol (Project-Wide)",
         shortcut: ":rn / F2",
         icon: "󰑕",
         id: CommandId::RenameSymbol,
@@ -295,6 +310,36 @@ pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
         shortcut: ":symbols / :sym",
         icon: "󰅩",
         id: CommandId::DocumentSymbols,
+    },
+    PaletteCommand {
+        title: "Next Compiler Diagnostic",
+        shortcut: ":nd / ]d",
+        icon: "",
+        id: CommandId::NextDiagnostic,
+    },
+    PaletteCommand {
+        title: "Previous Compiler Diagnostic",
+        shortcut: ":pd / [d",
+        icon: "",
+        id: CommandId::PrevDiagnostic,
+    },
+    PaletteCommand {
+        title: "Jump Backward (Location History)",
+        shortcut: "Ctrl-O",
+        icon: "󰁍",
+        id: CommandId::JumpBackward,
+    },
+    PaletteCommand {
+        title: "Jump Forward (Location History)",
+        shortcut: "Ctrl-I",
+        icon: "󰁔",
+        id: CommandId::JumpForward,
+    },
+    PaletteCommand {
+        title: "Restart Active LSP Server",
+        shortcut: ":lsp-restart",
+        icon: "󰑐",
+        id: CommandId::RestartLsp,
     },
     PaletteCommand {
         title: "Toggle Inferred Type & Param Inlay Hints",
@@ -705,7 +750,7 @@ pub struct Editor {
     pub lsp_out_tx: Option<mpsc::UnboundedSender<LspOutbound>>,
     pub spinner_tick: usize,
     pub lsp_req_id: i64,
-    pub doc_version: i64,
+    pub doc_version: i32,
 
     // Completions State
     pub completions: Vec<SuggestionItem>,
@@ -725,6 +770,10 @@ pub struct Editor {
     pub symbol_picker: Option<SymbolPicker>,
     pub location_picker: Option<LocationPicker>,
     pub rename_prompt: Option<String>,
+
+    // Location Navigation History (Jump List)
+    pub jump_list: Vec<JumpCheckpoint>,
+    pub jump_idx: usize,
 
     // Subsystems
     pub explorer: FileExplorer,
@@ -835,6 +884,9 @@ impl Editor {
             location_picker: None,
             rename_prompt: None,
 
+            jump_list: Vec::new(),
+            jump_idx: 0,
+
             explorer,
             palette: CommandPalette::new(),
             show_help: false,
@@ -886,6 +938,70 @@ impl Editor {
         }
         let line = self.rope.line(self.cursor_y).to_string();
         char_to_utf16_col(&line, self.cursor_x)
+    }
+
+    /// Records current file position in the jump history.
+    pub fn record_jump_checkpoint(&mut self) {
+        if let Some(p) = &self.path {
+            let cp = JumpCheckpoint {
+                path: p.clone(),
+                line: self.cursor_y,
+                col: self.cursor_x,
+            };
+            if self.jump_list.last() != Some(&cp) {
+                if self.jump_list.len() >= 100 {
+                    self.jump_list.remove(0);
+                }
+                self.jump_list.push(cp);
+                self.jump_idx = self.jump_list.len();
+            }
+        }
+    }
+
+    /// Jumps backward through the location jump-list history.
+    pub fn jump_backward(&mut self) {
+        if self.jump_idx > 0 && !self.jump_list.is_empty() {
+            if self.jump_idx == self.jump_list.len() {
+                self.record_jump_checkpoint();
+                self.jump_idx = self.jump_idx.saturating_sub(1);
+            }
+            self.jump_idx = self.jump_idx.saturating_sub(1);
+            if let Some(cp) = self.jump_list.get(self.jump_idx).cloned() {
+                self.jump_to_location(LocationItem {
+                    path: cp.path,
+                    line: cp.line,
+                    col: cp.col,
+                });
+                self.status_msg = format!(
+                    "Jumped back ({}/{})",
+                    self.jump_idx + 1,
+                    self.jump_list.len()
+                );
+            }
+        } else {
+            self.status_msg = "Already at oldest jump position".to_string();
+        }
+    }
+
+    /// Jumps forward through the location jump-list history.
+    pub fn jump_forward(&mut self) {
+        if self.jump_idx + 1 < self.jump_list.len() {
+            self.jump_idx += 1;
+            if let Some(cp) = self.jump_list.get(self.jump_idx).cloned() {
+                self.jump_to_location(LocationItem {
+                    path: cp.path,
+                    line: cp.line,
+                    col: cp.col,
+                });
+                self.status_msg = format!(
+                    "Jumped forward ({}/{})",
+                    self.jump_idx + 1,
+                    self.jump_list.len()
+                );
+            }
+        } else {
+            self.status_msg = "Already at newest jump position".to_string();
+        }
     }
 
     /// Loads a new file from disk into the current editor buffer, protecting against unsaved modifications[span_11](start_span)[span_11](end_span).
@@ -1037,6 +1153,16 @@ impl Editor {
         }
     }
 
+    /// Dispatches a reboot request to the active LSP background process.
+    pub fn restart_lsp(&mut self) {
+        if let Some(tx) = &self.lsp_tx {
+            let _ = tx.send(LspInbound::Restart);
+            self.status_msg = "Restarting Language Server...".to_string();
+        } else if let Some(path) = self.path.clone() {
+            self.ensure_lsp_for_file(&path);
+        }
+    }
+
     pub fn request_semantic_tokens(&mut self) {
         if self.syntax.has_treesitter() {
             return;
@@ -1088,6 +1214,7 @@ impl Editor {
     }
 
     pub fn request_definition(&mut self) {
+        self.record_jump_checkpoint();
         if let Some(tx) = &self.lsp_tx {
             self.lsp_req_id += 1;
             let col = self.cursor_utf16_col();
@@ -1101,6 +1228,7 @@ impl Editor {
     }
 
     pub fn request_references(&mut self) {
+        self.record_jump_checkpoint();
         if let Some(tx) = &self.lsp_tx {
             self.lsp_req_id += 1;
             let col = self.cursor_utf16_col();
@@ -1173,6 +1301,53 @@ impl Editor {
         }
     }
 
+    /// Navigates to the next diagnostic in the document.
+    pub fn next_diagnostic(&mut self) {
+        if self.diagnostics.is_empty() {
+            self.status_msg = "No diagnostics in buffer".to_string();
+            return;
+        }
+        let cur_y = self.cursor_y;
+        let target = self
+            .diagnostics
+            .iter()
+            .find(|d| d.line > cur_y)
+            .or_else(|| self.diagnostics.first())
+            .cloned();
+
+        if let Some(d) = target {
+            self.cursor_y = d.line.min(self.rope.len_lines().saturating_sub(1));
+            let line_str = self.rope.line(self.cursor_y).to_string();
+            self.cursor_x = utf16_to_char_col(&line_str, d.col);
+            self.clamp_cursor();
+            self.status_msg = format!("Diagnostic: {}", d.message);
+        }
+    }
+
+    /// Navigates to the previous diagnostic in the document.
+    pub fn prev_diagnostic(&mut self) {
+        if self.diagnostics.is_empty() {
+            self.status_msg = "No diagnostics in buffer".to_string();
+            return;
+        }
+        let cur_y = self.cursor_y;
+        let target = self
+            .diagnostics
+            .iter()
+            .rev()
+            .find(|d| d.line < cur_y)
+            .or_else(|| self.diagnostics.last())
+            .cloned();
+
+        if let Some(d) = target {
+            self.cursor_y = d.line.min(self.rope.len_lines().saturating_sub(1));
+            let line_str = self.rope.line(self.cursor_y).to_string();
+            self.cursor_x = utf16_to_char_col(&line_str, d.col);
+            self.clamp_cursor();
+            self.status_msg = format!("Diagnostic: {}", d.message);
+        }
+    }
+
     /// Converts an LSP position (0-based line, UTF-16 character column) into a character index.
     fn lsp_pos_to_char_index(rope: &Rope, line: usize, utf16_col: usize) -> usize {
         let total_lines = rope.len_lines();
@@ -1188,44 +1363,91 @@ impl Editor {
         (line_start_char + char_offset).min(rope.len_chars())
     }
 
-    /// Applies a collection of LSP text edits cleanly to the rope buffer.
-    ///
-    /// Edits are sorted in descending order by character position so earlier offsets
-    /// remain invariant while subsequent edits mutate the buffer.
+    /// Applies a collection of text edits to an arbitrary Rope buffer in descending order.
+    fn apply_edits_to_rope(rope: &mut Rope, edits: &[TextEditItem]) {
+        let mut indexed_edits: Vec<(usize, usize, &str)> = edits
+            .iter()
+            .map(|e| {
+                let start_idx = Self::lsp_pos_to_char_index(rope, e.start_line, e.start_col);
+                let end_idx = Self::lsp_pos_to_char_index(rope, e.end_line, e.end_col);
+                (start_idx, end_idx, e.new_text.as_str())
+            })
+            .collect();
+
+        // Descending order guarantees offset invariance for earlier edits
+        indexed_edits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+
+        for (start_idx, end_idx, new_text) in indexed_edits {
+            let safe_start = start_idx.min(rope.len_chars());
+            let safe_end = end_idx.max(safe_start).min(rope.len_chars());
+
+            if safe_start < safe_end {
+                rope.remove(safe_start..safe_end);
+            }
+            if !new_text.is_empty() {
+                rope.insert(safe_start, new_text);
+            }
+        }
+    }
+
+    /// Applies a collection of LSP text edits cleanly to the current editor buffer.
     pub fn apply_text_edits(&mut self, edits: &[TextEditItem]) {
         if edits.is_empty() {
             return;
         }
 
         self.snapshot();
-
-        let mut indexed_edits: Vec<(usize, usize, &str)> = edits
-            .iter()
-            .map(|e| {
-                let start_idx = Self::lsp_pos_to_char_index(&self.rope, e.start_line, e.start_col);
-                let end_idx = Self::lsp_pos_to_char_index(&self.rope, e.end_line, e.end_col);
-                (start_idx, end_idx, e.new_text.as_str())
-            })
-            .collect();
-
-        // Sort descending: highest start index first, then highest end index
-        indexed_edits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
-
-        for (start_idx, end_idx, new_text) in indexed_edits {
-            let safe_start = start_idx.min(self.rope.len_chars());
-            let safe_end = end_idx.max(safe_start).min(self.rope.len_chars());
-
-            if safe_start < safe_end {
-                self.rope.remove(safe_start..safe_end);
-            }
-            if !new_text.is_empty() {
-                self.rope.insert(safe_start, new_text);
-            }
-        }
+        Self::apply_edits_to_rope(&mut self.rope, edits);
 
         self.modified = true;
         self.clamp_cursor();
         self.on_buffer_modified();
+    }
+
+    /// Dispatches a project-wide `WorkspaceEdit` map cleanly across disk and memory.
+    pub fn apply_workspace_edits(
+        &mut self,
+        changes: &HashMap<PathBuf, Vec<TextEditItem>>,
+    ) -> Result<usize> {
+        let mut total_applied = 0;
+        let current_canon = self.path.as_ref().and_then(|p| p.canonicalize().ok());
+
+        for (path, edits) in changes {
+            if edits.is_empty() {
+                continue;
+            }
+
+            let is_current = current_canon
+                .as_ref()
+                .is_some_and(|cur| path.canonicalize().ok().as_ref() == Some(cur))
+                || self.path.as_ref() == Some(path);
+
+            if is_current {
+                self.apply_text_edits(edits);
+                total_applied += edits.len();
+            } else if path.exists() {
+                let file = File::open(path)?;
+                let mut ext_rope = Rope::from_reader(file)?;
+                Self::apply_edits_to_rope(&mut ext_rope, edits);
+
+                let tmp_path = path.with_extension("s0_wedit_tmp");
+                {
+                    let out_file = File::create(&tmp_path)?;
+                    let mut writer = BufWriter::new(out_file);
+                    for chunk in ext_rope.chunks() {
+                        writer.write_all(chunk.as_bytes())?;
+                    }
+                    writer.flush()?;
+                }
+                if fs::rename(&tmp_path, path).is_err() {
+                    fs::copy(&tmp_path, path)?;
+                    let _ = fs::remove_file(&tmp_path);
+                }
+                total_applied += edits.len();
+            }
+        }
+
+        Ok(total_applied)
     }
 
     /// Jumps directly to a target location (file, line, col), opening the target if external.
@@ -1331,6 +1553,7 @@ impl Editor {
         for d in &mut self.diagnostics {
             if d.line > after_line {
                 d.line += count;
+                d.end_line += count;
             }
         }
     }
@@ -1340,16 +1563,21 @@ impl Editor {
         for d in &mut self.diagnostics {
             if d.line >= from_line {
                 d.line += count;
+                d.end_line += count;
             }
         }
     }
 
     /// Shifts diagnostic coordinates up when a line above them is removed[span_17](start_span)[span_17](end_span).
     fn shift_diagnostics_up(&mut self, removed_line: usize) {
-        self.diagnostics.retain(|d| d.line != removed_line);
+        self.diagnostics
+            .retain(|d| d.line != removed_line && d.end_line != removed_line);
         for d in &mut self.diagnostics {
             if d.line > removed_line {
                 d.line = d.line.saturating_sub(1);
+            }
+            if d.end_line > removed_line {
+                d.end_line = d.end_line.saturating_sub(1);
             }
         }
     }
@@ -1357,7 +1585,7 @@ impl Editor {
     pub fn on_buffer_modified(&mut self) {
         let text = self.rope.to_string();
         self.syntax.reparse(&text);
-        self.doc_version += 1;
+        self.doc_version = self.doc_version.wrapping_add(1);
 
         let max_lines = self.rope.len_lines().max(1);
         self.diagnostics.retain(|d| d.line < max_lines);
@@ -1923,8 +2151,8 @@ impl Editor {
         }
 
         self.snapshot();
-        let item = &self.completions[self.completion_idx];
-        let replacement = item.insert_text.clone();
+        let item = self.completions[self.completion_idx].clone();
+        let replacement = item.insert_text;
         let prefix = self.current_word_prefix();
         let prefix_len = prefix.chars().count();
 
@@ -1939,6 +2167,11 @@ impl Editor {
         let line_start = self.rope.line_to_char(new_line);
         self.cursor_y = new_line;
         self.cursor_x = end_idx.saturating_sub(line_start);
+
+        // Apply any auto-import edits provided by the language server
+        if !item.additional_text_edits.is_empty() {
+            self.apply_text_edits(&item.additional_text_edits);
+        }
 
         self.modified = true;
         self.completion_visible = false;
@@ -2050,6 +2283,11 @@ impl Editor {
             CommandId::RenameSymbol => {
                 self.rename_prompt = Some(self.current_word_prefix());
             }
+            CommandId::NextDiagnostic => self.next_diagnostic(),
+            CommandId::PrevDiagnostic => self.prev_diagnostic(),
+            CommandId::JumpBackward => self.jump_backward(),
+            CommandId::JumpForward => self.jump_forward(),
+            CommandId::RestartLsp => self.restart_lsp(),
             CommandId::ToggleInlayHints => {
                 self.show_inlay_hints = !self.show_inlay_hints;
                 self.config.show_inlay_hints = self.show_inlay_hints;
@@ -2221,6 +2459,15 @@ impl Editor {
             "ref" | "references" => {
                 self.request_references();
             }
+            "nd" | "next-diag" => {
+                self.next_diagnostic();
+            }
+            "pd" | "prev-diag" => {
+                self.prev_diagnostic();
+            }
+            "lsp-restart" | "restart" => {
+                self.restart_lsp();
+            }
             "hints" | "inlay" => {
                 self.show_inlay_hints = !self.show_inlay_hints;
                 self.config.show_inlay_hints = self.show_inlay_hints;
@@ -2296,7 +2543,6 @@ impl Editor {
                 self.show_help = true;
                 self.help_scroll = 0;
             }
-
             _ if !cmd.is_empty() => {
                 self.status_msg = format!("Unknown command: :{cmd}");
             }
@@ -2321,7 +2567,7 @@ impl Editor {
         }
     }
 
-    /// Fast $O(1)$ linear viewport updater that guarantees instant response on large files[span_19](start_span)[span_19](end_span).
+    /// Viewport updater that guarantees instant response on large files[span_19](start_span)[span_19](end_span).
     pub fn update_scroll(&mut self, width: usize, height: usize) {
         if height == 0 || width == 0 {
             return;
@@ -2356,7 +2602,6 @@ impl Editor {
             let cur_sub_row =
                 (self.cursor_x / effective_width).min(cur_line_rows.saturating_sub(1));
 
-            // Fast check: sum rows from scroll_y to cursor_y bounded to (height + 1)
             let mut visual_rows_down = 0;
             for y in self.scroll_y..self.cursor_y {
                 visual_rows_down += line_visual_rows(y, &self.rope);
