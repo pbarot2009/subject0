@@ -3,19 +3,19 @@
 //! This module implements language intelligence and syntax styling for `subject0`:
 //!
 //! 1. **Crash-Proof LSP Background Actor (`run_lsp_actor`)**:
-//!    - Asynchronous, non-blocking Tokio actor communicating via JSON-RPC 2.0 with HTTP-style headers[`span_2`](start_span)[`span_2`](end_span).
+//!    - Asynchronous, non-blocking Tokio actor communicating via JSON-RPC 2.0 with HTTP-style headers.
 //!    - **Process Supervisor & Reboot Mechanics**: Automatically restarts crashed server processes with
 //!      exponential backoff, re-establishing initialization handshakes and document sync without lost edits.
 //!    - **Session Epoch Tracking**: Discards delayed messages from dead or superseded server processes.
 //!    - **Request Cancellation**: Transmits `$/cancelRequest` when operations are invalidated.
 //!    - **Full `lsp-types` Integration**: Standardized protocol types for handshakes, capabilities,
 //!      completions, hover documentation, signature assistance, definitions, references, workspace edits,
-//!      code actions, symbols, inlay hints, and push diagnostics[`span_3`](start_span)[`span_3`](end_span)[`span_4`](start_span)[`span_4`](end_span).
+//!      code actions, symbols, inlay hints, and push diagnostics.
 //!
 //! 2. **Compile-Time & Dynamic Syntax Engine (`SyntaxEngine`)**:
-//!    - Statically compiled and dynamic highlighting powered by **`tree-sitter-highlight`**[`span_5`](start_span)[`span_5`](end_span).
-//!    - Dual-tier highlighting: Statically linked Tree-sitter AST queries with fallback to LSP Semantic Tokens[`span_6`](start_span)[`span_6`](end_span).
-//!    - Zero-copy line-rendering mapped against the active [`Theme`][span_7](`start_span`)[`span_7`](end_span).
+//!    - Statically compiled and dynamic highlighting powered by **`tree-sitter-highlight`**.
+//!    - Dual-tier highlighting: Statically linked Tree-sitter AST queries with fallback to LSP Semantic Tokens.
+//!    - Zero-copy line-rendering mapped against the active [`Theme`].
 
 use anyhow::{Result, anyhow};
 use lsp_types::{
@@ -32,17 +32,18 @@ use lsp_types::{
     HoverContents, HoverParams, InitializeParams, InitializeResult, InitializedParams, InlayHint,
     InlayHintClientCapabilities, InlayHintKind, InlayHintLabel, InlayHintParams,
     InlayHintResolveClientCapabilities, InsertTextFormat, MarkedString, MarkupKind,
-    ParameterInformationSettings, ParameterLabel, Position, PositionEncodingKind,
-    PublishDiagnosticsClientCapabilities, PublishDiagnosticsParams, Range, ReferenceContext,
-    ReferenceParams, RenameClientCapabilities, RenameParams, ResourceOperationKind,
-    SemanticTokenModifier, SemanticTokenType, SemanticTokensClientCapabilities,
-    SemanticTokensClientCapabilitiesRequests, SemanticTokensFullOptions, SemanticTokensParams,
-    SemanticTokensResult, SignatureHelp, SignatureHelpClientCapabilities, SignatureHelpParams,
-    SignatureInformationSettings, TextDocumentClientCapabilities, TextDocumentContentChangeEvent,
-    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams,
-    TextDocumentSyncClientCapabilities, TextEdit, TokenFormat, Uri,
-    VersionedTextDocumentIdentifier, WindowClientCapabilities, WorkspaceClientCapabilities,
-    WorkspaceEdit, WorkspaceEditClientCapabilities, WorkspaceFolder,
+    ParameterInformationSettings, ParameterLabel, PartialResultParams, Position,
+    PositionEncodingKind, PublishDiagnosticsClientCapabilities, PublishDiagnosticsParams, Range,
+    ReferenceContext, ReferenceParams, RenameClientCapabilities, RenameParams,
+    ResourceOperationKind, SemanticTokenModifier, SemanticTokenType,
+    SemanticTokensClientCapabilities, SemanticTokensClientCapabilitiesRequests,
+    SemanticTokensFullOptions, SemanticTokensParams, SemanticTokensResult, SignatureHelp,
+    SignatureHelpClientCapabilities, SignatureHelpParams, SignatureInformationSettings,
+    TextDocumentClientCapabilities, TextDocumentContentChangeEvent, TextDocumentIdentifier,
+    TextDocumentItem, TextDocumentPositionParams, TextDocumentSyncClientCapabilities, TextEdit,
+    TokenFormat, Uri, VersionedTextDocumentIdentifier, WindowClientCapabilities,
+    WorkDoneProgressParams, WorkspaceClientCapabilities, WorkspaceEdit,
+    WorkspaceEditClientCapabilities, WorkspaceFolder,
 };
 use ratatui::{
     style::{Color, Modifier, Style},
@@ -68,7 +69,7 @@ use crate::theme::Theme;
 
 // === Standardized LSP Client Types ===
 
-/// Represents a single diagnostic entry emitted by an LSP server[`span_8`](start_span)[`span_8`](end_span).
+/// Represents a single diagnostic entry emitted by an LSP server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiagnosticItem {
     pub line: usize,
@@ -81,7 +82,7 @@ pub struct DiagnosticItem {
     pub is_deprecated: bool,
 }
 
-/// An individual code completion candidate returned by the LSP server[`span_9`](start_span)[`span_9`](end_span).
+/// An individual code completion candidate returned by the LSP server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SuggestionItem {
     pub label: String,
@@ -92,7 +93,7 @@ pub struct SuggestionItem {
     pub additional_text_edits: Vec<TextEditItem>,
 }
 
-/// Semantic kind of an inlay hint[`span_10`](start_span)[`span_10`](end_span).
+/// Semantic kind of an inlay hint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InlayHintType {
     Type,
@@ -100,7 +101,7 @@ pub enum InlayHintType {
     Other,
 }
 
-/// Inferred type or parameter name inlay hint displayed inline within code[`span_11`](start_span)[`span_11`](end_span).
+/// Inferred type or parameter name inlay hint displayed inline within code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InlayHintItem {
     pub line: usize,
@@ -111,13 +112,14 @@ pub struct InlayHintItem {
     pub padding_right: bool,
 }
 
-/// Hover documentation payload containing documentation lines[`span_12`](start_span)[`span_12`](end_span).
+/// Hover documentation payload containing documentation lines.
 #[derive(Debug, Clone)]
 pub struct HoverInfo {
     pub lines: Vec<String>,
 }
 
-/// Active function or method signature help tooltip information[`span_13`](start_span)[`span_13`](end_span).
+/// Active function or method signature help tooltip information.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct SignatureHelpInfo {
     pub signature_label: String,
@@ -126,7 +128,7 @@ pub struct SignatureHelpInfo {
     pub doc: Option<String>,
 }
 
-/// Source code location returned by definition and reference queries[`span_14`](start_span)[`span_14`](end_span).
+/// Source code location returned by definition and reference queries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocationItem {
     pub path: PathBuf,
@@ -134,7 +136,7 @@ pub struct LocationItem {
     pub col: usize,
 }
 
-/// Atomic text replacement range for formatting, renaming, and code actions[`span_15`](start_span)[`span_15`](end_span).
+/// Atomic text replacement range for formatting, renaming, and code actions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextEditItem {
     pub start_line: usize,
@@ -144,7 +146,8 @@ pub struct TextEditItem {
     pub new_text: String,
 }
 
-/// Code action or quickfix candidate provided by the LSP server[`span_16`](start_span)[`span_16`](end_span).
+/// Code action or quickfix candidate provided by the LSP server.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct CodeActionItem {
     pub title: String,
@@ -153,7 +156,7 @@ pub struct CodeActionItem {
     pub edits: HashMap<PathBuf, Vec<TextEditItem>>,
 }
 
-/// Document outline symbol (function, struct, method, variable, enum, etc.)[`span_17`](start_span)[`span_17`](end_span).
+/// Document outline symbol (function, struct, method, variable, enum, etc.).
 #[derive(Debug, Clone)]
 pub struct SymbolItem {
     pub name: String,
@@ -163,7 +166,7 @@ pub struct SymbolItem {
     pub container_name: Option<String>,
 }
 
-/// Operational lifecycle state of the LSP server process[`span_18`](start_span)[`span_18`](end_span).
+/// Operational lifecycle state of the LSP server process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LspStatus {
     Disabled,
@@ -173,7 +176,7 @@ pub enum LspStatus {
     Error(String),
 }
 
-/// Canonical semantic classification mapping server legends and queries into unified theme tokens[`span_19`](start_span)[`span_19`](end_span).
+/// Canonical semantic classification mapping server legends and queries into unified theme tokens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanonicalTokenType {
     Keyword,
@@ -213,6 +216,7 @@ impl CanonicalTokenType {
         }
     }
 
+    #[allow(dead_code)]
     pub fn from_query_capture(capture_name: &str) -> Self {
         let name = capture_name.trim_start_matches('@');
         if name.starts_with("keyword")
@@ -275,7 +279,7 @@ impl CanonicalTokenType {
     }
 }
 
-/// A single decoded semantic token span positioned in buffer coordinates[`span_20`](start_span)[`span_20`](end_span).
+/// A single decoded semantic token span positioned in buffer coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SemanticTokenSpan {
     pub line: usize,
@@ -284,7 +288,8 @@ pub struct SemanticTokenSpan {
     pub token_type: CanonicalTokenType,
 }
 
-/// Inbound messages routed to the background LSP actor[`span_21`](start_span)[`span_21`](end_span).
+/// Inbound messages routed to the background LSP actor.
+#[allow(dead_code)]
 pub enum LspInbound {
     Change {
         text: String,
@@ -352,7 +357,7 @@ pub enum LspInbound {
     Restart,
 }
 
-/// Outbound messages received from the background LSP actor[`span_22`](start_span)[`span_22`](end_span).
+/// Outbound messages received from the background LSP actor.
 pub enum LspOutbound {
     Status(LspStatus),
     Diagnostics(Vec<DiagnosticItem>),
@@ -403,7 +408,7 @@ pub enum LspOutbound {
 
 // === Cross-Platform Path & Directory Resolution ===
 
-/// Locates standard data directory honoring Termux, XDG, macOS, and Windows conventions[`span_23`](start_span)[`span_23`](end_span).
+/// Locates standard data directory honoring Termux, XDG, macOS, and Windows conventions.
 pub fn subject0_data_dir() -> PathBuf {
     if let Ok(custom) = env::var("SUBJECT0_DATA_DIR") {
         return PathBuf::from(custom);
@@ -420,7 +425,7 @@ pub fn subject0_data_dir() -> PathBuf {
     )
 }
 
-/// Locates standard config directory honoring Termux, XDG, macOS, and Windows conventions[`span_24`](start_span)[`span_24`](end_span).
+/// Locates standard config directory honoring Termux, XDG, macOS, and Windows conventions.
 pub fn subject0_config_dir() -> PathBuf {
     if let Ok(custom) = env::var("SUBJECT0_CONFIG_DIR") {
         return PathBuf::from(custom);
@@ -437,7 +442,7 @@ pub fn subject0_config_dir() -> PathBuf {
     )
 }
 
-/// Resolves an executable binary path across Android Termux, Linux, macOS, and Windows[`span_25`](start_span)[`span_25`](end_span).
+/// Resolves an executable binary path across Android Termux, Linux, macOS, and Windows.
 pub fn resolve_binary_path(cmd: &str) -> Option<PathBuf> {
     if let Ok(path) = which::which(cmd) {
         return Some(path);
@@ -496,7 +501,7 @@ pub fn resolve_binary_path(cmd: &str) -> Option<PathBuf> {
     None
 }
 
-/// Converts a local filesystem path to an RFC-compliant `file://` URI string[`span_26`](start_span)[`span_26`](end_span).
+/// Converts a local filesystem path to an RFC-compliant `file://` URI string.
 pub fn file_to_uri(path: &Path) -> String {
     let abs = if path.is_absolute() {
         path.to_path_buf()
@@ -519,7 +524,7 @@ pub fn file_to_uri(path: &Path) -> String {
     }
 }
 
-/// Parses an RFC 3986 `file://` URI into a local `PathBuf`[`span_27`](start_span)[`span_27`](end_span).
+/// Parses an RFC 3986 `file://` URI into a local `PathBuf`.
 pub fn uri_to_path(uri_str: &str) -> Option<PathBuf> {
     if let Ok(url) = url::Url::parse(uri_str)
         && let Ok(path) = url.to_file_path()
@@ -747,7 +752,6 @@ fn parse_lsp_diagnostics(params: Value) -> Result<(String, Vec<DiagnosticItem>)>
             .is_some_and(|tags| tags.contains(&DiagnosticTag::DEPRECATED));
 
         let severity = match d.severity {
-            Some(DiagnosticSeverity::ERROR) => 1,
             Some(DiagnosticSeverity::WARNING) => 2,
             Some(DiagnosticSeverity::INFORMATION) => 3,
             Some(DiagnosticSeverity::HINT) => 4,
@@ -1062,7 +1066,7 @@ fn parse_lsp_code_actions(val: Value) -> Vec<CodeActionItem> {
 
 fn parse_lsp_document_symbols_recursive(
     symbols: Vec<DocumentSymbol>,
-    container: Option<String>,
+    container: Option<&str>,
     out: &mut Vec<SymbolItem>,
 ) {
     for sym in symbols {
@@ -1072,11 +1076,11 @@ fn parse_lsp_document_symbols_recursive(
             kind: symbol_kind_to_u64(sym.kind),
             line: sym.selection_range.start.line as usize,
             col: sym.selection_range.start.character as usize,
-            container_name: container.clone(),
+            container_name: container.map(ToString::to_string),
         });
 
         if let Some(children) = sym.children {
-            parse_lsp_document_symbols_recursive(children, Some(sym.name), out);
+            parse_lsp_document_symbols_recursive(children, Some(&sym.name), out);
         }
     }
 }
@@ -1142,7 +1146,7 @@ fn parse_lsp_inlay_hints(val: Value) -> Vec<InlayHintItem> {
 
 // === Process Supervisor, Auto-Restart & Background Actor ===
 
-async fn spawn_lsp_child(
+fn spawn_lsp_child(
     bin_path: &Path,
     args: &[&str],
 ) -> Result<(Child, ChildStdin, BufReader<tokio::process::ChildStdout>)> {
@@ -1488,7 +1492,7 @@ async fn graceful_shutdown(
     }
 }
 
-/// Asynchronous LSP Process Supervisor with Auto-Restart, Crash Proofing, & Reboot[`span_28`](start_span)[`span_28`](end_span).
+/// Asynchronous LSP Process Supervisor with Auto-Restart, Crash Proofing, & Reboot.
 pub async fn run_lsp_actor(
     initial_file: PathBuf,
     initial_lang: String,
@@ -1521,7 +1525,7 @@ pub async fn run_lsp_actor(
         let active_session = session_id;
         let _ = tx.send(LspOutbound::Status(LspStatus::Starting(server_cmd.clone())));
 
-        let (mut child, mut stdin, mut stdout) = match spawn_lsp_child(&bin_path, &args).await {
+        let (mut child, mut stdin, mut stdout) = match spawn_lsp_child(&bin_path, &args) {
             Ok(triplet) => triplet,
             Err(e) => {
                 let _ = tx.send(LspOutbound::Status(LspStatus::Error(format!(
@@ -1668,8 +1672,8 @@ pub async fn run_lsp_actor(
                                             text_document: TextDocumentIdentifier { uri },
                                             position: Position { line: line as u32, character: col as u32 },
                                         },
-                                        work_done_progress_params: Default::default(),
-                                        partial_result_params: Default::default(),
+                                        work_done_progress_params: WorkDoneProgressParams::default(),
+                                        partial_result_params: PartialResultParams::default(),
                                         context: None,
                                     }
                                 });
@@ -1690,8 +1694,8 @@ pub async fn run_lsp_actor(
                                     "method": "textDocument/semanticTokens/full",
                                     "params": SemanticTokensParams {
                                         text_document: TextDocumentIdentifier { uri },
-                                        work_done_progress_params: Default::default(),
-                                        partial_result_params: Default::default(),
+                                        work_done_progress_params: WorkDoneProgressParams::default(),
+                                        partial_result_params: PartialResultParams::default(),
                                     }
                                 });
                                 let _ = send_lsp_message(&mut stdin, &st_req).await;
@@ -1711,7 +1715,7 @@ pub async fn run_lsp_actor(
                                             start: Position { line: 0, character: 0 },
                                             end: Position { line: max_lines.max(100) as u32, character: 0 },
                                         },
-                                        work_done_progress_params: Default::default(),
+                                        work_done_progress_params: WorkDoneProgressParams::default(),
                                     }
                                 });
                                 let _ = send_lsp_message(&mut stdin, &ih_req).await;
@@ -1730,7 +1734,7 @@ pub async fn run_lsp_actor(
                                             text_document: TextDocumentIdentifier { uri },
                                             position: Position { line: line as u32, character: col as u32 },
                                         },
-                                        work_done_progress_params: Default::default(),
+                                        work_done_progress_params: WorkDoneProgressParams::default(),
                                     }
                                 });
                                 let _ = send_lsp_message(&mut stdin, &h_req).await;
@@ -1749,7 +1753,7 @@ pub async fn run_lsp_actor(
                                             text_document: TextDocumentIdentifier { uri },
                                             position: Position { line: line as u32, character: col as u32 },
                                         },
-                                        work_done_progress_params: Default::default(),
+                                        work_done_progress_params: WorkDoneProgressParams::default(),
                                         context: None,
                                     }
                                 });
@@ -1769,8 +1773,8 @@ pub async fn run_lsp_actor(
                                             text_document: TextDocumentIdentifier { uri },
                                             position: Position { line: line as u32, character: col as u32 },
                                         },
-                                        work_done_progress_params: Default::default(),
-                                        partial_result_params: Default::default(),
+                                        work_done_progress_params: WorkDoneProgressParams::default(),
+                                        partial_result_params: PartialResultParams::default(),
                                     }
                                 });
                                 let _ = send_lsp_message(&mut stdin, &def_req).await;
@@ -1789,8 +1793,8 @@ pub async fn run_lsp_actor(
                                             text_document: TextDocumentIdentifier { uri },
                                             position: Position { line: line as u32, character: col as u32 },
                                         },
-                                        work_done_progress_params: Default::default(),
-                                        partial_result_params: Default::default(),
+                                        work_done_progress_params: WorkDoneProgressParams::default(),
+                                        partial_result_params: PartialResultParams::default(),
                                         context: ReferenceContext { include_declaration: true },
                                     }
                                 });
@@ -1812,7 +1816,7 @@ pub async fn run_lsp_actor(
                                             insert_spaces: true,
                                             ..Default::default()
                                         },
-                                        work_done_progress_params: Default::default(),
+                                        work_done_progress_params: WorkDoneProgressParams::default(),
                                     }
                                 });
                                 let _ = send_lsp_message(&mut stdin, &fmt_req).await;
@@ -1855,8 +1859,8 @@ pub async fn run_lsp_actor(
                                             only: None,
                                             trigger_kind: None,
                                         },
-                                        work_done_progress_params: Default::default(),
-                                        partial_result_params: Default::default(),
+                                        work_done_progress_params: WorkDoneProgressParams::default(),
+                                        partial_result_params: PartialResultParams::default(),
                                     }
                                 });
                                 let _ = send_lsp_message(&mut stdin, &ca_req).await;
@@ -1876,7 +1880,7 @@ pub async fn run_lsp_actor(
                                             position: Position { line: line as u32, character: col as u32 },
                                         },
                                         new_name,
-                                        work_done_progress_params: Default::default(),
+                                        work_done_progress_params: WorkDoneProgressParams::default(),
                                     }
                                 });
                                 let _ = send_lsp_message(&mut stdin, &rn_req).await;
@@ -1892,8 +1896,8 @@ pub async fn run_lsp_actor(
                                     "method": "textDocument/documentSymbol",
                                     "params": DocumentSymbolParams {
                                         text_document: TextDocumentIdentifier { uri },
-                                        work_done_progress_params: Default::default(),
-                                        partial_result_params: Default::default(),
+                                        work_done_progress_params: WorkDoneProgressParams::default(),
+                                        partial_result_params: PartialResultParams::default(),
                                     }
                                 });
                                 let _ = send_lsp_message(&mut stdin, &ds_req).await;
@@ -2053,7 +2057,6 @@ pub async fn run_lsp_actor(
                 "{server_cmd} (restarting in {backoff:?}...)"
             ))));
             sleep(backoff).await;
-            continue 'supervisor;
         }
     }
 }
@@ -2080,7 +2083,7 @@ pub fn query_file_path(lang_name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Dynamic grammar facade maintaining clean compatibility with `cmd.rs`[`span_29`](start_span)[`span_29`](end_span).
+/// Dynamic grammar facade maintaining clean compatibility with `cmd.rs`.
 pub struct DynamicGrammar;
 
 impl DynamicGrammar {
@@ -2088,6 +2091,7 @@ impl DynamicGrammar {
         query_file_path(lang_name)
     }
 
+    #[allow(dead_code)]
     pub fn download_wasm_grammar(lang_name: &str) -> Result<PathBuf> {
         let sl = SupportedLanguage::all()
             .iter()
@@ -2208,7 +2212,7 @@ pub enum SupportedLanguage {
     Org,
     Assembly,
     Verilog,
-    VHDL,
+    Vhdl,
     Zephyr,
     Janet,
     Wren,
@@ -2216,6 +2220,9 @@ pub enum SupportedLanguage {
     Gd,
     Plain,
 }
+
+#[allow(non_upper_case_globals)]
+pub const VHDL: SupportedLanguage = SupportedLanguage::Vhdl;
 
 impl SupportedLanguage {
     pub fn from_path(path: Option<&PathBuf>) -> Self {
@@ -2335,7 +2342,7 @@ impl SupportedLanguage {
             "org" => SupportedLanguage::Org,
             "asm" | "s" => SupportedLanguage::Assembly,
             "v_verilog" | "sv" | "svh" => SupportedLanguage::Verilog,
-            "vhd" | "vhdl" => SupportedLanguage::VHDL,
+            "vhd" | "vhdl" => SupportedLanguage::Vhdl,
             "janet" => SupportedLanguage::Janet,
             "wren" => SupportedLanguage::Wren,
             "vala" => SupportedLanguage::Vala,
@@ -2344,7 +2351,7 @@ impl SupportedLanguage {
         }
     }
 
-    /// Resolves compiled, statically linked grammar for top-tier languages[`span_30`](start_span)[`span_30`](end_span).
+    /// Resolves compiled, statically linked grammar for top-tier languages.
     pub fn static_language(self) -> Option<tree_sitter::Language> {
         match self {
             SupportedLanguage::Rust => Some(tree_sitter_rust::LANGUAGE.into()),
@@ -2714,7 +2721,7 @@ impl SupportedLanguage {
             SupportedLanguage::Org => "Org Mode",
             SupportedLanguage::Assembly => "Assembly",
             SupportedLanguage::Verilog => "Verilog",
-            SupportedLanguage::VHDL => "VHDL",
+            SupportedLanguage::Vhdl => "VHDL",
             SupportedLanguage::Zephyr => "Zephyr",
             SupportedLanguage::Janet => "Janet",
             SupportedLanguage::Wren => "Wren",
@@ -2739,7 +2746,7 @@ impl SupportedLanguage {
             SupportedLanguage::Json => "json",
             SupportedLanguage::Toml => "toml",
             SupportedLanguage::Yaml => "yaml",
-            SupportedLanguage::Bash => "bash",
+            SupportedLanguage::Bash | SupportedLanguage::Zsh => "bash",
             SupportedLanguage::Lua => "lua",
             SupportedLanguage::Markdown => "markdown",
             SupportedLanguage::Java => "java",
@@ -2764,7 +2771,7 @@ impl SupportedLanguage {
             SupportedLanguage::Clojure => "clojure",
             SupportedLanguage::Nix => "nix",
             SupportedLanguage::Gleam => "gleam",
-            SupportedLanguage::Terraform => "hcl",
+            SupportedLanguage::Terraform | SupportedLanguage::Hcl => "hcl",
             SupportedLanguage::Vue => "vue",
             SupportedLanguage::Svelte => "svelte",
             SupportedLanguage::Astro => "astro",
@@ -2777,7 +2784,6 @@ impl SupportedLanguage {
             SupportedLanguage::Fortran => "fortran",
             SupportedLanguage::D => "d",
             SupportedLanguage::V => "v",
-            SupportedLanguage::Zsh => "bash",
             SupportedLanguage::Fish => "fish",
             SupportedLanguage::PowerShell => "powershell",
             SupportedLanguage::Groovy | SupportedLanguage::Gradle => "groovy",
@@ -2807,7 +2813,6 @@ impl SupportedLanguage {
             SupportedLanguage::Csv => "csv",
             SupportedLanguage::Properties => "properties",
             SupportedLanguage::EnvFile => "dotenv",
-            SupportedLanguage::Hcl => "hcl",
             SupportedLanguage::Jsonnet => "jsonnet",
             SupportedLanguage::Dhall => "dhall",
             SupportedLanguage::Nginx => "nginx",
@@ -2822,7 +2827,7 @@ impl SupportedLanguage {
             SupportedLanguage::Org => "org",
             SupportedLanguage::Assembly => "asm",
             SupportedLanguage::Verilog => "verilog",
-            SupportedLanguage::VHDL => "vhdl",
+            SupportedLanguage::Vhdl => "vhdl",
             SupportedLanguage::Zephyr => "devicetree",
             SupportedLanguage::Janet => "janet_simple",
             SupportedLanguage::Wren => "wren",
@@ -2929,7 +2934,7 @@ impl SupportedLanguage {
             SupportedLanguage::Org => "org",
             SupportedLanguage::Assembly => "asm",
             SupportedLanguage::Verilog => "verilog",
-            SupportedLanguage::VHDL => "vhdl",
+            SupportedLanguage::Vhdl => "vhdl",
             SupportedLanguage::Zephyr => "dts",
             SupportedLanguage::Janet => "janet",
             SupportedLanguage::Wren => "wren",
@@ -3016,7 +3021,7 @@ impl SupportedLanguage {
             SupportedLanguage::EmacsLisp => &["elisp-language-server"],
             SupportedLanguage::Latex | SupportedLanguage::Bibtex => &["texlab", "digestif"],
             SupportedLanguage::Typst => &["tinymist", "typst-lsp"],
-            SupportedLanguage::Verilog | SupportedLanguage::VHDL => &["svlangserver", "vhdl_ls"],
+            SupportedLanguage::Verilog | SupportedLanguage::Vhdl => &["svlangserver", "vhdl_ls"],
             SupportedLanguage::Zephyr => &["dts-lsp"],
             SupportedLanguage::Vala => &["vala-language-server"],
             _ => &[],
@@ -3131,7 +3136,7 @@ impl SupportedLanguage {
             SupportedLanguage::Org,
             SupportedLanguage::Assembly,
             SupportedLanguage::Verilog,
-            SupportedLanguage::VHDL,
+            SupportedLanguage::Vhdl,
             SupportedLanguage::Zephyr,
             SupportedLanguage::Janet,
             SupportedLanguage::Wren,
@@ -3178,9 +3183,10 @@ fn highlight_idx_to_token_type(idx: usize) -> CanonicalTokenType {
     }
 }
 
-/// Themed Syntax Highlighting Engine using compiled AST queries via `tree-sitter-highlight`[`span_31`](start_span)[`span_31`](end_span).
+/// Themed Syntax Highlighting Engine using compiled AST queries via `tree-sitter-highlight`.
 pub struct SyntaxEngine {
     pub language: SupportedLanguage,
+    #[allow(dead_code)]
     pub parser: tree_sitter::Parser,
     pub highlight_config: Option<HighlightConfiguration>,
     pub highlighter: Highlighter,
@@ -3233,7 +3239,7 @@ impl SyntaxEngine {
         self.has_grammar && self.highlight_config.is_some()
     }
 
-    /// Reparses text into line-addressed syntax spans using `tree-sitter-highlight`[`span_32`](start_span)[`span_32`](end_span).
+    /// Reparses text into line-addressed syntax spans using `tree-sitter-highlight`.
     pub fn reparse(&mut self, text: &str) {
         if !self.has_treesitter() {
             return;
@@ -3262,9 +3268,8 @@ impl SyntaxEngine {
             clean[..boundary].chars().count()
         };
 
-        let events = match self.highlighter.highlight(config, bytes, None, |_| None) {
-            Ok(iter) => iter,
-            Err(_) => return,
+        let Ok(events) = self.highlighter.highlight(config, bytes, None, |_| None) else {
+            return;
         };
 
         let mut highlight_stack: Vec<CanonicalTokenType> = Vec::new();
@@ -3342,7 +3347,7 @@ impl SyntaxEngine {
         }
     }
 
-    /// Renders styled terminal spans for a single line using the active [`Theme`][span_33](`start_span`)[`span_33`](end_span).
+    /// Renders styled terminal spans for a single line using the active [`Theme`].
     pub fn highlight_line(
         &self,
         line_text: &str,
@@ -3579,27 +3584,20 @@ pub fn completion_kind_icon(kind: u64) -> (&'static str, Color) {
 
 pub fn symbol_kind_icon(kind: u64) -> (&'static str, Color) {
     match kind {
-        1 => ("󰅩", Color::Rgb(120, 160, 255)),  // File
-        2 => ("󰏗", Color::Rgb(220, 140, 80)),   // Module
-        3 => ("󰅲", Color::Rgb(150, 166, 200)),  // Namespace
-        4 => ("󰏗", Color::Rgb(220, 140, 80)),   // Package
-        5 => ("󰌗", Color::Rgb(240, 180, 70)),   // Class
-        6 => ("󰊕", Color::Rgb(80, 200, 240)),   // Method
-        7 => ("󰫧", Color::Rgb(250, 210, 90)),   // Property
-        8 => ("󰫧", Color::Rgb(250, 210, 90)),   // Field
-        9 => ("󰊕", Color::Rgb(80, 200, 240)),   // Constructor
-        10 => ("󰌗", Color::Rgb(240, 180, 70)),  // Enum
-        11 => ("󰌗", Color::Rgb(150, 166, 200)), // Interface
-        12 => ("󰊕", Color::Rgb(80, 200, 240)),  // Function
-        13 => ("󱡠", Color::Rgb(228, 228, 228)), // Variable
-        14 => ("󰌆", Color::Rgb(255, 221, 51)),  // Constant
-        15 => ("󰈙", Color::Rgb(115, 201, 54)),  // String
-        16 => ("󰎠", Color::Rgb(149, 169, 159)), // Number
-        17 => ("󰨚", Color::Rgb(255, 221, 51)),  // Boolean
-        18 => ("󰅲", Color::Rgb(150, 166, 200)), // Array
-        23 => ("󰌗", Color::Rgb(240, 180, 70)),  // Struct
-        25 => ("󰊕", Color::Rgb(220, 110, 240)), // Operator
-        26 => ("󰌗", Color::Rgb(149, 169, 159)), // TypeParameter
+        1 => ("󰅩", Color::Rgb(120, 160, 255)),          // File
+        2 | 4 => ("󰏗", Color::Rgb(220, 140, 80)),       // Module, Package
+        3 | 18 => ("󰅲", Color::Rgb(150, 166, 200)),     // Namespace, Array
+        5 | 10 | 23 => ("󰌗", Color::Rgb(240, 180, 70)), // Class, Enum, Struct
+        6 | 9 | 12 => ("󰊕", Color::Rgb(80, 200, 240)),  // Method, Constructor, Function
+        7 | 8 => ("󰫧", Color::Rgb(250, 210, 90)),       // Property, Field
+        11 => ("󰌗", Color::Rgb(150, 166, 200)),         // Interface
+        13 => ("󱡠", Color::Rgb(228, 228, 228)),         // Variable
+        14 => ("󰌆", Color::Rgb(255, 221, 51)),          // Constant
+        15 => ("󰈙", Color::Rgb(115, 201, 54)),          // String
+        16 => ("󰎠", Color::Rgb(149, 169, 159)),         // Number
+        17 => ("󰨚", Color::Rgb(255, 221, 51)),          // Boolean
+        25 => ("󰊕", Color::Rgb(220, 110, 240)),         // Operator
+        26 => ("󰌗", Color::Rgb(149, 169, 159)),         // TypeParameter
         _ => ("󰈚", Color::Rgb(170, 175, 190)),
     }
 }
