@@ -358,6 +358,7 @@ pub enum LspInbound {
 }
 
 /// Outbound messages received from the background LSP actor.
+#[allow(dead_code)]
 pub enum LspOutbound {
     Status(LspStatus),
     Diagnostics(Vec<DiagnosticItem>),
@@ -2221,7 +2222,7 @@ pub enum SupportedLanguage {
     Plain,
 }
 
-#[allow(non_upper_case_globals)]
+#[allow(non_upper_case_globals, dead_code)]
 pub const VHDL: SupportedLanguage = SupportedLanguage::Vhdl;
 
 impl SupportedLanguage {

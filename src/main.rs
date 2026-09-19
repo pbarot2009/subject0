@@ -518,10 +518,8 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
     if mouse.row == status_row {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             let badge_len = match editor.mode {
-                Mode::Normal => 8,
-                Mode::Insert => 8,
+                Mode::Normal | Mode::Insert | Mode::Visual { .. } => 8,
                 Mode::Command => 9,
-                Mode::Visual { .. } => 8,
             } + 1;
 
             let files_end = badge_len + 10;

@@ -1451,6 +1451,7 @@ impl Editor {
     }
 
     /// Jumps directly to a target location (file, line, col), opening the target if external.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn jump_to_location(&mut self, loc: LocationItem) {
         let is_current = self
             .path

@@ -9,6 +9,7 @@ use ratatui::style::Color;
 
 /// Complete styling specification for all UI components, syntax tokens, and LSP features.
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
 pub struct Theme {
     pub name: &'static str,
     pub display_name: &'static str,
