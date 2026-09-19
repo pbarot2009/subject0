@@ -1,10 +1,10 @@
 //! # Application Entry Point, Event Loop, & Terminal UI Subsystem
 //!
-//! This module serves as the runtime orchestrator for `subject0`[span_2](start_span)[span_2](end_span). It integrates the
+//! This module serves as the runtime orchestrator for `subject0`[`span_2`](start_span)[`span_2`](end_span). It integrates the
 //! terminal lifecycle, asynchronous event multiplexing, input decoding, themed frame
 //! rendering, and modal subsystem coordination for full Language Server Protocol (LSP)
 //! intelligence (inferred types & parameter inlay hints, hover docs, signature assistance,
-//! definition jumps, formatting, code actions, and symbol outlines)[span_3](start_span)[span_3](end_span).
+//! definition jumps, formatting, code actions, and symbol outlines)[`span_3`](start_span)[`span_3`](end_span).
 
 mod cmd;
 mod editor;
@@ -13,7 +13,7 @@ mod theme;
 
 use std::{
     cmp::Ordering,
-    io::{stdout, Write},
+    io::{Write, stdout},
     time::Duration,
 };
 
@@ -26,28 +26,28 @@ use crossterm::{
         KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
+    Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Position, Rect, Size},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
-    Frame, Terminal,
 };
 use tokio::sync::mpsc;
 
 use editor::{CodeActionPicker, Editor, Focus, LocationPicker, Mode, SymbolPicker};
 use lsp::{
-    completion_kind_icon, file_icon_and_color, symbol_kind_icon, utf16_to_char_col, InlayHintType,
-    LspOutbound, LspStatus, SuggestionItem,
+    InlayHintType, LspOutbound, LspStatus, SuggestionItem, completion_kind_icon,
+    file_icon_and_color, symbol_kind_icon, utf16_to_char_col,
 };
 
 use theme::Theme;
 
 /// RAII Terminal Guard ensuring the host terminal is reliably restored
-/// to canonical mode regardless of exit status[span_4](start_span)[span_4](end_span).
+/// to canonical mode regardless of exit status[`span_4`](start_span)[`span_4`](end_span).
 struct TerminalGuard;
 
 impl TerminalGuard {
@@ -69,7 +69,7 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// Configures the terminal hardware cursor geometry based on the active modal editing state[span_5](start_span)[span_5](end_span).
+/// Configures the terminal hardware cursor geometry based on the active modal editing state[`span_5`](start_span)[`span_5`](end_span).
 fn set_terminal_cursor_style(mode: Mode) {
     let mut stdout = stdout();
     match mode {
@@ -83,7 +83,7 @@ fn set_terminal_cursor_style(mode: Mode) {
     let _ = stdout.flush();
 }
 
-/// Registers a secondary panic hook ensuring screen recovery during thread unwinding[span_8](start_span)[span_8](end_span).
+/// Registers a secondary panic hook ensuring screen recovery during thread unwinding[`span_8`](start_span)[`span_8`](end_span).
 fn setup_panic_hook() {
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -96,7 +96,7 @@ fn setup_panic_hook() {
     }));
 }
 
-/// Safely truncates a string by Unicode scalar count without slicing mid-codepoint[span_9](start_span)[span_9](end_span).
+/// Safely truncates a string by Unicode scalar count without slicing mid-codepoint[`span_9`](start_span)[`span_9`](end_span).
 fn safe_truncate(s: &str, max_chars: usize) -> String {
     if s.chars().count() > max_chars {
         let mut result: String = s.chars().take(max_chars.saturating_sub(1)).collect();
@@ -142,10 +142,10 @@ async fn main() -> Result<()> {
     let (lsp_out_tx, mut lsp_out_rx) = mpsc::unbounded_channel::<LspOutbound>();
     editor.lsp_out_tx = Some(lsp_out_tx.clone());
 
-    if let Some(path) = &target_path {
-        if path.is_file() {
-            editor.ensure_lsp_for_file(path);
-        }
+    if let Some(path) = &target_path
+        && path.is_file()
+    {
+        editor.ensure_lsp_for_file(path);
     }
 
     set_terminal_cursor_style(editor.mode);
@@ -400,7 +400,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
             let x = (size.width.saturating_sub(width)) / 2;
             let y = (size.height.saturating_sub(height)) / 2;
 
-            if mouse.column >= x + 1
+            if mouse.column > x
                 && mouse.column < x + width - 1
                 && mouse.row >= y + 2
                 && mouse.row < y + 2 + themes.len() as u16
@@ -429,7 +429,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
             let x = (size.width.saturating_sub(width)) / 2;
             let y = (size.height.saturating_sub(height)) / 2;
 
-            if mouse.column >= x + 1
+            if mouse.column > x
                 && mouse.column < x + width - 1
                 && mouse.row >= y + 2
                 && mouse.row < y + 2 + picker.candidates.len() as u16
@@ -491,7 +491,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
                 return;
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                if mouse.column >= x + 1
+                if mouse.column > x
                     && mouse.column < x + width - 1
                     && mouse.row >= y + 3
                     && mouse.row < y + height - 1
@@ -614,47 +614,46 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
     }
 
     // Completion Dropdown Interactions
-    if editor.completion_visible && !editor.completions.is_empty() {
-        if let Some((px, py, pw, ph)) = editor.completion_rect {
-            let in_popup = mouse.column >= px
-                && mouse.column < px + pw
-                && mouse.row >= py
-                && mouse.row < py + ph;
+    if editor.completion_visible
+        && !editor.completions.is_empty()
+        && let Some((px, py, pw, ph)) = editor.completion_rect
+    {
+        let in_popup =
+            mouse.column >= px && mouse.column < px + pw && mouse.row >= py && mouse.row < py + ph;
 
-            if in_popup {
-                let max_visible = 6usize;
-                match mouse.kind {
-                    MouseEventKind::ScrollDown => {
-                        if editor.completion_idx + 1 < editor.completions.len() {
-                            editor.completion_idx += 1;
-                            editor.update_completion_scroll(max_visible);
-                        }
-                        return;
+        if in_popup {
+            let max_visible = 6usize;
+            match mouse.kind {
+                MouseEventKind::ScrollDown => {
+                    if editor.completion_idx + 1 < editor.completions.len() {
+                        editor.completion_idx += 1;
+                        editor.update_completion_scroll(max_visible);
                     }
-                    MouseEventKind::ScrollUp => {
-                        if editor.completion_idx > 0 {
-                            editor.completion_idx -= 1;
-                            editor.update_completion_scroll(max_visible);
-                        }
-                        return;
-                    }
-                    MouseEventKind::Down(MouseButton::Left) => {
-                        if mouse.row >= py + 1 && mouse.row < py + ph - 1 {
-                            let clicked_row = (mouse.row - (py + 1)) as usize;
-                            let target_idx = editor.completion_scroll + clicked_row;
-                            if target_idx < editor.completions.len() {
-                                editor.completion_idx = target_idx;
-                            }
-                        }
-                        editor.accept_completion();
-                        return;
-                    }
-                    _ => return,
+                    return;
                 }
-            } else if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-                editor.completion_visible = false;
-                editor.completion_rect = None;
+                MouseEventKind::ScrollUp => {
+                    if editor.completion_idx > 0 {
+                        editor.completion_idx -= 1;
+                        editor.update_completion_scroll(max_visible);
+                    }
+                    return;
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if mouse.row > py && mouse.row < py + ph - 1 {
+                        let clicked_row = (mouse.row - (py + 1)) as usize;
+                        let target_idx = editor.completion_scroll + clicked_row;
+                        if target_idx < editor.completions.len() {
+                            editor.completion_idx = target_idx;
+                        }
+                    }
+                    editor.accept_completion();
+                    return;
+                }
+                _ => return,
             }
+        } else if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+            editor.completion_visible = false;
+            editor.completion_rect = None;
         }
     }
 
@@ -2145,12 +2144,12 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
         frame.render_widget(Paragraph::new(msg_line), main_chunks[2]);
 
-        if editor.focus == Focus::Editor {
-            if let Some((cx, cy)) = cursor_screen_pos {
-                if cx < inner_area.right() && cy < inner_area.bottom() {
-                    frame.set_cursor_position(Position::new(cx, cy));
-                }
-            }
+        if editor.focus == Focus::Editor
+            && let Some((cx, cy)) = cursor_screen_pos
+            && cx < inner_area.right()
+            && cy < inner_area.bottom()
+        {
+            frame.set_cursor_position(Position::new(cx, cy));
         }
     }
 
@@ -2231,49 +2230,49 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
     }
 
     // 6. Floating Signature Help Tooltip
-    if editor.mode == Mode::Insert {
-        if let Some(help) = &editor.signature_help {
-            let width = (help.signature_label.len() as u16 + 4)
-                .min(frame.area().width.saturating_sub(4))
-                .max(30);
-            let height = 3u16;
-            let x = screen_x.min(frame.area().width.saturating_sub(width));
-            let y = if screen_y >= height + 1 {
-                screen_y.saturating_sub(height)
-            } else {
-                (screen_y + 1).min(frame.area().height.saturating_sub(height))
-            };
+    if editor.mode == Mode::Insert
+        && let Some(help) = &editor.signature_help
+    {
+        let width = (help.signature_label.len() as u16 + 4)
+            .min(frame.area().width.saturating_sub(4))
+            .max(30);
+        let height = 3u16;
+        let x = screen_x.min(frame.area().width.saturating_sub(width));
+        let y = if screen_y > height {
+            screen_y.saturating_sub(height)
+        } else {
+            (screen_y + 1).min(frame.area().height.saturating_sub(height))
+        };
 
-            let tooltip_rect = Rect::new(x, y, width, height);
-            frame.render_widget(Clear, tooltip_rect);
+        let tooltip_rect = Rect::new(x, y, width, height);
+        frame.render_widget(Clear, tooltip_rect);
 
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(theme.syn_function))
-                .style(Style::default().bg(theme.hover_bg))
-                .title(Line::from(Span::styled(
-                    " 󰊕 Signature ",
-                    Style::default()
-                        .fg(theme.syn_function)
-                        .add_modifier(Modifier::BOLD),
-                )));
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.syn_function))
+            .style(Style::default().bg(theme.hover_bg))
+            .title(Line::from(Span::styled(
+                " 󰊕 Signature ",
+                Style::default()
+                    .fg(theme.syn_function)
+                    .add_modifier(Modifier::BOLD),
+            )));
 
-            let line = Line::from(vec![
-                Span::raw(" "),
-                Span::styled(
-                    &help.signature_label,
-                    Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
-                ),
-            ]);
+        let line = Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                &help.signature_label,
+                Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
+            ),
+        ]);
 
-            frame.render_widget(Paragraph::new(line).block(block), tooltip_rect);
-        }
+        frame.render_widget(Paragraph::new(line).block(block), tooltip_rect);
     }
 
     // 7. Floating Hover Documentation Card
     if let Some(hover) = &editor.hover_info {
-        let max_content_len = hover.lines.iter().map(|l| l.len()).max().unwrap_or(30);
+        let max_content_len = hover.lines.iter().map(String::len).max().unwrap_or(30);
         let width = (max_content_len as u16 + 4)
             .min(frame.area().width.saturating_sub(4))
             .max(40);

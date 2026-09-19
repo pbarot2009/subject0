@@ -2,7 +2,7 @@
 //!
 //! Handles command-line arguments, flag decoding (`--help`, `--version`, `--clean`),
 //! jump-to-line specifiers (`+<line>`, `file:line:col`), path resolution across
-//! Termux, Linux, macOS, and Windows, grammar inspection, and language health diagnostics[span_3](start_span)[span_3](end_span).
+//! Termux, Linux, macOS, and Windows, grammar inspection, and language health diagnostics[`span_3`](start_span)[`span_3`](end_span).
 
 use std::{
     env,
@@ -12,26 +12,26 @@ use std::{
 
 use crate::lsp::{DynamicGrammar, SupportedLanguage, resolve_binary_path};
 
-/// Parsed command-line arguments[span_4](start_span)[span_4](end_span).
+/// Parsed command-line arguments[`span_4`](start_span)[`span_4`](end_span).
 #[derive(Debug, Default, Clone)]
 pub struct CliArgs {
-    /// Path to target file or directory[span_5](start_span)[span_5](end_span).
+    /// Path to target file or directory[`span_5`](start_span)[`span_5`](end_span).
     pub path: Option<PathBuf>,
-    /// Optional target line number to jump to on launch (1-based)[span_6](start_span)[span_6](end_span).
+    /// Optional target line number to jump to on launch (1-based)[`span_6`](start_span)[`span_6`](end_span).
     pub jump_line: Option<usize>,
-    /// Optional target column number to jump to on launch (1-based)[span_7](start_span)[span_7](end_span).
+    /// Optional target column number to jump to on launch (1-based)[`span_7`](start_span)[`span_7`](end_span).
     pub jump_col: Option<usize>,
-    /// Optional override for soft line wrapping[span_8](start_span)[span_8](end_span).
+    /// Optional override for soft line wrapping[`span_8`](start_span)[`span_8`](end_span).
     pub line_wrap: Option<bool>,
-    /// When true, ignore `.subject0` configuration file[span_9](start_span)[span_9](end_span).
+    /// When true, ignore `.subject0` configuration file[`span_9`](start_span)[`span_9`](end_span).
     pub ignore_config: bool,
 }
 
 impl CliArgs {
-    /// Parses CLI arguments from standard environment args[span_10](start_span)[span_10](end_span).
+    /// Parses CLI arguments from standard environment args[`span_10`](start_span)[`span_10`](end_span).
     ///
     /// Intercepts `--help` and `--version` to print directly to stdout and exit
-    /// before terminal raw mode or alternate screen buffers are initialized[span_11](start_span)[span_11](end_span).
+    /// before terminal raw mode or alternate screen buffers are initialized[`span_11`](start_span)[`span_11`](end_span).
     pub fn parse() -> Self {
         let raw_args: Vec<String> = env::args().skip(1).collect();
         let mut cli = Self::default();
@@ -112,12 +112,12 @@ impl CliArgs {
         cli
     }
 
-    /// Strips enclosing quotes from argument flags[span_14](start_span)[span_14](end_span).
+    /// Strips enclosing quotes from argument flags[`span_14`](start_span)[`span_14`](end_span).
     fn clean_lang_arg(raw: &str) -> String {
         raw.trim().trim_matches('\'').trim_matches('"').to_string()
     }
 
-    /// Assigns file path and checks for `path:line:col` or `path:line` format across Unix and Windows[span_15](start_span)[span_15](end_span).
+    /// Assigns file path and checks for `path:line:col` or `path:line` format across Unix and Windows[`span_15`](start_span)[`span_15`](end_span).
     fn assign_target_path(cli: &mut Self, arg: &str) {
         if cli.path.is_some() {
             return;
@@ -132,33 +132,33 @@ impl CliArgs {
         // Tokenize from the right to support Windows drive prefixes (e.g. C:\path:line:col)
         let tokens: Vec<&str> = arg.rsplit(':').collect();
 
-        if tokens.len() >= 3 {
-            if let (Ok(col), Ok(line)) = (tokens[0].parse::<usize>(), tokens[1].parse::<usize>()) {
-                let path_str: String = tokens[2..]
-                    .iter()
-                    .rev()
-                    .copied()
-                    .collect::<Vec<_>>()
-                    .join(":");
-                cli.path = Some(PathBuf::from(path_str));
-                cli.jump_line = Some(line);
-                cli.jump_col = Some(col);
-                return;
-            }
+        if tokens.len() >= 3
+            && let (Ok(col), Ok(line)) = (tokens[0].parse::<usize>(), tokens[1].parse::<usize>())
+        {
+            let path_str: String = tokens[2..]
+                .iter()
+                .rev()
+                .copied()
+                .collect::<Vec<_>>()
+                .join(":");
+            cli.path = Some(PathBuf::from(path_str));
+            cli.jump_line = Some(line);
+            cli.jump_col = Some(col);
+            return;
         }
 
-        if tokens.len() >= 2 {
-            if let Ok(line) = tokens[0].parse::<usize>() {
-                let path_str: String = tokens[1..]
-                    .iter()
-                    .rev()
-                    .copied()
-                    .collect::<Vec<_>>()
-                    .join(":");
-                cli.path = Some(PathBuf::from(path_str));
-                cli.jump_line = Some(line);
-                return;
-            }
+        if tokens.len() >= 2
+            && let Ok(line) = tokens[0].parse::<usize>()
+        {
+            let path_str: String = tokens[1..]
+                .iter()
+                .rev()
+                .copied()
+                .collect::<Vec<_>>()
+                .join(":");
+            cli.path = Some(PathBuf::from(path_str));
+            cli.jump_line = Some(line);
+            return;
         }
 
         cli.path = Some(literal_path);
@@ -252,7 +252,7 @@ impl CliArgs {
         );
     }
 
-    /// Renders a bordered card with dynamic padding, guaranteeing border alignment[span_16](start_span)[span_16](end_span).
+    /// Renders a bordered card with dynamic padding, guaranteeing border alignment[`span_16`](start_span)[`span_16`](end_span).
     fn print_boxed_card(lines: &[String], min_width: usize) {
         let r = "\x1b[0m";
         let border = "\x1b[38;2;70;75;95m";
@@ -275,7 +275,7 @@ impl CliArgs {
         println!("{border}╰{}╯{r}", "─".repeat(inner_width + 2));
     }
 
-    /// Computes terminal display character width handling escape codes and double-width glyphs[span_17](start_span)[span_17](end_span).
+    /// Computes terminal display character width handling escape codes and double-width glyphs[`span_17`](start_span)[`span_17`](end_span).
     fn visible_width(s: &str) -> usize {
         let mut width = 0;
         let mut in_escape = false;
@@ -323,7 +323,7 @@ impl CliArgs {
                 .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     }
 
-    /// Inspects status of a Tree-sitter grammar[span_18](start_span)[span_18](end_span).
+    /// Inspects status of a Tree-sitter grammar[`span_18`](start_span)[`span_18`](end_span).
     fn run_grammar_installer(lang: &str, _force: bool) {
         let r = "\x1b[0m";
         let b = "\x1b[1m";
@@ -357,28 +357,28 @@ impl CliArgs {
             .copied()
             .find(|l| l.grammar_name() == canon_lang || l.lsp_id() == canon_lang);
 
-        if let Some(sl) = matched_lang {
-            if sl.static_language().is_some() {
-                let custom_query = DynamicGrammar::grammar_file_path(canon_lang);
-                let query_status = if let Some(qp) = custom_query {
-                    let disp = Self::shorten_home(&qp);
-                    format!("{green}Custom override ({disp}){r}")
-                } else {
-                    format!("{green}Built-in standard queries{r}")
-                };
+        if let Some(sl) = matched_lang
+            && sl.static_language().is_some()
+        {
+            let custom_query = DynamicGrammar::grammar_file_path(canon_lang);
+            let query_status = if let Some(qp) = custom_query {
+                let disp = Self::shorten_home(&qp);
+                format!("{green}Custom override ({disp}){r}")
+            } else {
+                format!("{green}Built-in standard queries{r}")
+            };
 
-                let lines = vec![
-                    format!(" {green}󰄬 Built-in Static Grammar{r}"),
-                    format!(" Language:  {b}{canon_lang}{r}"),
-                    format!(" Tier:      {green}Statically linked (zero runtime overhead){r}"),
-                    format!(" Queries:   {query_status}"),
-                    format!(" Latency:   {blue}0 ms (Instantly ready){r}"),
-                    String::new(),
-                    format!(" {gray}No external compiler or runtime downloading is needed.{r}"),
-                ];
-                Self::print_boxed_card(&lines, 60);
-                process::exit(0);
-            }
+            let lines = vec![
+                format!(" {green}󰄬 Built-in Static Grammar{r}"),
+                format!(" Language:  {b}{canon_lang}{r}"),
+                format!(" Tier:      {green}Statically linked (zero runtime overhead){r}"),
+                format!(" Queries:   {query_status}"),
+                format!(" Latency:   {blue}0 ms (Instantly ready){r}"),
+                String::new(),
+                format!(" {gray}No external compiler or runtime downloading is needed.{r}"),
+            ];
+            Self::print_boxed_card(&lines, 60);
+            process::exit(0);
         }
 
         let lines = vec![
@@ -397,7 +397,7 @@ impl CliArgs {
         Self::print_boxed_card(&lines, 66);
     }
 
-    /// Prints a comprehensive health report showing static grammars and LSP servers[span_19](start_span)[span_19](end_span).
+    /// Prints a comprehensive health report showing static grammars and LSP servers[`span_19`](start_span)[`span_19`](end_span).
     fn run_health_check() {
         let r = "\x1b[0m";
         let b = "\x1b[1m";

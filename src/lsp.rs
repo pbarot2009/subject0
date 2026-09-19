@@ -3,21 +3,21 @@
 //! This module implements language intelligence and syntax styling for `subject0`:
 //!
 //! 1. **Crash-Proof LSP Background Actor (`run_lsp_actor`)**:
-//!    - Asynchronous, non-blocking Tokio actor communicating via JSON-RPC 2.0 with HTTP-style headers[span_2](start_span)[span_2](end_span).
+//!    - Asynchronous, non-blocking Tokio actor communicating via JSON-RPC 2.0 with HTTP-style headers[`span_2`](start_span)[`span_2`](end_span).
 //!    - **Process Supervisor & Reboot Mechanics**: Automatically restarts crashed server processes with
 //!      exponential backoff, re-establishing initialization handshakes and document sync without lost edits.
 //!    - **Session Epoch Tracking**: Discards delayed messages from dead or superseded server processes.
 //!    - **Request Cancellation**: Transmits `$/cancelRequest` when operations are invalidated.
 //!    - **Full `lsp-types` Integration**: Standardized protocol types for handshakes, capabilities,
 //!      completions, hover documentation, signature assistance, definitions, references, workspace edits,
-//!      code actions, symbols, inlay hints, and push diagnostics[span_3](start_span)[span_3](end_span)[span_4](start_span)[span_4](end_span).
+//!      code actions, symbols, inlay hints, and push diagnostics[`span_3`](start_span)[`span_3`](end_span)[`span_4`](start_span)[`span_4`](end_span).
 //!
 //! 2. **Compile-Time & Dynamic Syntax Engine (`SyntaxEngine`)**:
-//!    - Statically compiled and dynamic highlighting powered by **`tree-sitter-highlight`**[span_5](start_span)[span_5](end_span).
-//!    - Dual-tier highlighting: Statically linked Tree-sitter AST queries with fallback to LSP Semantic Tokens[span_6](start_span)[span_6](end_span).
-//!    - Zero-copy line-rendering mapped against the active [`Theme`][span_7](start_span)[span_7](end_span).
+//!    - Statically compiled and dynamic highlighting powered by **`tree-sitter-highlight`**[`span_5`](start_span)[`span_5`](end_span).
+//!    - Dual-tier highlighting: Statically linked Tree-sitter AST queries with fallback to LSP Semantic Tokens[`span_6`](start_span)[`span_6`](end_span).
+//!    - Zero-copy line-rendering mapped against the active [`Theme`][span_7](`start_span`)[`span_7`](end_span).
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use lsp_types::{
     ClientCapabilities, CodeActionClientCapabilities, CodeActionKind, CodeActionKindLiteralSupport,
     CodeActionLiteralSupport, CodeActionOrCommand, CodeActionParams, CodeActionResponse,
@@ -68,7 +68,7 @@ use crate::theme::Theme;
 
 // === Standardized LSP Client Types ===
 
-/// Represents a single diagnostic entry emitted by an LSP server[span_8](start_span)[span_8](end_span).
+/// Represents a single diagnostic entry emitted by an LSP server[`span_8`](start_span)[`span_8`](end_span).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiagnosticItem {
     pub line: usize,
@@ -81,7 +81,7 @@ pub struct DiagnosticItem {
     pub is_deprecated: bool,
 }
 
-/// An individual code completion candidate returned by the LSP server[span_9](start_span)[span_9](end_span).
+/// An individual code completion candidate returned by the LSP server[`span_9`](start_span)[`span_9`](end_span).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SuggestionItem {
     pub label: String,
@@ -92,7 +92,7 @@ pub struct SuggestionItem {
     pub additional_text_edits: Vec<TextEditItem>,
 }
 
-/// Semantic kind of an inlay hint[span_10](start_span)[span_10](end_span).
+/// Semantic kind of an inlay hint[`span_10`](start_span)[`span_10`](end_span).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InlayHintType {
     Type,
@@ -100,7 +100,7 @@ pub enum InlayHintType {
     Other,
 }
 
-/// Inferred type or parameter name inlay hint displayed inline within code[span_11](start_span)[span_11](end_span).
+/// Inferred type or parameter name inlay hint displayed inline within code[`span_11`](start_span)[`span_11`](end_span).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InlayHintItem {
     pub line: usize,
@@ -111,13 +111,13 @@ pub struct InlayHintItem {
     pub padding_right: bool,
 }
 
-/// Hover documentation payload containing documentation lines[span_12](start_span)[span_12](end_span).
+/// Hover documentation payload containing documentation lines[`span_12`](start_span)[`span_12`](end_span).
 #[derive(Debug, Clone)]
 pub struct HoverInfo {
     pub lines: Vec<String>,
 }
 
-/// Active function or method signature help tooltip information[span_13](start_span)[span_13](end_span).
+/// Active function or method signature help tooltip information[`span_13`](start_span)[`span_13`](end_span).
 #[derive(Debug, Clone)]
 pub struct SignatureHelpInfo {
     pub signature_label: String,
@@ -126,7 +126,7 @@ pub struct SignatureHelpInfo {
     pub doc: Option<String>,
 }
 
-/// Source code location returned by definition and reference queries[span_14](start_span)[span_14](end_span).
+/// Source code location returned by definition and reference queries[`span_14`](start_span)[`span_14`](end_span).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocationItem {
     pub path: PathBuf,
@@ -134,7 +134,7 @@ pub struct LocationItem {
     pub col: usize,
 }
 
-/// Atomic text replacement range for formatting, renaming, and code actions[span_15](start_span)[span_15](end_span).
+/// Atomic text replacement range for formatting, renaming, and code actions[`span_15`](start_span)[`span_15`](end_span).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextEditItem {
     pub start_line: usize,
@@ -144,7 +144,7 @@ pub struct TextEditItem {
     pub new_text: String,
 }
 
-/// Code action or quickfix candidate provided by the LSP server[span_16](start_span)[span_16](end_span).
+/// Code action or quickfix candidate provided by the LSP server[`span_16`](start_span)[`span_16`](end_span).
 #[derive(Debug, Clone)]
 pub struct CodeActionItem {
     pub title: String,
@@ -153,7 +153,7 @@ pub struct CodeActionItem {
     pub edits: HashMap<PathBuf, Vec<TextEditItem>>,
 }
 
-/// Document outline symbol (function, struct, method, variable, enum, etc.)[span_17](start_span)[span_17](end_span).
+/// Document outline symbol (function, struct, method, variable, enum, etc.)[`span_17`](start_span)[`span_17`](end_span).
 #[derive(Debug, Clone)]
 pub struct SymbolItem {
     pub name: String,
@@ -163,7 +163,7 @@ pub struct SymbolItem {
     pub container_name: Option<String>,
 }
 
-/// Operational lifecycle state of the LSP server process[span_18](start_span)[span_18](end_span).
+/// Operational lifecycle state of the LSP server process[`span_18`](start_span)[`span_18`](end_span).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LspStatus {
     Disabled,
@@ -173,7 +173,7 @@ pub enum LspStatus {
     Error(String),
 }
 
-/// Canonical semantic classification mapping server legends and queries into unified theme tokens[span_19](start_span)[span_19](end_span).
+/// Canonical semantic classification mapping server legends and queries into unified theme tokens[`span_19`](start_span)[`span_19`](end_span).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanonicalTokenType {
     Keyword,
@@ -275,7 +275,7 @@ impl CanonicalTokenType {
     }
 }
 
-/// A single decoded semantic token span positioned in buffer coordinates[span_20](start_span)[span_20](end_span).
+/// A single decoded semantic token span positioned in buffer coordinates[`span_20`](start_span)[`span_20`](end_span).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SemanticTokenSpan {
     pub line: usize,
@@ -284,7 +284,7 @@ pub struct SemanticTokenSpan {
     pub token_type: CanonicalTokenType,
 }
 
-/// Inbound messages routed to the background LSP actor[span_21](start_span)[span_21](end_span).
+/// Inbound messages routed to the background LSP actor[`span_21`](start_span)[`span_21`](end_span).
 pub enum LspInbound {
     Change {
         text: String,
@@ -352,7 +352,7 @@ pub enum LspInbound {
     Restart,
 }
 
-/// Outbound messages received from the background LSP actor[span_22](start_span)[span_22](end_span).
+/// Outbound messages received from the background LSP actor[`span_22`](start_span)[`span_22`](end_span).
 pub enum LspOutbound {
     Status(LspStatus),
     Diagnostics(Vec<DiagnosticItem>),
@@ -403,7 +403,7 @@ pub enum LspOutbound {
 
 // === Cross-Platform Path & Directory Resolution ===
 
-/// Locates standard data directory honoring Termux, XDG, macOS, and Windows conventions[span_23](start_span)[span_23](end_span).
+/// Locates standard data directory honoring Termux, XDG, macOS, and Windows conventions[`span_23`](start_span)[`span_23`](end_span).
 pub fn subject0_data_dir() -> PathBuf {
     if let Ok(custom) = env::var("SUBJECT0_DATA_DIR") {
         return PathBuf::from(custom);
@@ -414,12 +414,13 @@ pub fn subject0_data_dir() -> PathBuf {
     if let Ok(prefix) = env::var("PREFIX") {
         return PathBuf::from(prefix).join("share/subject0");
     }
-    dirs::home_dir()
-        .map(|h| h.join(".local/share/subject0"))
-        .unwrap_or_else(|| PathBuf::from("./.subject0_data"))
+    dirs::home_dir().map_or_else(
+        || PathBuf::from("./.subject0_data"),
+        |h| h.join(".local/share/subject0"),
+    )
 }
 
-/// Locates standard config directory honoring Termux, XDG, macOS, and Windows conventions[span_24](start_span)[span_24](end_span).
+/// Locates standard config directory honoring Termux, XDG, macOS, and Windows conventions[`span_24`](start_span)[`span_24`](end_span).
 pub fn subject0_config_dir() -> PathBuf {
     if let Ok(custom) = env::var("SUBJECT0_CONFIG_DIR") {
         return PathBuf::from(custom);
@@ -430,12 +431,13 @@ pub fn subject0_config_dir() -> PathBuf {
     if let Ok(prefix) = env::var("PREFIX") {
         return PathBuf::from(prefix).join("etc/subject0");
     }
-    dirs::home_dir()
-        .map(|h| h.join(".config/subject0"))
-        .unwrap_or_else(|| PathBuf::from("./.subject0_cfg"))
+    dirs::home_dir().map_or_else(
+        || PathBuf::from("./.subject0_cfg"),
+        |h| h.join(".config/subject0"),
+    )
 }
 
-/// Resolves an executable binary path across Android Termux, Linux, macOS, and Windows[span_25](start_span)[span_25](end_span).
+/// Resolves an executable binary path across Android Termux, Linux, macOS, and Windows[`span_25`](start_span)[`span_25`](end_span).
 pub fn resolve_binary_path(cmd: &str) -> Option<PathBuf> {
     if let Ok(path) = which::which(cmd) {
         return Some(path);
@@ -494,7 +496,7 @@ pub fn resolve_binary_path(cmd: &str) -> Option<PathBuf> {
     None
 }
 
-/// Converts a local filesystem path to an RFC-compliant `file://` URI string[span_26](start_span)[span_26](end_span).
+/// Converts a local filesystem path to an RFC-compliant `file://` URI string[`span_26`](start_span)[`span_26`](end_span).
 pub fn file_to_uri(path: &Path) -> String {
     let abs = if path.is_absolute() {
         path.to_path_buf()
@@ -517,12 +519,12 @@ pub fn file_to_uri(path: &Path) -> String {
     }
 }
 
-/// Parses an RFC 3986 `file://` URI into a local `PathBuf`[span_27](start_span)[span_27](end_span).
+/// Parses an RFC 3986 `file://` URI into a local `PathBuf`[`span_27`](start_span)[`span_27`](end_span).
 pub fn uri_to_path(uri_str: &str) -> Option<PathBuf> {
-    if let Ok(url) = url::Url::parse(uri_str) {
-        if let Ok(path) = url.to_file_path() {
-            return Some(path);
-        }
+    if let Ok(url) = url::Url::parse(uri_str)
+        && let Ok(path) = url.to_file_path()
+    {
+        return Some(path);
     }
 
     let raw = uri_str.strip_prefix("file://")?;
@@ -899,16 +901,16 @@ fn parse_lsp_signature_help(val: Value) -> Option<SignatureHelpInfo> {
         .map(|v| v as usize);
 
     let mut parameter_label = None;
-    if let (Some(params), Some(p_idx)) = (&sig.parameters, active_param_idx) {
-        if let Some(p_info) = params.get(p_idx) {
-            match &p_info.label {
-                ParameterLabel::Simple(s) => parameter_label = Some(s.clone()),
-                ParameterLabel::LabelOffsets([start, end]) => {
-                    let s_idx = *start as usize;
-                    let e_idx = *end as usize;
-                    if s_idx <= e_idx && e_idx <= signature_label.len() {
-                        parameter_label = Some(signature_label[s_idx..e_idx].to_string());
-                    }
+    if let (Some(params), Some(p_idx)) = (&sig.parameters, active_param_idx)
+        && let Some(p_info) = params.get(p_idx)
+    {
+        match &p_info.label {
+            ParameterLabel::Simple(s) => parameter_label = Some(s.clone()),
+            ParameterLabel::LabelOffsets([start, end]) => {
+                let s_idx = *start as usize;
+                let e_idx = *end as usize;
+                if s_idx <= e_idx && e_idx <= signature_label.len() {
+                    parameter_label = Some(signature_label[s_idx..e_idx].to_string());
                 }
             }
         }
@@ -1006,18 +1008,18 @@ fn parse_lsp_workspace_edit(edit: WorkspaceEdit) -> HashMap<PathBuf, Vec<TextEdi
             }
             DocumentChanges::Operations(ops) => {
                 for op in ops {
-                    if let lsp_types::DocumentChangeOperation::Edit(edit_op) = op {
-                        if let Some(path) = uri_to_path(edit_op.text_document.uri.as_str()) {
-                            let converted: Vec<TextEditItem> = edit_op
-                                .edits
-                                .into_iter()
-                                .map(|oe| match oe {
-                                    lsp_types::OneOf::Left(te) => text_edit_to_item(te),
-                                    lsp_types::OneOf::Right(ae) => text_edit_to_item(ae.text_edit),
-                                })
-                                .collect();
-                            result.entry(path).or_default().extend(converted);
-                        }
+                    if let lsp_types::DocumentChangeOperation::Edit(edit_op) = op
+                        && let Some(path) = uri_to_path(edit_op.text_document.uri.as_str())
+                    {
+                        let converted: Vec<TextEditItem> = edit_op
+                            .edits
+                            .into_iter()
+                            .map(|oe| match oe {
+                                lsp_types::OneOf::Left(te) => text_edit_to_item(te),
+                                lsp_types::OneOf::Right(ae) => text_edit_to_item(ae.text_edit),
+                            })
+                            .collect();
+                        result.entry(path).or_default().extend(converted);
                     }
                 }
             }
@@ -1377,7 +1379,7 @@ async fn perform_handshake(
     while tokio::time::Instant::now() < init_deadline {
         let msg = tokio::select! {
             res = read_lsp_message(stdout) => res?,
-            _ = sleep(Duration::from_millis(50)) => continue,
+            () = sleep(Duration::from_millis(50)) => continue,
         };
 
         if let Some(method) = msg.get("method").and_then(Value::as_str) {
@@ -1398,20 +1400,18 @@ async fn perform_handshake(
         } else if msg.get("id").and_then(Value::as_i64) == Some(1) {
             if let Ok(init_res) = serde_json::from_value::<InitializeResult>(
                 msg.get("result").cloned().unwrap_or(Value::Null),
-            ) {
-                if let Some(lsp_types::ServerCapabilities {
-                    semantic_tokens_provider:
-                        Some(lsp_types::SemanticTokensServerCapabilities::SemanticTokensOptions(opt)),
-                    ..
-                }) = init_res.capabilities.into()
-                {
-                    server_legend = opt
-                        .legend
-                        .token_types
-                        .into_iter()
-                        .map(|t| t.as_str().to_string())
-                        .collect();
-                }
+            ) && let Some(lsp_types::ServerCapabilities {
+                semantic_tokens_provider:
+                    Some(lsp_types::SemanticTokensServerCapabilities::SemanticTokensOptions(opt)),
+                ..
+            }) = init_res.capabilities.into()
+            {
+                server_legend = opt
+                    .legend
+                    .token_types
+                    .into_iter()
+                    .map(|t| t.as_str().to_string())
+                    .collect();
             }
             break;
         }
@@ -1467,7 +1467,7 @@ async fn graceful_shutdown(
         tokio::pin!(shutdown_timeout);
         loop {
             tokio::select! {
-                _ = &mut shutdown_timeout => break,
+                () = &mut shutdown_timeout => break,
                 msg = read_lsp_message(stdout) => {
                     if let Ok(v) = msg {
                         if v.get("id").and_then(Value::as_i64) == Some(999_999) {
@@ -1488,7 +1488,7 @@ async fn graceful_shutdown(
     }
 }
 
-/// Asynchronous LSP Process Supervisor with Auto-Restart, Crash Proofing, & Reboot[span_28](start_span)[span_28](end_span).
+/// Asynchronous LSP Process Supervisor with Auto-Restart, Crash Proofing, & Reboot[`span_28`](start_span)[`span_28`](end_span).
 pub async fn run_lsp_actor(
     initial_file: PathBuf,
     initial_lang: String,
@@ -1583,8 +1583,8 @@ pub async fn run_lsp_actor(
                             let old_uri_str = file_to_uri(&current_file);
                             let new_uri_str = file_to_uri(&path);
 
-                            if old_uri_str != new_uri_str {
-                                if let Ok(old_uri) = old_uri_str.parse::<Uri>() {
+                            if old_uri_str != new_uri_str
+                                && let Ok(old_uri) = old_uri_str.parse::<Uri>() {
                                     let did_close = serde_json::json!({
                                         "jsonrpc": "2.0",
                                         "method": "textDocument/didClose",
@@ -1594,7 +1594,6 @@ pub async fn run_lsp_actor(
                                     });
                                     let _ = send_lsp_message(&mut stdin, &did_close).await;
                                 }
-                            }
 
                             current_file = path;
                             current_text = text;
@@ -1907,127 +1906,122 @@ pub async fn run_lsp_actor(
                     }
                 }
                 msg = read_lsp_message(&mut stdout) => {
-                    match msg {
-                        Ok(json) => {
-                            if active_session != session_id {
-                                continue;
-                            }
-                            if let Some(method) = json.get("method").and_then(Value::as_str) {
-                                if method == "textDocument/publishDiagnostics" {
-                                    if let Some(params) = json.get("params").cloned() {
-                                        if let Ok((diag_uri, diags)) = parse_lsp_diagnostics(params) {
-                                            let current_uri = file_to_uri(&current_file);
-                                            if uris_match(&diag_uri, &current_uri) {
-                                                let _ = tx.send(LspOutbound::Diagnostics(diags));
-                                            }
+                    if let Ok(json) = msg {
+                        if active_session != session_id {
+                            continue;
+                        }
+                        if let Some(method) = json.get("method").and_then(Value::as_str) {
+                            if method == "textDocument/publishDiagnostics" {
+                                if let Some(params) = json.get("params").cloned()
+                                    && let Ok((diag_uri, diags)) = parse_lsp_diagnostics(params) {
+                                        let current_uri = file_to_uri(&current_file);
+                                        if uris_match(&diag_uri, &current_uri) {
+                                            let _ = tx.send(LspOutbound::Diagnostics(diags));
                                         }
                                     }
-                                } else if let Some(req_id) = json.get("id") {
-                                    let resp = serde_json::json!({
-                                        "jsonrpc": "2.0",
-                                        "id": req_id,
-                                        "result": if method == "workspace/configuration" {
-                                            serde_json::json!([{}])
-                                        } else if method == "workspace/workspaceFolders" {
-                                            serde_json::json!([{ "uri": root_uri.as_str(), "name": "root" }])
-                                        } else if method == "workspace/applyEdit" {
-                                            serde_json::json!({ "applied": true })
-                                        } else {
-                                            Value::Null
-                                        }
-                                    });
-                                    let _ = send_lsp_message(&mut stdin, &resp).await;
-                                }
-                            } else if let Some(resp_id) = json.get("id").and_then(Value::as_i64) {
-                                let result_val = json.get("result").cloned().unwrap_or(Value::Null);
+                            } else if let Some(req_id) = json.get("id") {
+                                let resp = serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": req_id,
+                                    "result": if method == "workspace/configuration" {
+                                        serde_json::json!([{}])
+                                    } else if method == "workspace/workspaceFolders" {
+                                        serde_json::json!([{ "uri": root_uri.as_str(), "name": "root" }])
+                                    } else if method == "workspace/applyEdit" {
+                                        serde_json::json!({ "applied": true })
+                                    } else {
+                                        Value::Null
+                                    }
+                                });
+                                let _ = send_lsp_message(&mut stdin, &resp).await;
+                            }
+                        } else if let Some(resp_id) = json.get("id").and_then(Value::as_i64) {
+                            let result_val = json.get("result").cloned().unwrap_or(Value::Null);
 
-                                if let Some(req_type) = pending_requests.remove(&resp_id) {
-                                    match req_type {
-                                        "completion" => {
-                                            last_completion_req = None;
-                                            let items = parse_lsp_completions(result_val);
-                                            let _ = tx.send(LspOutbound::Completions { req_id: resp_id, items });
-                                        }
-                                        "hover" => {
-                                            let hover = parse_lsp_hover(result_val);
-                                            let _ = tx.send(LspOutbound::Hover { req_id: resp_id, hover });
-                                        }
-                                        "signatureHelp" => {
-                                            let help = parse_lsp_signature_help(result_val);
-                                            let _ = tx.send(LspOutbound::SignatureHelp { req_id: resp_id, help });
-                                        }
-                                        "definition" => {
-                                            let locations = parse_lsp_locations(result_val);
-                                            let _ = tx.send(LspOutbound::Definition { req_id: resp_id, locations });
-                                        }
-                                        "references" => {
-                                            let locations = parse_lsp_locations(result_val);
-                                            let _ = tx.send(LspOutbound::References { req_id: resp_id, locations });
-                                        }
-                                        "formatting" => {
-                                            let edits = parse_lsp_formatting(result_val);
-                                            let _ = tx.send(LspOutbound::Formatting { req_id: resp_id, edits });
-                                        }
-                                        "codeAction" => {
-                                            let actions = parse_lsp_code_actions(result_val);
-                                            let _ = tx.send(LspOutbound::CodeActions { req_id: resp_id, actions });
-                                        }
-                                        "rename" => {
-                                            let edit: WorkspaceEdit = serde_json::from_value(result_val).unwrap_or_default();
-                                            let changes = parse_lsp_workspace_edit(edit);
-                                            let _ = tx.send(LspOutbound::Rename { req_id: resp_id, changes });
-                                        }
-                                        "documentSymbol" => {
-                                            let symbols = parse_lsp_document_symbols(result_val);
-                                            let _ = tx.send(LspOutbound::DocumentSymbols { req_id: resp_id, symbols });
-                                        }
-                                        "inlayHints" => {
-                                            let hints = parse_lsp_inlay_hints(result_val);
-                                            let _ = tx.send(LspOutbound::InlayHints { req_id: resp_id, hints });
-                                        }
-                                        "semanticTokens" => {
-                                            let mut tokens = Vec::new();
-                                            if let Ok(st_res) = serde_json::from_value::<SemanticTokensResult>(result_val) {
-                                                if let SemanticTokensResult::Tokens(st) = st_res {
-                                                    let mut cur_line = 0usize;
-                                                    let mut cur_char = 0usize;
+                            if let Some(req_type) = pending_requests.remove(&resp_id) {
+                                match req_type {
+                                    "completion" => {
+                                        last_completion_req = None;
+                                        let items = parse_lsp_completions(result_val);
+                                        let _ = tx.send(LspOutbound::Completions { req_id: resp_id, items });
+                                    }
+                                    "hover" => {
+                                        let hover = parse_lsp_hover(result_val);
+                                        let _ = tx.send(LspOutbound::Hover { req_id: resp_id, hover });
+                                    }
+                                    "signatureHelp" => {
+                                        let help = parse_lsp_signature_help(result_val);
+                                        let _ = tx.send(LspOutbound::SignatureHelp { req_id: resp_id, help });
+                                    }
+                                    "definition" => {
+                                        let locations = parse_lsp_locations(result_val);
+                                        let _ = tx.send(LspOutbound::Definition { req_id: resp_id, locations });
+                                    }
+                                    "references" => {
+                                        let locations = parse_lsp_locations(result_val);
+                                        let _ = tx.send(LspOutbound::References { req_id: resp_id, locations });
+                                    }
+                                    "formatting" => {
+                                        let edits = parse_lsp_formatting(result_val);
+                                        let _ = tx.send(LspOutbound::Formatting { req_id: resp_id, edits });
+                                    }
+                                    "codeAction" => {
+                                        let actions = parse_lsp_code_actions(result_val);
+                                        let _ = tx.send(LspOutbound::CodeActions { req_id: resp_id, actions });
+                                    }
+                                    "rename" => {
+                                        let edit: WorkspaceEdit = serde_json::from_value(result_val).unwrap_or_default();
+                                        let changes = parse_lsp_workspace_edit(edit);
+                                        let _ = tx.send(LspOutbound::Rename { req_id: resp_id, changes });
+                                    }
+                                    "documentSymbol" => {
+                                        let symbols = parse_lsp_document_symbols(result_val);
+                                        let _ = tx.send(LspOutbound::DocumentSymbols { req_id: resp_id, symbols });
+                                    }
+                                    "inlayHints" => {
+                                        let hints = parse_lsp_inlay_hints(result_val);
+                                        let _ = tx.send(LspOutbound::InlayHints { req_id: resp_id, hints });
+                                    }
+                                    "semanticTokens" => {
+                                        let mut tokens = Vec::new();
+                                        if let Ok(st_res) = serde_json::from_value::<SemanticTokensResult>(result_val)
+                                            && let SemanticTokensResult::Tokens(st) = st_res {
+                                                let mut cur_line = 0usize;
+                                                let mut cur_char = 0usize;
 
-                                                    for token in &st.data {
-                                                        let delta_line = token.delta_line as usize;
-                                                        let delta_start = token.delta_start as usize;
-                                                        let length = token.length as usize;
-                                                        let token_type_idx = token.token_type as usize;
+                                                for token in &st.data {
+                                                    let delta_line = token.delta_line as usize;
+                                                    let delta_start = token.delta_start as usize;
+                                                    let length = token.length as usize;
+                                                    let token_type_idx = token.token_type as usize;
 
-                                                        let token_name = server_legend.get(token_type_idx).map_or("", String::as_str);
-                                                        let token_type = CanonicalTokenType::from_name(token_name);
+                                                    let token_name = server_legend.get(token_type_idx).map_or("", String::as_str);
+                                                    let token_type = CanonicalTokenType::from_name(token_name);
 
-                                                        if delta_line > 0 {
-                                                            cur_line = cur_line.saturating_add(delta_line);
-                                                            cur_char = delta_start;
-                                                        } else {
-                                                            cur_char = cur_char.saturating_add(delta_start);
-                                                        }
-
-                                                        tokens.push(SemanticTokenSpan {
-                                                            line: cur_line,
-                                                            start_col: cur_char,
-                                                            length,
-                                                            token_type,
-                                                        });
+                                                    if delta_line > 0 {
+                                                        cur_line = cur_line.saturating_add(delta_line);
+                                                        cur_char = delta_start;
+                                                    } else {
+                                                        cur_char = cur_char.saturating_add(delta_start);
                                                     }
+
+                                                    tokens.push(SemanticTokenSpan {
+                                                        line: cur_line,
+                                                        start_col: cur_char,
+                                                        length,
+                                                        token_type,
+                                                    });
                                                 }
                                             }
-                                            let _ = tx.send(LspOutbound::SemanticTokens { tokens });
-                                        }
-                                        _ => {}
+                                        let _ = tx.send(LspOutbound::SemanticTokens { tokens });
                                     }
+                                    _ => {}
                                 }
                             }
                         }
-                        Err(_) => {
-                            child_crashed = true;
-                            break 'event_loop;
-                        }
+                    } else {
+                        child_crashed = true;
+                        break 'event_loop;
                     }
                 }
             }
@@ -2086,7 +2080,7 @@ pub fn query_file_path(lang_name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Dynamic grammar facade maintaining clean compatibility with `cmd.rs`[span_29](start_span)[span_29](end_span).
+/// Dynamic grammar facade maintaining clean compatibility with `cmd.rs`[`span_29`](start_span)[`span_29`](end_span).
 pub struct DynamicGrammar;
 
 impl DynamicGrammar {
@@ -2100,10 +2094,10 @@ impl DynamicGrammar {
             .copied()
             .find(|l| l.grammar_name() == lang_name || l.lsp_id() == lang_name);
 
-        if let Some(lang) = sl {
-            if lang.static_language().is_some() {
-                return Ok(PathBuf::from("built-in"));
-            }
+        if let Some(lang) = sl
+            && lang.static_language().is_some()
+        {
+            return Ok(PathBuf::from("built-in"));
         }
 
         Err(anyhow!(
@@ -2350,7 +2344,7 @@ impl SupportedLanguage {
         }
     }
 
-    /// Resolves compiled, statically linked grammar for top-tier languages[span_30](start_span)[span_30](end_span).
+    /// Resolves compiled, statically linked grammar for top-tier languages[`span_30`](start_span)[`span_30`](end_span).
     pub fn static_language(self) -> Option<tree_sitter::Language> {
         match self {
             SupportedLanguage::Rust => Some(tree_sitter_rust::LANGUAGE.into()),
@@ -2543,7 +2537,7 @@ impl SupportedLanguage {
                 "#
             }
             SupportedLanguage::Toml => {
-                r#"
+                r"
                 (table (bare_key) @type)
                 (pair (bare_key) @property)
                 (string) @string
@@ -2551,10 +2545,10 @@ impl SupportedLanguage {
                 (float) @number
                 (boolean) @number
                 (comment) @comment
-                "#
+                "
             }
             SupportedLanguage::Yaml => {
-                r#"
+                r"
                 (block_mapping_pair key: (flow_node) @property)
                 (string_scalar) @string
                 (integer_scalar) @number
@@ -2562,18 +2556,18 @@ impl SupportedLanguage {
                 (boolean_scalar) @number
                 (null_scalar) @keyword
                 (comment) @comment
-                "#
+                "
             }
             SupportedLanguage::Html => {
-                r#"
+                r"
                 (tag_name) @tag
                 (attribute_name) @property
                 (attribute_value) @string
                 (comment) @comment
-                "#
+                "
             }
             SupportedLanguage::Css => {
-                r#"
+                r"
                 (tag_name) @tag
                 (class_name) @type
                 (id_name) @type
@@ -2583,14 +2577,14 @@ impl SupportedLanguage {
                 (float_value) @number
                 (string_value) @string
                 (comment) @comment
-                "#
+                "
             }
             SupportedLanguage::Markdown => {
-                r#"
+                r"
                 (atx_heading) @type
                 (fenced_code_block) @string
                 (link) @property
-                "#
+                "
             }
             SupportedLanguage::Java => {
                 r#"
@@ -3184,7 +3178,7 @@ fn highlight_idx_to_token_type(idx: usize) -> CanonicalTokenType {
     }
 }
 
-/// Themed Syntax Highlighting Engine using compiled AST queries via `tree-sitter-highlight`[span_31](start_span)[span_31](end_span).
+/// Themed Syntax Highlighting Engine using compiled AST queries via `tree-sitter-highlight`[`span_31`](start_span)[`span_31`](end_span).
 pub struct SyntaxEngine {
     pub language: SupportedLanguage,
     pub parser: tree_sitter::Parser,
@@ -3239,7 +3233,7 @@ impl SyntaxEngine {
         self.has_grammar && self.highlight_config.is_some()
     }
 
-    /// Reparses text into line-addressed syntax spans using `tree-sitter-highlight`[span_32](start_span)[span_32](end_span).
+    /// Reparses text into line-addressed syntax spans using `tree-sitter-highlight`[`span_32`](start_span)[`span_32`](end_span).
     pub fn reparse(&mut self, text: &str) {
         if !self.has_treesitter() {
             return;
@@ -3348,7 +3342,7 @@ impl SyntaxEngine {
         }
     }
 
-    /// Renders styled terminal spans for a single line using the active [`Theme`][span_33](start_span)[span_33](end_span).
+    /// Renders styled terminal spans for a single line using the active [`Theme`][span_33](`start_span`)[`span_33`](end_span).
     pub fn highlight_line(
         &self,
         line_text: &str,
