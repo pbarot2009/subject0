@@ -1,12 +1,13 @@
 //! # Theme Engine & Visual Styles
 //!
 //! Provides 10 complete, curated themes with unified color schemes across the
-//! text buffer, syntax tokens, file explorer, statusline, and modal popups.
-//! Includes the classic `gruber-darker` theme.
+//! text buffer, syntax tokens, file explorer, statusline, modal popups,
+//! and full Language Server Protocol (LSP) intelligence elements (inlay hints,
+//! hover documentation cards, signature helpers, and diagnostics).
 
 use ratatui::style::Color;
 
-/// Complete styling specification for all UI components and syntax tokens.
+/// Complete styling specification for all UI components, syntax tokens, and LSP features.
 #[derive(Clone, Copy, Debug)]
 pub struct Theme {
     pub name: &'static str,
@@ -61,6 +62,20 @@ pub struct Theme {
     pub syn_variable: Color,
     pub syn_parameter: Color,
     pub syn_property: Color,
+
+    // LSP Intelligence: Inlay Hints, Hover Documentation, Signature Help & Diagnostics
+    pub inlay_hint_fg: Color,
+    pub inlay_hint_bg: Color,
+    pub inlay_hint_param_fg: Color,
+    pub hover_bg: Color,
+    pub hover_border: Color,
+    pub hover_fg: Color,
+    pub hover_code_bg: Color,
+    pub signature_active_param: Color,
+    pub diag_error: Color,
+    pub diag_warn: Color,
+    pub diag_info: Color,
+    pub diag_hint: Color,
 }
 
 impl Theme {
@@ -139,6 +154,19 @@ impl Theme {
             syn_variable: Color::Rgb(228, 228, 228),
             syn_parameter: Color::Rgb(149, 169, 159),
             syn_property: Color::Rgb(158, 149, 199), // Wisteria Purple
+
+            inlay_hint_fg: Color::Rgb(115, 115, 115),
+            inlay_hint_bg: Color::Rgb(32, 32, 32),
+            inlay_hint_param_fg: Color::Rgb(149, 169, 159),
+            hover_bg: Color::Rgb(20, 20, 20),
+            hover_border: Color::Rgb(255, 221, 51),
+            hover_fg: Color::Rgb(228, 228, 228),
+            hover_code_bg: Color::Rgb(30, 30, 30),
+            signature_active_param: Color::Rgb(255, 221, 51),
+            diag_error: Color::Rgb(244, 56, 65),
+            diag_warn: Color::Rgb(255, 221, 51),
+            diag_info: Color::Rgb(150, 166, 200),
+            diag_hint: Color::Rgb(149, 169, 159),
         }
     }
 
@@ -191,6 +219,19 @@ impl Theme {
             syn_variable: Color::Rgb(192, 202, 245),
             syn_parameter: Color::Rgb(224, 175, 104),
             syn_property: Color::Rgb(115, 218, 202),
+
+            inlay_hint_fg: Color::Rgb(86, 95, 137),
+            inlay_hint_bg: Color::Rgb(31, 35, 53),
+            inlay_hint_param_fg: Color::Rgb(115, 218, 202),
+            hover_bg: Color::Rgb(22, 22, 30),
+            hover_border: Color::Rgb(122, 162, 247),
+            hover_fg: Color::Rgb(192, 202, 245),
+            hover_code_bg: Color::Rgb(31, 35, 53),
+            signature_active_param: Color::Rgb(224, 175, 104),
+            diag_error: Color::Rgb(247, 118, 142),
+            diag_warn: Color::Rgb(224, 175, 104),
+            diag_info: Color::Rgb(122, 162, 247),
+            diag_hint: Color::Rgb(115, 218, 202),
         }
     }
 
@@ -243,6 +284,19 @@ impl Theme {
             syn_variable: Color::Rgb(205, 214, 244),
             syn_parameter: Color::Rgb(235, 160, 172),
             syn_property: Color::Rgb(137, 220, 235),
+
+            inlay_hint_fg: Color::Rgb(108, 112, 134),
+            inlay_hint_bg: Color::Rgb(38, 38, 56),
+            inlay_hint_param_fg: Color::Rgb(148, 226, 213),
+            hover_bg: Color::Rgb(24, 24, 37),
+            hover_border: Color::Rgb(137, 180, 250),
+            hover_fg: Color::Rgb(205, 214, 244),
+            hover_code_bg: Color::Rgb(49, 50, 68),
+            signature_active_param: Color::Rgb(249, 226, 175),
+            diag_error: Color::Rgb(243, 139, 168),
+            diag_warn: Color::Rgb(249, 226, 175),
+            diag_info: Color::Rgb(137, 180, 250),
+            diag_hint: Color::Rgb(148, 226, 213),
         }
     }
 
@@ -295,6 +349,19 @@ impl Theme {
             syn_variable: Color::Rgb(235, 219, 178),
             syn_parameter: Color::Rgb(131, 165, 152),
             syn_property: Color::Rgb(142, 192, 124),
+
+            inlay_hint_fg: Color::Rgb(146, 131, 116),
+            inlay_hint_bg: Color::Rgb(50, 48, 47),
+            inlay_hint_param_fg: Color::Rgb(142, 192, 124),
+            hover_bg: Color::Rgb(29, 32, 33),
+            hover_border: Color::Rgb(250, 189, 47),
+            hover_fg: Color::Rgb(235, 219, 178),
+            hover_code_bg: Color::Rgb(50, 48, 47),
+            signature_active_param: Color::Rgb(250, 189, 47),
+            diag_error: Color::Rgb(251, 73, 52),
+            diag_warn: Color::Rgb(250, 189, 47),
+            diag_info: Color::Rgb(131, 165, 152),
+            diag_hint: Color::Rgb(142, 192, 124),
         }
     }
 
@@ -347,6 +414,19 @@ impl Theme {
             syn_variable: Color::Rgb(216, 222, 233),
             syn_parameter: Color::Rgb(229, 233, 240),
             syn_property: Color::Rgb(236, 239, 244),
+
+            inlay_hint_fg: Color::Rgb(94, 106, 130),
+            inlay_hint_bg: Color::Rgb(59, 66, 82),
+            inlay_hint_param_fg: Color::Rgb(143, 188, 187),
+            hover_bg: Color::Rgb(36, 41, 51),
+            hover_border: Color::Rgb(136, 192, 208),
+            hover_fg: Color::Rgb(236, 239, 244),
+            hover_code_bg: Color::Rgb(46, 52, 64),
+            signature_active_param: Color::Rgb(235, 203, 139),
+            diag_error: Color::Rgb(191, 97, 106),
+            diag_warn: Color::Rgb(235, 203, 139),
+            diag_info: Color::Rgb(136, 192, 208),
+            diag_hint: Color::Rgb(143, 188, 187),
         }
     }
 
@@ -399,6 +479,19 @@ impl Theme {
             syn_variable: Color::Rgb(224, 108, 117),
             syn_parameter: Color::Rgb(171, 178, 191),
             syn_property: Color::Rgb(171, 178, 191),
+
+            inlay_hint_fg: Color::Rgb(92, 99, 112),
+            inlay_hint_bg: Color::Rgb(44, 49, 58),
+            inlay_hint_param_fg: Color::Rgb(86, 182, 194),
+            hover_bg: Color::Rgb(33, 37, 43),
+            hover_border: Color::Rgb(97, 175, 239),
+            hover_fg: Color::Rgb(171, 178, 191),
+            hover_code_bg: Color::Rgb(40, 44, 52),
+            signature_active_param: Color::Rgb(229, 192, 123),
+            diag_error: Color::Rgb(224, 108, 117),
+            diag_warn: Color::Rgb(229, 192, 123),
+            diag_info: Color::Rgb(97, 175, 239),
+            diag_hint: Color::Rgb(86, 182, 194),
         }
     }
 
@@ -451,6 +544,19 @@ impl Theme {
             syn_variable: Color::Rgb(248, 248, 242),
             syn_parameter: Color::Rgb(255, 184, 108),
             syn_property: Color::Rgb(102, 217, 239),
+
+            inlay_hint_fg: Color::Rgb(98, 114, 164),
+            inlay_hint_bg: Color::Rgb(50, 52, 66),
+            inlay_hint_param_fg: Color::Rgb(139, 233, 253),
+            hover_bg: Color::Rgb(33, 34, 44),
+            hover_border: Color::Rgb(189, 147, 249),
+            hover_fg: Color::Rgb(248, 248, 242),
+            hover_code_bg: Color::Rgb(40, 42, 54),
+            signature_active_param: Color::Rgb(241, 250, 140),
+            diag_error: Color::Rgb(255, 85, 85),
+            diag_warn: Color::Rgb(241, 250, 140),
+            diag_info: Color::Rgb(139, 233, 253),
+            diag_hint: Color::Rgb(80, 250, 123),
         }
     }
 
@@ -503,6 +609,19 @@ impl Theme {
             syn_variable: Color::Rgb(224, 222, 244),
             syn_parameter: Color::Rgb(196, 167, 231),
             syn_property: Color::Rgb(156, 207, 216),
+
+            inlay_hint_fg: Color::Rgb(110, 106, 134),
+            inlay_hint_bg: Color::Rgb(35, 33, 48),
+            inlay_hint_param_fg: Color::Rgb(156, 207, 216),
+            hover_bg: Color::Rgb(20, 18, 28),
+            hover_border: Color::Rgb(196, 167, 231),
+            hover_fg: Color::Rgb(224, 222, 244),
+            hover_code_bg: Color::Rgb(31, 29, 46),
+            signature_active_param: Color::Rgb(246, 193, 119),
+            diag_error: Color::Rgb(235, 111, 146),
+            diag_warn: Color::Rgb(246, 193, 119),
+            diag_info: Color::Rgb(156, 207, 216),
+            diag_hint: Color::Rgb(196, 167, 231),
         }
     }
 
@@ -555,6 +674,19 @@ impl Theme {
             syn_variable: Color::Rgb(220, 215, 186),
             syn_parameter: Color::Rgb(184, 180, 160),
             syn_property: Color::Rgb(230, 195, 134),
+
+            inlay_hint_fg: Color::Rgb(114, 113, 105),
+            inlay_hint_bg: Color::Rgb(42, 42, 55),
+            inlay_hint_param_fg: Color::Rgb(126, 156, 216),
+            hover_bg: Color::Rgb(22, 22, 29),
+            hover_border: Color::Rgb(126, 156, 216),
+            hover_fg: Color::Rgb(220, 215, 186),
+            hover_code_bg: Color::Rgb(31, 31, 40),
+            signature_active_param: Color::Rgb(224, 159, 84),
+            diag_error: Color::Rgb(228, 104, 114),
+            diag_warn: Color::Rgb(224, 159, 84),
+            diag_info: Color::Rgb(126, 156, 216),
+            diag_hint: Color::Rgb(152, 187, 108),
         }
     }
 
@@ -607,6 +739,19 @@ impl Theme {
             syn_variable: Color::Rgb(252, 252, 250),
             syn_parameter: Color::Rgb(255, 157, 0),
             syn_property: Color::Rgb(120, 220, 232),
+
+            inlay_hint_fg: Color::Rgb(114, 112, 114),
+            inlay_hint_bg: Color::Rgb(55, 52, 56),
+            inlay_hint_param_fg: Color::Rgb(120, 220, 232),
+            hover_bg: Color::Rgb(34, 31, 34),
+            hover_border: Color::Rgb(255, 216, 102),
+            hover_fg: Color::Rgb(252, 252, 250),
+            hover_code_bg: Color::Rgb(45, 42, 46),
+            signature_active_param: Color::Rgb(255, 216, 102),
+            diag_error: Color::Rgb(255, 97, 136),
+            diag_warn: Color::Rgb(255, 216, 102),
+            diag_info: Color::Rgb(120, 220, 232),
+            diag_hint: Color::Rgb(169, 220, 105),
         }
     }
 }

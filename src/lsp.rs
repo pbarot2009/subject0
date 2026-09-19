@@ -5,10 +5,12 @@
 //! 1. **LSP Background Actor (`run_lsp_actor`)**:
 //!    Asynchronous, non-blocking Tokio task managing the language server child process
 //!    over JSON-RPC 2.0 with HTTP-style `Content-Length` framing.
+//!    Supports Completions, Inlay Hints (inferred types & parameter names), Hover Documentation,
+//!    Signature Help, Go to Definition, References, Formatting, Code Actions, Rename, and Document Symbols.
 //!
 //! 2. **Compile-Time Static Syntax Engine ([`SyntaxEngine`])**:
 //!    Statically linked Tree-sitter parsers and built-in queries for primary languages
-//!    (Rust, C, C++, Python, Go, JS, TS, Bash, JSON, TOML, YAML, HTML, CSS, Markdown, Java).
+//!    (Rust, C, C++, Zig, Python, Go, JS, TS, Bash, JSON, TOML, YAML, HTML, CSS, Markdown, Java).
 //!    All tokens are styled dynamically against the active [`Theme`].
 //!
 //! 3. **LSP Semantic Token Tier**:
@@ -54,6 +56,77 @@ pub struct SuggestionItem {
     pub insert_text: String,
     pub detail: Option<String>,
     pub kind: u64,
+}
+
+/// Semantic kind of an inlay hint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InlayHintType {
+    Type,
+    Parameter,
+    Other,
+}
+
+/// Inferred type or parameter name inlay hint displayed inline within code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlayHintItem {
+    pub line: usize,
+    pub col: usize,
+    pub label: String,
+    pub kind: InlayHintType,
+    pub padding_left: bool,
+    pub padding_right: bool,
+}
+
+/// Hover documentation payload containing documentation markdown and signature lines.
+#[derive(Debug, Clone)]
+pub struct HoverInfo {
+    pub lines: Vec<String>,
+}
+
+/// Active function or method signature help tooltip information.
+#[derive(Debug, Clone)]
+pub struct SignatureHelpInfo {
+    pub signature_label: String,
+    pub active_parameter: Option<usize>,
+    pub parameter_label: Option<String>,
+    pub doc: Option<String>,
+}
+
+/// Source code location returned by definition and reference queries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocationItem {
+    pub path: PathBuf,
+    pub line: usize,
+    pub col: usize,
+}
+
+/// Atomic text replacement range for formatting, renaming, and code actions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextEditItem {
+    pub start_line: usize,
+    pub start_col: usize,
+    pub end_line: usize,
+    pub end_col: usize,
+    pub new_text: String,
+}
+
+/// Code action or quickfix candidate provided by the LSP server.
+#[derive(Debug, Clone)]
+pub struct CodeActionItem {
+    pub title: String,
+    pub kind: Option<String>,
+    pub is_preferred: bool,
+    pub edits: HashMap<PathBuf, Vec<TextEditItem>>,
+}
+
+/// Document outline symbol (function, struct, method, variable, enum, etc.).
+#[derive(Debug, Clone)]
+pub struct SymbolItem {
+    pub name: String,
+    pub kind: u64,
+    pub line: usize,
+    pub col: usize,
+    pub container_name: Option<String>,
 }
 
 /// Operational lifecycle state of the LSP server process.
@@ -192,6 +265,48 @@ pub enum LspInbound {
     SemanticTokens {
         req_id: i64,
     },
+    InlayHints {
+        req_id: i64,
+        max_lines: usize,
+    },
+    Hover {
+        line: usize,
+        col: usize,
+        req_id: i64,
+    },
+    SignatureHelp {
+        line: usize,
+        col: usize,
+        req_id: i64,
+    },
+    Definition {
+        line: usize,
+        col: usize,
+        req_id: i64,
+    },
+    References {
+        line: usize,
+        col: usize,
+        req_id: i64,
+    },
+    Formatting {
+        req_id: i64,
+    },
+    CodeAction {
+        line: usize,
+        col: usize,
+        diagnostics: Vec<DiagnosticItem>,
+        req_id: i64,
+    },
+    Rename {
+        line: usize,
+        col: usize,
+        new_name: String,
+        req_id: i64,
+    },
+    DocumentSymbol {
+        req_id: i64,
+    },
     OpenFile {
         path: PathBuf,
         text: String,
@@ -209,6 +324,42 @@ pub enum LspOutbound {
     },
     SemanticTokens {
         tokens: Vec<SemanticTokenSpan>,
+    },
+    InlayHints {
+        req_id: i64,
+        hints: Vec<InlayHintItem>,
+    },
+    Hover {
+        req_id: i64,
+        hover: Option<HoverInfo>,
+    },
+    SignatureHelp {
+        req_id: i64,
+        help: Option<SignatureHelpInfo>,
+    },
+    Definition {
+        req_id: i64,
+        locations: Vec<LocationItem>,
+    },
+    References {
+        req_id: i64,
+        locations: Vec<LocationItem>,
+    },
+    Formatting {
+        req_id: i64,
+        edits: Vec<TextEditItem>,
+    },
+    CodeActions {
+        req_id: i64,
+        actions: Vec<CodeActionItem>,
+    },
+    Rename {
+        req_id: i64,
+        changes: HashMap<PathBuf, Vec<TextEditItem>>,
+    },
+    DocumentSymbols {
+        req_id: i64,
+        symbols: Vec<SymbolItem>,
     },
 }
 
@@ -305,7 +456,7 @@ pub fn resolve_binary_path(cmd: &str) -> Option<PathBuf> {
     None
 }
 
-/// Converts local path to an RFC 3986 `file://` URI string.
+/// Converts local path to an RFC 3986 `file://` URI string using `url::Url`.
 pub fn file_to_uri(path: &Path) -> String {
     let abs = if path.is_absolute() {
         path.to_path_buf()
@@ -314,6 +465,11 @@ pub fn file_to_uri(path: &Path) -> String {
     } else {
         path.to_path_buf()
     };
+
+    if let Ok(parsed) = url::Url::from_file_path(&abs) {
+        return parsed.to_string();
+    }
+
     let s = abs.to_string_lossy();
     if cfg!(target_os = "windows") {
         let clean = s.replace('\\', "/");
@@ -323,7 +479,30 @@ pub fn file_to_uri(path: &Path) -> String {
     }
 }
 
-fn uris_match(a: &str, b: &str) -> bool {
+/// Parses an RFC 3986 `file://` URI into a local path.
+pub fn uri_to_path(uri_str: &str) -> Option<PathBuf> {
+    if let Ok(parsed) = url::Url::parse(uri_str) {
+        if let Ok(path) = parsed.to_file_path() {
+            return Some(path);
+        }
+    }
+
+    let raw = uri_str.strip_prefix("file://")?;
+    #[cfg(target_os = "windows")]
+    {
+        let clean = raw.trim_start_matches('/');
+        Some(PathBuf::from(clean.replace('/', "\\")))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Some(PathBuf::from(raw))
+    }
+}
+
+pub fn uris_match(a: &str, b: &str) -> bool {
+    if let (Some(pa), Some(pb)) = (uri_to_path(a), uri_to_path(b)) {
+        return pa == pb;
+    }
     a.trim_end_matches('/')
         .eq_ignore_ascii_case(b.trim_end_matches('/'))
 }
@@ -339,6 +518,17 @@ pub fn utf16_to_char_col(line: &str, utf16_col: usize) -> usize {
         char_count += 1;
     }
     char_count
+}
+
+pub fn char_to_utf16_col(line: &str, char_col: usize) -> usize {
+    let mut utf16_count = 0usize;
+    for (idx, ch) in line.chars().enumerate() {
+        if idx >= char_col {
+            break;
+        }
+        utf16_count += ch.len_utf16();
+    }
+    utf16_count
 }
 
 pub fn parse_snippet_to_plain_text(snippet: &str) -> String {
@@ -464,6 +654,284 @@ pub fn server_cmd_and_args(cmd: &str) -> (String, Vec<&'static str>) {
     }
 }
 
+// === Parsing Helpers for LSP Results ===
+
+fn parse_raw_location(val: &Value) -> Option<LocationItem> {
+    let uri = val
+        .get("uri")
+        .or_else(|| val.get("targetUri"))
+        .and_then(Value::as_str)?;
+    let path = uri_to_path(uri)?;
+
+    let range = val
+        .get("range")
+        .or_else(|| val.get("targetSelectionRange"))
+        .or_else(|| val.get("targetRange"))?;
+    let start = range.get("start")?;
+    let line = start.get("line").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let col = start.get("character").and_then(Value::as_u64).unwrap_or(0) as usize;
+
+    Some(LocationItem { path, line, col })
+}
+
+fn parse_text_edit(val: &Value) -> Option<TextEditItem> {
+    let range = val.get("range")?;
+    let start = range.get("start")?;
+    let end = range.get("end")?;
+
+    let start_line = start.get("line").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let start_col = start.get("character").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let end_line = end.get("line").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let end_col = end.get("character").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let new_text = val
+        .get("newText")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    Some(TextEditItem {
+        start_line,
+        start_col,
+        end_line,
+        end_col,
+        new_text,
+    })
+}
+
+fn parse_workspace_edit(val: &Value) -> HashMap<PathBuf, Vec<TextEditItem>> {
+    let mut result = HashMap::new();
+
+    if let Some(changes) = val.get("changes").and_then(Value::as_object) {
+        for (uri, edits_arr) in changes {
+            if let Some(path) = uri_to_path(uri) {
+                if let Some(arr) = edits_arr.as_array() {
+                    let edits = arr.iter().filter_map(parse_text_edit).collect();
+                    result.insert(path, edits);
+                }
+            }
+        }
+    }
+
+    if let Some(doc_changes) = val.get("documentChanges").and_then(Value::as_array) {
+        for change in doc_changes {
+            if let Some(text_doc) = change.get("textDocument") {
+                if let Some(uri) = text_doc.get("uri").and_then(Value::as_str) {
+                    if let Some(path) = uri_to_path(uri) {
+                        if let Some(edits_arr) = change.get("edits").and_then(Value::as_array) {
+                            let edits: Vec<TextEditItem> =
+                                edits_arr.iter().filter_map(parse_text_edit).collect();
+                            result.entry(path).or_insert_with(Vec::new).extend(edits);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    result
+}
+
+fn parse_inlay_hint(val: &Value) -> Option<InlayHintItem> {
+    let pos = val.get("position")?;
+    let line = pos.get("line").and_then(Value::as_u64)? as usize;
+    let col = pos.get("character").and_then(Value::as_u64)? as usize;
+
+    let label = if let Some(s) = val.get("label").and_then(Value::as_str) {
+        s.to_string()
+    } else if let Some(arr) = val.get("label").and_then(Value::as_array) {
+        let mut combined = String::new();
+        for part in arr {
+            if let Some(part_str) = part.get("value").and_then(Value::as_str) {
+                combined.push_str(part_str);
+            }
+        }
+        combined
+    } else {
+        return None;
+    };
+
+    if label.trim().is_empty() {
+        return None;
+    }
+
+    let kind_num = val.get("kind").and_then(Value::as_u64).unwrap_or(0);
+    let kind = match kind_num {
+        1 => InlayHintType::Type,
+        2 => InlayHintType::Parameter,
+        _ => InlayHintType::Other,
+    };
+
+    let padding_left = val
+        .get("paddingLeft")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let padding_right = val
+        .get("paddingRight")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    Some(InlayHintItem {
+        line,
+        col,
+        label,
+        kind,
+        padding_left,
+        padding_right,
+    })
+}
+
+fn parse_hover(val: &Value) -> Option<HoverInfo> {
+    let contents = val.get("contents")?;
+    let mut lines = Vec::new();
+
+    fn extract_text(v: &Value, out: &mut Vec<String>) {
+        match v {
+            Value::String(s) => {
+                for l in s.lines() {
+                    out.push(l.to_string());
+                }
+            }
+            Value::Object(map) => {
+                if let Some(val_str) = map.get("value").and_then(Value::as_str) {
+                    for l in val_str.lines() {
+                        out.push(l.to_string());
+                    }
+                }
+            }
+            Value::Array(arr) => {
+                for item in arr {
+                    extract_text(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    extract_text(contents, &mut lines);
+
+    if lines.is_empty() {
+        None
+    } else {
+        Some(HoverInfo { lines })
+    }
+}
+
+fn parse_signature_help(val: &Value) -> Option<SignatureHelpInfo> {
+    let sigs = val.get("signatures").and_then(Value::as_array)?;
+    if sigs.is_empty() {
+        return None;
+    }
+
+    let active_sig_idx = val
+        .get("activeSignature")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let sig = sigs.get(active_sig_idx).or_else(|| sigs.first())?;
+
+    let signature_label = sig.get("label").and_then(Value::as_str)?.to_string();
+    let active_param_idx = val
+        .get("activeParameter")
+        .and_then(Value::as_u64)
+        .or_else(|| sig.get("activeParameter").and_then(Value::as_u64))
+        .map(|v| v as usize);
+
+    let mut parameter_label = None;
+    if let (Some(params), Some(p_idx)) = (
+        sig.get("parameters").and_then(Value::as_array),
+        active_param_idx,
+    ) {
+        if let Some(p_obj) = params.get(p_idx) {
+            if let Some(plabel) = p_obj.get("label") {
+                if let Some(s) = plabel.as_str() {
+                    parameter_label = Some(s.to_string());
+                } else if let Some(arr) = plabel.as_array() {
+                    if arr.len() == 2 {
+                        let start = arr[0].as_u64().unwrap_or(0) as usize;
+                        let end = arr[1].as_u64().unwrap_or(0) as usize;
+                        if start <= end && end <= signature_label.len() {
+                            parameter_label = Some(signature_label[start..end].to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let doc = sig.get("documentation").and_then(|d| match d {
+        Value::String(s) => Some(s.clone()),
+        Value::Object(m) => m
+            .get("value")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        _ => None,
+    });
+
+    Some(SignatureHelpInfo {
+        signature_label,
+        active_parameter: active_param_idx,
+        parameter_label,
+        doc,
+    })
+}
+
+fn parse_document_symbols_recursive(
+    val: &Value,
+    container: Option<String>,
+    out: &mut Vec<SymbolItem>,
+) {
+    if let Some(arr) = val.as_array() {
+        for item in arr {
+            let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+            let kind = item.get("kind").and_then(Value::as_u64).unwrap_or(0);
+
+            let (line, col) =
+                if let Some(range) = item.get("selectionRange").or_else(|| item.get("range")) {
+                    let start = range.get("start");
+                    let l = start
+                        .and_then(|s| s.get("line"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0) as usize;
+                    let c = start
+                        .and_then(|s| s.get("character"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0) as usize;
+                    (l, c)
+                } else if let Some(loc) = item.get("location") {
+                    let start = loc.get("range").and_then(|r| r.get("start"));
+                    let l = start
+                        .and_then(|s| s.get("line"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0) as usize;
+                    let c = start
+                        .and_then(|s| s.get("character"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0) as usize;
+                    (l, c)
+                } else {
+                    (0, 0)
+                };
+
+            let item_container = item
+                .get("containerName")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+                .or_else(|| container.clone());
+
+            out.push(SymbolItem {
+                name: name.to_string(),
+                kind,
+                line,
+                col,
+                container_name: item_container,
+            });
+
+            if let Some(children) = item.get("children") {
+                parse_document_symbols_recursive(children, Some(name.to_string()), out);
+            }
+        }
+    }
+}
+
 // === Asynchronous LSP Background Actor ===
 
 pub async fn run_lsp_actor(
@@ -522,7 +990,11 @@ pub async fn run_lsp_actor(
             "rootUri": root_uri,
             "workspaceFolders": [{ "uri": root_uri, "name": "root" }],
             "capabilities": {
-                "workspace": { "workspaceFolders": true, "configuration": true },
+                "workspace": {
+                    "workspaceFolders": true,
+                    "configuration": true,
+                    "applyEdit": true
+                },
                 "textDocument": {
                     "synchronization": {
                         "openClose": true,
@@ -533,8 +1005,41 @@ pub async fn run_lsp_actor(
                         "completionItem": {
                             "snippetSupport": true,
                             "commitCharactersSupport": true,
-                            "documentationFormat": ["plaintext", "markdown"]
+                            "documentationFormat": ["markdown", "plaintext"]
                         }
+                    },
+                    "hover": {
+                        "contentFormat": ["markdown", "plaintext"]
+                    },
+                    "signatureHelp": {
+                        "signatureInformation": {
+                            "documentationFormat": ["markdown", "plaintext"],
+                            "parameterInformation": { "labelOffsetSupport": true }
+                        }
+                    },
+                    "definition": { "dynamicRegistration": false, "linkSupport": true },
+                    "references": { "dynamicRegistration": false },
+                    "documentSymbol": {
+                        "dynamicRegistration": false,
+                        "hierarchicalDocumentSymbolSupport": true
+                    },
+                    "formatting": { "dynamicRegistration": false },
+                    "codeAction": {
+                        "dynamicRegistration": false,
+                        "codeActionLiteralSupport": {
+                            "codeActionKind": {
+                                "valueSet": ["quickfix", "refactor", "source"]
+                            }
+                        },
+                        "isPreferredSupport": true
+                    },
+                    "rename": {
+                        "dynamicRegistration": false,
+                        "prepareSupport": false
+                    },
+                    "inlayHint": {
+                        "dynamicRegistration": false,
+                        "resolveSupport": { "properties": [] }
                     },
                     "publishDiagnostics": { "relatedInformation": true },
                     "semanticTokens": {
@@ -715,6 +1220,150 @@ pub async fn run_lsp_actor(
                         });
                         let _ = send_lsp_message(&mut stdin, &st_req).await;
                     }
+                    Some(LspInbound::InlayHints { req_id, max_lines }) => {
+                        pending_requests.insert(req_id, "inlayHints");
+                        let ih_req = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "method": "textDocument/inlayHint",
+                            "params": {
+                                "textDocument": { "uri": current_file_uri },
+                                "range": {
+                                    "start": { "line": 0, "character": 0 },
+                                    "end": { "line": max_lines.max(100), "character": 0 }
+                                }
+                            }
+                        });
+                        let _ = send_lsp_message(&mut stdin, &ih_req).await;
+                    }
+                    Some(LspInbound::Hover { line, col, req_id }) => {
+                        pending_requests.insert(req_id, "hover");
+                        let h_req = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "method": "textDocument/hover",
+                            "params": {
+                                "textDocument": { "uri": current_file_uri },
+                                "position": { "line": line, "character": col }
+                            }
+                        });
+                        let _ = send_lsp_message(&mut stdin, &h_req).await;
+                    }
+                    Some(LspInbound::SignatureHelp { line, col, req_id }) => {
+                        pending_requests.insert(req_id, "signatureHelp");
+                        let sh_req = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "method": "textDocument/signatureHelp",
+                            "params": {
+                                "textDocument": { "uri": current_file_uri },
+                                "position": { "line": line, "character": col }
+                            }
+                        });
+                        let _ = send_lsp_message(&mut stdin, &sh_req).await;
+                    }
+                    Some(LspInbound::Definition { line, col, req_id }) => {
+                        pending_requests.insert(req_id, "definition");
+                        let def_req = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "method": "textDocument/definition",
+                            "params": {
+                                "textDocument": { "uri": current_file_uri },
+                                "position": { "line": line, "character": col }
+                            }
+                        });
+                        let _ = send_lsp_message(&mut stdin, &def_req).await;
+                    }
+                    Some(LspInbound::References { line, col, req_id }) => {
+                        pending_requests.insert(req_id, "references");
+                        let ref_req = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "method": "textDocument/references",
+                            "params": {
+                                "textDocument": { "uri": current_file_uri },
+                                "position": { "line": line, "character": col },
+                                "context": { "includeDeclaration": true }
+                            }
+                        });
+                        let _ = send_lsp_message(&mut stdin, &ref_req).await;
+                    }
+                    Some(LspInbound::Formatting { req_id }) => {
+                        pending_requests.insert(req_id, "formatting");
+                        let fmt_req = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "method": "textDocument/formatting",
+                            "params": {
+                                "textDocument": { "uri": current_file_uri },
+                                "options": {
+                                    "tabSize": 4,
+                                    "insertSpaces": true
+                                }
+                            }
+                        });
+                        let _ = send_lsp_message(&mut stdin, &fmt_req).await;
+                    }
+                    Some(LspInbound::CodeAction { line, col, diagnostics, req_id }) => {
+                        pending_requests.insert(req_id, "codeAction");
+                        let diag_json: Vec<Value> = diagnostics
+                            .into_iter()
+                            .map(|d| {
+                                serde_json::json!({
+                                    "range": {
+                                        "start": { "line": d.line, "character": d.col },
+                                        "end": { "line": d.line, "character": d.col + 1 }
+                                    },
+                                    "message": d.message,
+                                    "severity": d.severity
+                                })
+                            })
+                            .collect();
+
+                        let ca_req = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "method": "textDocument/codeAction",
+                            "params": {
+                                "textDocument": { "uri": current_file_uri },
+                                "range": {
+                                    "start": { "line": line, "character": col },
+                                    "end": { "line": line, "character": col }
+                                },
+                                "context": {
+                                    "diagnostics": diag_json
+                                }
+                            }
+                        });
+                        let _ = send_lsp_message(&mut stdin, &ca_req).await;
+                    }
+                    Some(LspInbound::Rename { line, col, new_name, req_id }) => {
+                        pending_requests.insert(req_id, "rename");
+                        let rn_req = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "method": "textDocument/rename",
+                            "params": {
+                                "textDocument": { "uri": current_file_uri },
+                                "position": { "line": line, "character": col },
+                                "newName": new_name
+                            }
+                        });
+                        let _ = send_lsp_message(&mut stdin, &rn_req).await;
+                    }
+                    Some(LspInbound::DocumentSymbol { req_id }) => {
+                        pending_requests.insert(req_id, "documentSymbol");
+                        let ds_req = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "method": "textDocument/documentSymbol",
+                            "params": {
+                                "textDocument": { "uri": current_file_uri }
+                            }
+                        });
+                        let _ = send_lsp_message(&mut stdin, &ds_req).await;
+                    }
                     Some(LspInbound::OpenFile { path, text, lang_id }) => {
                         let new_uri = file_to_uri(&path);
                         if new_uri != current_file_uri {
@@ -803,6 +1452,8 @@ pub async fn run_lsp_actor(
                                     serde_json::json!([])
                                 } else if method == "workspace/workspaceFolders" {
                                     serde_json::json!([{ "uri": root_uri, "name": "root" }])
+                                } else if method == "workspace/applyEdit" {
+                                    serde_json::json!({ "applied": true })
                                 } else {
                                     Value::Null
                                 }
@@ -918,6 +1569,122 @@ pub async fn run_lsp_actor(
                                     let _ = tx.send(LspOutbound::Completions {
                                         req_id: resp_id,
                                         items: results,
+                                    });
+                                }
+                                "inlayHints" => {
+                                    let mut hints = Vec::new();
+                                    if let Some(arr) = result_val.and_then(Value::as_array) {
+                                        for h_val in arr {
+                                            if let Some(hint) = parse_inlay_hint(h_val) {
+                                                hints.push(hint);
+                                            }
+                                        }
+                                    }
+                                    let _ = tx.send(LspOutbound::InlayHints {
+                                        req_id: resp_id,
+                                        hints,
+                                    });
+                                }
+                                "hover" => {
+                                    let hover = result_val.and_then(parse_hover);
+                                    let _ = tx.send(LspOutbound::Hover {
+                                        req_id: resp_id,
+                                        hover,
+                                    });
+                                }
+                                "signatureHelp" => {
+                                    let help = result_val.and_then(parse_signature_help);
+                                    let _ = tx.send(LspOutbound::SignatureHelp {
+                                        req_id: resp_id,
+                                        help,
+                                    });
+                                }
+                                "definition" => {
+                                    let mut locations = Vec::new();
+                                    if let Some(arr) = result_val.and_then(Value::as_array) {
+                                        for v in arr {
+                                            if let Some(loc) = parse_raw_location(v) {
+                                                locations.push(loc);
+                                            }
+                                        }
+                                    } else if let Some(v) = result_val {
+                                        if let Some(loc) = parse_raw_location(v) {
+                                            locations.push(loc);
+                                        }
+                                    }
+                                    let _ = tx.send(LspOutbound::Definition {
+                                        req_id: resp_id,
+                                        locations,
+                                    });
+                                }
+                                "references" => {
+                                    let mut locations = Vec::new();
+                                    if let Some(arr) = result_val.and_then(Value::as_array) {
+                                        for v in arr {
+                                            if let Some(loc) = parse_raw_location(v) {
+                                                locations.push(loc);
+                                            }
+                                        }
+                                    }
+                                    let _ = tx.send(LspOutbound::References {
+                                        req_id: resp_id,
+                                        locations,
+                                    });
+                                }
+                                "formatting" => {
+                                    let mut edits = Vec::new();
+                                    if let Some(arr) = result_val.and_then(Value::as_array) {
+                                        for v in arr {
+                                            if let Some(edit) = parse_text_edit(v) {
+                                                edits.push(edit);
+                                            }
+                                        }
+                                    }
+                                    let _ = tx.send(LspOutbound::Formatting {
+                                        req_id: resp_id,
+                                        edits,
+                                    });
+                                }
+                                "codeAction" => {
+                                    let mut actions = Vec::new();
+                                    if let Some(arr) = result_val.and_then(Value::as_array) {
+                                        for v in arr {
+                                            let title = v.get("title").and_then(Value::as_str).unwrap_or("").to_string();
+                                            if title.is_empty() {
+                                                continue;
+                                            }
+                                            let kind = v.get("kind").and_then(Value::as_str).map(ToString::to_string);
+                                            let is_preferred = v.get("isPreferred").and_then(Value::as_bool).unwrap_or(false);
+                                            let edits = v.get("edit").map_or_else(HashMap::new, parse_workspace_edit);
+
+                                            actions.push(CodeActionItem {
+                                                title,
+                                                kind,
+                                                is_preferred,
+                                                edits,
+                                            });
+                                        }
+                                    }
+                                    let _ = tx.send(LspOutbound::CodeActions {
+                                        req_id: resp_id,
+                                        actions,
+                                    });
+                                }
+                                "rename" => {
+                                    let changes = result_val.map_or_else(HashMap::new, parse_workspace_edit);
+                                    let _ = tx.send(LspOutbound::Rename {
+                                        req_id: resp_id,
+                                        changes,
+                                    });
+                                }
+                                "documentSymbol" => {
+                                    let mut symbols = Vec::new();
+                                    if let Some(v) = result_val {
+                                        parse_document_symbols_recursive(v, None, &mut symbols);
+                                    }
+                                    let _ = tx.send(LspOutbound::DocumentSymbols {
+                                        req_id: resp_id,
+                                        symbols,
                                     });
                                 }
                                 _ => {}
@@ -2419,6 +3186,33 @@ pub fn completion_kind_icon(kind: u64) -> (&'static str, Color) {
         7 | 8 => ("󱡠", Color::Rgb(120, 160, 255)),
         9 => ("󰏗", Color::Rgb(140, 220, 120)),
         14 => ("󰌆", Color::Rgb(220, 110, 240)),
+        _ => ("󰈚", Color::Rgb(170, 175, 190)),
+    }
+}
+
+pub fn symbol_kind_icon(kind: u64) -> (&'static str, Color) {
+    match kind {
+        1 => ("󰅩", Color::Rgb(120, 160, 255)),  // File
+        2 => ("󰏗", Color::Rgb(220, 140, 80)),   // Module
+        3 => ("󰅲", Color::Rgb(150, 166, 200)),  // Namespace
+        4 => ("󰏗", Color::Rgb(220, 140, 80)),   // Package
+        5 => ("󰌗", Color::Rgb(240, 180, 70)),   // Class
+        6 => ("󰊕", Color::Rgb(80, 200, 240)),   // Method
+        7 => ("󰫧", Color::Rgb(250, 210, 90)),   // Property
+        8 => ("󰫧", Color::Rgb(250, 210, 90)),   // Field
+        9 => ("󰊕", Color::Rgb(80, 200, 240)),   // Constructor
+        10 => ("󰌗", Color::Rgb(240, 180, 70)),  // Enum
+        11 => ("󰌗", Color::Rgb(150, 166, 200)), // Interface
+        12 => ("󰊕", Color::Rgb(80, 200, 240)),  // Function
+        13 => ("󱡠", Color::Rgb(228, 228, 228)), // Variable
+        14 => ("󰌆", Color::Rgb(255, 221, 51)),  // Constant
+        15 => ("󰈙", Color::Rgb(115, 201, 54)),  // String
+        16 => ("󰎠", Color::Rgb(149, 169, 159)), // Number
+        17 => ("󰨚", Color::Rgb(255, 221, 51)),  // Boolean
+        18 => ("󰅲", Color::Rgb(150, 166, 200)), // Array
+        23 => ("󰌗", Color::Rgb(240, 180, 70)),  // Struct
+        25 => ("󰊕", Color::Rgb(220, 110, 240)), // Operator
+        26 => ("󰌗", Color::Rgb(149, 169, 159)), // TypeParameter
         _ => ("󰈚", Color::Rgb(170, 175, 190)),
     }
 }

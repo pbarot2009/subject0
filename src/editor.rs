@@ -4,17 +4,19 @@
 //!
 //! 1. **Text Storage & Mutability ([`ropey::Rope`])**:
 //!    Buffer contents are stored as a chunked, reference-counted B-tree rope with $O(\log N)$
-//!    mutations and $O(1)$ copy-on-write structural sharing for undo/redo snapshots.
+//!    mutations and $O(1)$ copy-on-write structural sharing for undo/redo snapshots[span_0](start_span)[span_0](end_span).
 //!
 //! 2. **Modal Editing State Machine ([`Mode`])**:
-//!    Implements modal key semantics across `Normal`, `Insert`, `Command`, and `Visual` states.
+//!    Implements modal key semantics across `Normal`, `Insert`, `Command`, and `Visual` states[span_1](start_span)[span_1](end_span).
 //!
-//! 3. **Theming & Visual Customization**:
-//!    Maintains active [`Theme`] state and persists user color scheme choices to `.subject0`.
+//! 3. **Full Language Server Protocol (LSP) State Integration**:
+//!    Maintains real-time caches and dispatchers for Inlay Hints (inferred types & parameter names),
+//!    Floating Markdown Hover Cards, Signature Help, Go to Definition & References, Workspace/Document
+//!    Formatting edits, Code Action Quickfixes, Symbol Search, and Identifier Renaming.
 //!
-//! 4. **Incremental Syntax Engine, Diagnostics Sync & Data Protection**:
+//! 4. **Theming, Diagnostics Sync & Data Protection**:
 //!    Maintains AST highlighting trees, shifts diagnostic positions on row mutations,
-//!    tracks a bidirectional undo/redo ring, and protects unsaved buffers against file explorer wipes.
+//!    tracks a bidirectional undo/redo ring, and protects unsaved buffers against file explorer wipes[span_2](start_span)[span_2](end_span).
 
 use std::{
     collections::{HashMap, HashSet},
@@ -25,23 +27,25 @@ use std::{
 };
 
 use crate::lsp::{
-    DiagnosticItem, LspInbound, LspOutbound, LspStatus, SuggestionItem, SyntaxEngine,
-    run_lsp_actor, subject0_config_dir,
+    char_to_utf16_col, run_lsp_actor, subject0_config_dir, utf16_to_char_col, CodeActionItem,
+    DiagnosticItem, HoverInfo, InlayHintItem, LocationItem, LspInbound, LspOutbound, LspStatus,
+    SignatureHelpInfo, SuggestionItem, SymbolItem, SyntaxEngine, TextEditItem,
 };
 use crate::theme::Theme;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use ropey::Rope;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-/// Persistent editor configuration stored in `.subject0`.
+/// Persistent editor configuration stored in `.subject0`[span_3](start_span)[span_3](end_span).
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     pub preferred_lsps: HashMap<String, String>,
     pub line_wrap: bool,
     pub theme: String,
-    /// Resolved absolute path to the `.subject0` configuration file.
+    pub show_inlay_hints: bool,
+    /// Resolved absolute path to the `.subject0` configuration file[span_4](start_span)[span_4](end_span).
     pub source_path: PathBuf,
 }
 
@@ -72,6 +76,7 @@ impl AppConfig {
         let mut preferred_lsps = HashMap::new();
         let mut line_wrap = true;
         let mut theme = "gruber-darker".to_string();
+        let mut show_inlay_hints = true;
 
         if let Ok(content) = fs::read_to_string(&path) {
             if let Ok(val) = serde_json::from_str::<Value>(&content) {
@@ -88,6 +93,9 @@ impl AppConfig {
                 if let Some(t) = val.get("theme").and_then(Value::as_str) {
                     theme = t.to_string();
                 }
+                if let Some(ih) = val.get("show_inlay_hints").and_then(Value::as_bool) {
+                    show_inlay_hints = ih;
+                }
             }
         }
 
@@ -95,6 +103,7 @@ impl AppConfig {
             preferred_lsps,
             line_wrap,
             theme,
+            show_inlay_hints,
             source_path: path,
         }
     }
@@ -114,11 +123,13 @@ impl AppConfig {
             obj.insert("preferred_lsps".to_string(), json!(self.preferred_lsps));
             obj.insert("line_wrap".to_string(), json!(self.line_wrap));
             obj.insert("theme".to_string(), json!(self.theme));
+            obj.insert("show_inlay_hints".to_string(), json!(self.show_inlay_hints));
         } else {
             val = json!({
                 "preferred_lsps": self.preferred_lsps,
                 "line_wrap": self.line_wrap,
                 "theme": self.theme,
+                "show_inlay_hints": self.show_inlay_hints,
             });
         }
 
@@ -130,19 +141,57 @@ impl AppConfig {
     }
 }
 
-/// Interactive modal state when choosing from available color themes.
+/// Interactive modal state when choosing from available color themes[span_5](start_span)[span_5](end_span).
 pub struct ThemePicker {
     pub selected_idx: usize,
 }
 
-/// Interactive modal state when multiple language servers are detected for a language.
+/// Interactive modal state when multiple language servers are detected for a language[span_6](start_span)[span_6](end_span).
 pub struct LspPicker {
     pub language_id: String,
     pub candidates: Vec<String>,
     pub selected_idx: usize,
 }
 
-/// Active modal editing state.
+/// Interactive modal state when choosing a Code Action / Quickfix.
+pub struct CodeActionPicker {
+    pub actions: Vec<CodeActionItem>,
+    pub selected_idx: usize,
+}
+
+/// Interactive modal state for fuzzy symbol search across document outlines.
+pub struct SymbolPicker {
+    pub symbols: Vec<SymbolItem>,
+    pub query: String,
+    pub selected_idx: usize,
+    pub scroll: usize,
+}
+
+impl SymbolPicker {
+    pub fn filtered_symbols(&self) -> Vec<&SymbolItem> {
+        let q = self.query.to_lowercase();
+        self.symbols
+            .iter()
+            .filter(|s| {
+                q.is_empty()
+                    || s.name.to_lowercase().contains(&q)
+                    || s.container_name
+                        .as_deref()
+                        .is_some_and(|c| c.to_lowercase().contains(&q))
+            })
+            .collect()
+    }
+}
+
+/// Interactive modal state when choosing from multiple definition or reference locations.
+pub struct LocationPicker {
+    pub title: &'static str,
+    pub locations: Vec<LocationItem>,
+    pub selected_idx: usize,
+    pub scroll: usize,
+}
+
+/// Active modal editing state[span_7](start_span)[span_7](end_span).
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum Mode {
     Normal,
@@ -151,7 +200,7 @@ pub enum Mode {
     Visual { anchor_x: usize, anchor_y: usize },
 }
 
-/// Identifies which viewport element currently holds keyboard input focus.
+/// Identifies which viewport element currently holds keyboard input focus[span_8](start_span)[span_8](end_span).
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum Focus {
     Editor,
@@ -185,6 +234,15 @@ pub enum CommandId {
     SelectTheme,
     SaveConfig,
     ShowHelp,
+    // LSP-Powered Capabilities
+    FormatDocument,
+    RenameSymbol,
+    ShowHover,
+    CodeActions,
+    DocumentSymbols,
+    GoToDefinition,
+    FindReferences,
+    ToggleInlayHints,
 }
 
 #[derive(Clone)]
@@ -196,6 +254,54 @@ pub struct PaletteCommand {
 }
 
 pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
+    PaletteCommand {
+        title: "Format Document (LSP)",
+        shortcut: ":fmt / Alt-F",
+        icon: "󰉠",
+        id: CommandId::FormatDocument,
+    },
+    PaletteCommand {
+        title: "Show Documentation / Type Hover",
+        shortcut: "K / :hover",
+        icon: "󰋽",
+        id: CommandId::ShowHover,
+    },
+    PaletteCommand {
+        title: "Code Actions & Quickfixes",
+        shortcut: "ga / :ca",
+        icon: "󰌵",
+        id: CommandId::CodeActions,
+    },
+    PaletteCommand {
+        title: "Go to Definition",
+        shortcut: "gd",
+        icon: "󰌹",
+        id: CommandId::GoToDefinition,
+    },
+    PaletteCommand {
+        title: "Find References",
+        shortcut: "gr",
+        icon: "󰌷",
+        id: CommandId::FindReferences,
+    },
+    PaletteCommand {
+        title: "Rename Symbol",
+        shortcut: ":rn / F2",
+        icon: "󰑕",
+        id: CommandId::RenameSymbol,
+    },
+    PaletteCommand {
+        title: "Document Symbol Outline",
+        shortcut: ":symbols / :sym",
+        icon: "󰅩",
+        id: CommandId::DocumentSymbols,
+    },
+    PaletteCommand {
+        title: "Toggle Inferred Type & Param Inlay Hints",
+        shortcut: ":hints",
+        icon: "󰌵",
+        id: CommandId::ToggleInlayHints,
+    },
     PaletteCommand {
         title: "Select All Buffer",
         shortcut: "%",
@@ -399,7 +505,7 @@ impl FileExplorer {
         explorer
     }
 
-    /// Refreshes the explorer tree while preserving expanded folders across refreshes.
+    /// Refreshes the explorer tree while preserving expanded folders across refreshes[span_9](start_span)[span_9](end_span).
     pub fn refresh(&mut self) {
         let expanded_paths: HashSet<PathBuf> = self
             .entries
@@ -609,6 +715,17 @@ pub struct Editor {
     pub completion_rect: Option<(u16, u16, u16, u16)>,
     pub active_lsp_lang: Option<String>,
 
+    // LSP Extended Intelligence State
+    pub inlay_hints: Vec<InlayHintItem>,
+    pub show_inlay_hints: bool,
+    pub hover_info: Option<HoverInfo>,
+    pub hover_scroll: usize,
+    pub signature_help: Option<SignatureHelpInfo>,
+    pub code_action_picker: Option<CodeActionPicker>,
+    pub symbol_picker: Option<SymbolPicker>,
+    pub location_picker: Option<LocationPicker>,
+    pub rename_prompt: Option<String>,
+
     // Subsystems
     pub explorer: FileExplorer,
     pub palette: CommandPalette,
@@ -661,6 +778,7 @@ impl Editor {
 
         let config = AppConfig::load_from(&root_dir);
         let initial_wrap = config.line_wrap;
+        let initial_hints = config.show_inlay_hints;
         let theme = Theme::from_name(&config.theme);
 
         Ok(Self {
@@ -706,6 +824,17 @@ impl Editor {
             completion_visible: false,
             completion_rect: None,
             active_lsp_lang: None,
+
+            inlay_hints: Vec::new(),
+            show_inlay_hints: initial_hints,
+            hover_info: None,
+            hover_scroll: 0,
+            signature_help: None,
+            code_action_picker: None,
+            symbol_picker: None,
+            location_picker: None,
+            rename_prompt: None,
+
             explorer,
             palette: CommandPalette::new(),
             show_help: false,
@@ -714,7 +843,7 @@ impl Editor {
         })
     }
 
-    /// Switches the active color theme and writes it to `.subject0`.
+    /// Switches the active color theme and writes it to `.subject0`[span_10](start_span)[span_10](end_span).
     pub fn set_theme(&mut self, theme_name: &str) {
         self.theme = Theme::from_name(theme_name);
         self.config.theme = self.theme.name.to_string();
@@ -755,18 +884,11 @@ impl Editor {
         if self.cursor_y >= self.rope.len_lines() {
             return 0;
         }
-        let line = self.rope.line(self.cursor_y);
-        let mut utf16_count = 0;
-        for (char_idx, ch) in line.chars().enumerate() {
-            if char_idx >= self.cursor_x {
-                break;
-            }
-            utf16_count += ch.len_utf16();
-        }
-        utf16_count
+        let line = self.rope.line(self.cursor_y).to_string();
+        char_to_utf16_col(&line, self.cursor_x)
     }
 
-    /// Loads a new file from disk into the current editor buffer, protecting against unsaved modifications.
+    /// Loads a new file from disk into the current editor buffer, protecting against unsaved modifications[span_11](start_span)[span_11](end_span).
     pub fn open_file<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
         if self.modified {
             return Err(anyhow!(
@@ -789,6 +911,9 @@ impl Editor {
         self.insert_snapshot_taken = false;
         self.diagnostics.clear();
         self.completion_visible = false;
+        self.inlay_hints.clear();
+        self.hover_info = None;
+        self.signature_help = None;
 
         self.syntax = SyntaxEngine::new(Some(&path_buf));
         let text = self.rope.to_string();
@@ -805,6 +930,7 @@ impl Editor {
                         lang_id: lang_id.to_string(),
                     });
                     self.request_semantic_tokens();
+                    self.request_inlay_hints();
                 }
             } else {
                 self.ensure_lsp_for_file(&path_buf);
@@ -843,6 +969,7 @@ impl Editor {
                         lang_id: lang_id.to_string(),
                     });
                     self.request_semantic_tokens();
+                    self.request_inlay_hints();
                 }
             } else {
                 self.ensure_lsp_for_file(&abs_path);
@@ -922,7 +1049,219 @@ impl Editor {
         }
     }
 
-    /// Pushes current buffer state into the undo stack and clears redo history.
+    pub fn request_inlay_hints(&mut self) {
+        if !self.show_inlay_hints {
+            return;
+        }
+        if let Some(tx) = &self.lsp_tx {
+            self.lsp_req_id += 1;
+            let _ = tx.send(LspInbound::InlayHints {
+                req_id: self.lsp_req_id,
+                max_lines: self.rope.len_lines(),
+            });
+        }
+    }
+
+    pub fn request_hover(&mut self) {
+        if let Some(tx) = &self.lsp_tx {
+            self.lsp_req_id += 1;
+            let col = self.cursor_utf16_col();
+            let _ = tx.send(LspInbound::Hover {
+                line: self.cursor_y,
+                col,
+                req_id: self.lsp_req_id,
+            });
+            self.status_msg = "Fetching hover docs…".to_string();
+        }
+    }
+
+    pub fn request_signature_help(&mut self) {
+        if let Some(tx) = &self.lsp_tx {
+            self.lsp_req_id += 1;
+            let col = self.cursor_utf16_col();
+            let _ = tx.send(LspInbound::SignatureHelp {
+                line: self.cursor_y,
+                col,
+                req_id: self.lsp_req_id,
+            });
+        }
+    }
+
+    pub fn request_definition(&mut self) {
+        if let Some(tx) = &self.lsp_tx {
+            self.lsp_req_id += 1;
+            let col = self.cursor_utf16_col();
+            let _ = tx.send(LspInbound::Definition {
+                line: self.cursor_y,
+                col,
+                req_id: self.lsp_req_id,
+            });
+            self.status_msg = "Finding definition…".to_string();
+        }
+    }
+
+    pub fn request_references(&mut self) {
+        if let Some(tx) = &self.lsp_tx {
+            self.lsp_req_id += 1;
+            let col = self.cursor_utf16_col();
+            let _ = tx.send(LspInbound::References {
+                line: self.cursor_y,
+                col,
+                req_id: self.lsp_req_id,
+            });
+            self.status_msg = "Searching references…".to_string();
+        }
+    }
+
+    pub fn request_formatting(&mut self) {
+        if let Some(tx) = &self.lsp_tx {
+            self.lsp_req_id += 1;
+            let _ = tx.send(LspInbound::Formatting {
+                req_id: self.lsp_req_id,
+            });
+            self.status_msg = "Formatting buffer with LSP…".to_string();
+        }
+    }
+
+    pub fn request_code_actions(&mut self) {
+        if let Some(tx) = &self.lsp_tx {
+            self.lsp_req_id += 1;
+            let col = self.cursor_utf16_col();
+            let cur_y = self.cursor_y;
+            let diags: Vec<DiagnosticItem> = self
+                .diagnostics
+                .iter()
+                .filter(|d| d.line == cur_y)
+                .cloned()
+                .collect();
+
+            let _ = tx.send(LspInbound::CodeAction {
+                line: cur_y,
+                col,
+                diagnostics: diags,
+                req_id: self.lsp_req_id,
+            });
+            self.status_msg = "Querying code actions…".to_string();
+        }
+    }
+
+    pub fn request_rename(&mut self, new_name: &str) {
+        if new_name.trim().is_empty() {
+            self.status_msg = "Rename aborted: empty identifier name".to_string();
+            return;
+        }
+        if let Some(tx) = &self.lsp_tx {
+            self.lsp_req_id += 1;
+            let col = self.cursor_utf16_col();
+            let _ = tx.send(LspInbound::Rename {
+                line: self.cursor_y,
+                col,
+                new_name: new_name.to_string(),
+                req_id: self.lsp_req_id,
+            });
+            self.status_msg = format!("Renaming to '{new_name}'…");
+        }
+    }
+
+    pub fn request_document_symbols(&mut self) {
+        if let Some(tx) = &self.lsp_tx {
+            self.lsp_req_id += 1;
+            let _ = tx.send(LspInbound::DocumentSymbol {
+                req_id: self.lsp_req_id,
+            });
+            self.status_msg = "Loading document symbols…".to_string();
+        }
+    }
+
+    /// Converts an LSP position (0-based line, UTF-16 character column) into a character index.
+    fn lsp_pos_to_char_index(rope: &Rope, line: usize, utf16_col: usize) -> usize {
+        let total_lines = rope.len_lines();
+        if line >= total_lines {
+            return rope.len_chars();
+        }
+
+        let line_start_char = rope.line_to_char(line);
+        let line_slice = rope.line(line);
+        let line_str = line_slice.to_string();
+        let char_offset = utf16_to_char_col(&line_str, utf16_col);
+
+        (line_start_char + char_offset).min(rope.len_chars())
+    }
+
+    /// Applies a collection of LSP text edits cleanly to the rope buffer.
+    ///
+    /// Edits are sorted in descending order by character position so earlier offsets
+    /// remain invariant while subsequent edits mutate the buffer.
+    pub fn apply_text_edits(&mut self, edits: &[TextEditItem]) {
+        if edits.is_empty() {
+            return;
+        }
+
+        self.snapshot();
+
+        let mut indexed_edits: Vec<(usize, usize, &str)> = edits
+            .iter()
+            .map(|e| {
+                let start_idx = Self::lsp_pos_to_char_index(&self.rope, e.start_line, e.start_col);
+                let end_idx = Self::lsp_pos_to_char_index(&self.rope, e.end_line, e.end_col);
+                (start_idx, end_idx, e.new_text.as_str())
+            })
+            .collect();
+
+        // Sort descending: highest start index first, then highest end index
+        indexed_edits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+
+        for (start_idx, end_idx, new_text) in indexed_edits {
+            let safe_start = start_idx.min(self.rope.len_chars());
+            let safe_end = end_idx.max(safe_start).min(self.rope.len_chars());
+
+            if safe_start < safe_end {
+                self.rope.remove(safe_start..safe_end);
+            }
+            if !new_text.is_empty() {
+                self.rope.insert(safe_start, new_text);
+            }
+        }
+
+        self.modified = true;
+        self.clamp_cursor();
+        self.on_buffer_modified();
+    }
+
+    /// Jumps directly to a target location (file, line, col), opening the target if external.
+    pub fn jump_to_location(&mut self, loc: LocationItem) {
+        let is_current = self
+            .path
+            .as_ref()
+            .is_some_and(|p| p.canonicalize().ok() == loc.path.canonicalize().ok());
+
+        if is_current {
+            self.cursor_y = loc.line.min(self.rope.len_lines().saturating_sub(1));
+            let line_str = self.rope.line(self.cursor_y).to_string();
+            self.cursor_x = utf16_to_char_col(&line_str, loc.col);
+            self.clamp_cursor();
+            self.status_msg = format!("Jumped to line {}", self.cursor_y + 1);
+        } else {
+            match self.open_file(&loc.path) {
+                Ok(()) => {
+                    self.cursor_y = loc.line.min(self.rope.len_lines().saturating_sub(1));
+                    let line_str = self.rope.line(self.cursor_y).to_string();
+                    self.cursor_x = utf16_to_char_col(&line_str, loc.col);
+                    self.clamp_cursor();
+                    self.status_msg = format!(
+                        "Opened {} at line {}",
+                        loc.path.file_name().unwrap_or_default().to_string_lossy(),
+                        self.cursor_y + 1
+                    );
+                }
+                Err(e) => {
+                    self.status_msg = format!("Failed to jump to {}: {e}", loc.path.display());
+                }
+            }
+        }
+    }
+
+    /// Pushes current buffer state into the undo stack and clears redo history[span_12](start_span)[span_12](end_span).
     pub fn snapshot(&mut self) {
         if self.undo_stack.len() >= 64 {
             self.undo_stack.remove(0);
@@ -936,7 +1275,7 @@ impl Editor {
         self.redo_stack.clear();
     }
 
-    /// Reverts the document rope to the most recent checkpoint on `undo_stack`.
+    /// Reverts the document rope to the most recent checkpoint on `undo_stack`[span_13](start_span)[span_13](end_span).
     pub fn undo(&mut self) {
         if let Some(prev) = self.undo_stack.pop() {
             if self.redo_stack.len() >= 64 {
@@ -961,7 +1300,7 @@ impl Editor {
         }
     }
 
-    /// Steps forward through historical edits using `redo_stack`.
+    /// Steps forward through historical edits using `redo_stack`[span_14](start_span)[span_14](end_span).
     pub fn redo(&mut self) {
         if let Some(next) = self.redo_stack.pop() {
             if self.undo_stack.len() >= 64 {
@@ -987,7 +1326,7 @@ impl Editor {
         }
     }
 
-    /// Shifts diagnostic coordinates down when lines are added strictly below them.
+    /// Shifts diagnostic coordinates down when lines are added strictly below them[span_15](start_span)[span_15](end_span).
     fn shift_diagnostics_down(&mut self, after_line: usize, count: usize) {
         for d in &mut self.diagnostics {
             if d.line > after_line {
@@ -996,7 +1335,7 @@ impl Editor {
         }
     }
 
-    /// Shifts diagnostic coordinates down when lines are inserted at or above them.
+    /// Shifts diagnostic coordinates down when lines are inserted at or above them[span_16](start_span)[span_16](end_span).
     fn shift_diagnostics_down_from(&mut self, from_line: usize, count: usize) {
         for d in &mut self.diagnostics {
             if d.line >= from_line {
@@ -1005,7 +1344,7 @@ impl Editor {
         }
     }
 
-    /// Shifts diagnostic coordinates up when a line above them is removed.
+    /// Shifts diagnostic coordinates up when a line above them is removed[span_17](start_span)[span_17](end_span).
     fn shift_diagnostics_up(&mut self, removed_line: usize) {
         self.diagnostics.retain(|d| d.line != removed_line);
         for d in &mut self.diagnostics {
@@ -1029,6 +1368,7 @@ impl Editor {
                 version: self.doc_version,
             });
             self.request_semantic_tokens();
+            self.request_inlay_hints();
         }
     }
 
@@ -1485,7 +1825,7 @@ impl Editor {
         self.on_buffer_modified();
     }
 
-    /// Dedents current line by up to 4 spaces or 1 tab.
+    /// Dedents current line by up to 4 spaces or 1 tab[span_18](start_span)[span_18](end_span).
     pub fn dedent_current_line(&mut self) {
         if self.cursor_y >= self.rope.len_lines() {
             return;
@@ -1689,6 +2029,7 @@ impl Editor {
             if let Some(tx) = &self.lsp_tx {
                 let _ = tx.send(LspInbound::Save);
                 self.request_semantic_tokens();
+                self.request_inlay_hints();
             }
             Ok(())
         } else {
@@ -1700,6 +2041,27 @@ impl Editor {
     pub fn execute_palette_command(&mut self, id: CommandId) {
         self.palette.visible = false;
         match id {
+            CommandId::FormatDocument => self.request_formatting(),
+            CommandId::ShowHover => self.request_hover(),
+            CommandId::CodeActions => self.request_code_actions(),
+            CommandId::GoToDefinition => self.request_definition(),
+            CommandId::FindReferences => self.request_references(),
+            CommandId::DocumentSymbols => self.request_document_symbols(),
+            CommandId::RenameSymbol => {
+                self.rename_prompt = Some(self.current_word_prefix());
+            }
+            CommandId::ToggleInlayHints => {
+                self.show_inlay_hints = !self.show_inlay_hints;
+                self.config.show_inlay_hints = self.show_inlay_hints;
+                let _ = self.config.save();
+                if self.show_inlay_hints {
+                    self.request_inlay_hints();
+                    self.status_msg = "Inlay Hints: ON".to_string();
+                } else {
+                    self.inlay_hints.clear();
+                    self.status_msg = "Inlay Hints: OFF".to_string();
+                }
+            }
             CommandId::SelectAll => self.select_all(),
             CommandId::ToggleExplorer => {
                 self.explorer.visible = !self.explorer.visible;
@@ -1785,6 +2147,7 @@ impl Editor {
             CommandId::SaveConfig => {
                 self.config.line_wrap = self.line_wrap;
                 self.config.theme = self.theme.name.to_string();
+                self.config.show_inlay_hints = self.show_inlay_hints;
                 if self.config.save().is_ok() {
                     self.status_msg = "Config saved to .subject0".to_string();
                 } else {
@@ -1840,6 +2203,43 @@ impl Editor {
                 self.status_msg =
                     format!("Line Wrap: {}", if self.line_wrap { "ON" } else { "OFF" });
             }
+            "fmt" | "format" => {
+                self.request_formatting();
+            }
+            "hover" | "doc" => {
+                self.request_hover();
+            }
+            "ca" | "action" | "codeaction" => {
+                self.request_code_actions();
+            }
+            "sym" | "symbols" => {
+                self.request_document_symbols();
+            }
+            "def" | "definition" => {
+                self.request_definition();
+            }
+            "ref" | "references" => {
+                self.request_references();
+            }
+            "hints" | "inlay" => {
+                self.show_inlay_hints = !self.show_inlay_hints;
+                self.config.show_inlay_hints = self.show_inlay_hints;
+                let _ = self.config.save();
+                if self.show_inlay_hints {
+                    self.request_inlay_hints();
+                    self.status_msg = "Inlay Hints: ON".to_string();
+                } else {
+                    self.inlay_hints.clear();
+                    self.status_msg = "Inlay Hints: OFF".to_string();
+                }
+            }
+            "rn" | "rename" => {
+                if let Some(name) = arg.filter(|s| !s.is_empty()) {
+                    self.request_rename(name);
+                } else {
+                    self.rename_prompt = Some(self.current_word_prefix());
+                }
+            }
             "theme" | "colorscheme" => {
                 if let Some(name) = arg.filter(|s| !s.is_empty()) {
                     self.set_theme(name);
@@ -1870,6 +2270,7 @@ impl Editor {
             "cfg" => {
                 self.config.line_wrap = self.line_wrap;
                 self.config.theme = self.theme.name.to_string();
+                self.config.show_inlay_hints = self.show_inlay_hints;
                 if self.config.save().is_ok() {
                     self.status_msg = "Config saved to .subject0".to_string();
                 } else {
@@ -1920,7 +2321,7 @@ impl Editor {
         }
     }
 
-    /// Fast $O(1)$ linear viewport updater that guarantees instant response on large files.
+    /// Fast $O(1)$ linear viewport updater that guarantees instant response on large files[span_19](start_span)[span_19](end_span).
     pub fn update_scroll(&mut self, width: usize, height: usize) {
         if height == 0 || width == 0 {
             return;

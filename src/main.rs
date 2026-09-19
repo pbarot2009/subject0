@@ -2,7 +2,9 @@
 //!
 //! This module serves as the runtime orchestrator for `subject0`. It integrates the
 //! terminal lifecycle, asynchronous event multiplexing, input decoding, themed frame
-//! rendering, and modal subsystem coordination.
+//! rendering, and modal subsystem coordination for full Language Server Protocol (LSP)
+//! intelligence (inferred types & parameter inlay hints, hover docs, signature assistance,
+//! definition jumps, formatting, code actions, and symbol outlines)[span_0](start_span)[span_0](end_span).
 
 mod cmd;
 mod editor;
@@ -11,7 +13,7 @@ mod theme;
 
 use std::{
     cmp::Ordering,
-    io::{Write, stdout},
+    io::{stdout, Write},
     time::Duration,
 };
 
@@ -24,24 +26,29 @@ use crossterm::{
         KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
-    Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Position, Rect, Size},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
+    Frame, Terminal,
 };
 use tokio::sync::mpsc;
 
-use editor::{Editor, Focus, Mode};
-use lsp::{LspOutbound, LspStatus, SuggestionItem, completion_kind_icon, file_icon_and_color};
+use editor::{
+    line_len, CodeActionPicker, Editor, Focus, LocationPicker, Mode, SymbolPicker, ThemePicker,
+};
+use lsp::{
+    completion_kind_icon, file_icon_and_color, symbol_kind_icon, utf16_to_char_col, InlayHintType,
+    LocationItem, LspOutbound, LspStatus, SuggestionItem,
+};
 use theme::Theme;
 
 /// RAII Terminal Guard ensuring the host terminal is reliably restored
-/// to canonical mode regardless of exit status.
+/// to canonical mode regardless of exit status[span_1](start_span)[span_1](end_span).
 struct TerminalGuard;
 
 impl TerminalGuard {
@@ -63,21 +70,21 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// Configures the terminal hardware cursor geometry based on the active modal editing state.
+/// Configures the terminal hardware cursor geometry based on the active modal editing state[span_2](start_span)[span_2](end_span).
 fn set_terminal_cursor_style(mode: Mode) {
     let mut stdout = stdout();
     match mode {
         Mode::Normal | Mode::Command | Mode::Visual { .. } => {
-            let _ = stdout.write_all(b"\x1b[2 q"); // Steady Block
+            let _ = stdout.write_all(b"\x1b[2 q"); // Steady Block[span_3](start_span)[span_3](end_span)
         }
         Mode::Insert => {
-            let _ = stdout.write_all(b"\x1b[6 q"); // Steady Bar / I-Beam
+            let _ = stdout.write_all(b"\x1b[6 q"); // Steady Bar / I-Beam[span_4](start_span)[span_4](end_span)
         }
     }
     let _ = stdout.flush();
 }
 
-/// Registers a secondary panic hook ensuring screen recovery during thread unwinding.
+/// Registers a secondary panic hook ensuring screen recovery during thread unwinding[span_5](start_span)[span_5](end_span).
 fn setup_panic_hook() {
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -90,7 +97,7 @@ fn setup_panic_hook() {
     }));
 }
 
-/// Safely truncates a string by Unicode scalar count without slicing mid-codepoint.
+/// Safely truncates a string by Unicode scalar count without slicing mid-codepoint[span_6](start_span)[span_6](end_span).
 fn safe_truncate(s: &str, max_chars: usize) -> String {
     if s.chars().count() > max_chars {
         let mut result: String = s.chars().take(max_chars.saturating_sub(1)).collect();
@@ -99,26 +106,6 @@ fn safe_truncate(s: &str, max_chars: usize) -> String {
     } else {
         s.to_string()
     }
-}
-
-/// Calculates visual column width of a line taking expanded tabs into account.
-fn visual_line_len(rope: &ropey::Rope, line_idx: usize) -> usize {
-    if line_idx >= rope.len_lines() {
-        return 0;
-    }
-    let line = rope.line(line_idx);
-    let mut len = 0;
-    for ch in line.chars() {
-        if ch == '\n' || ch == '\r' {
-            continue;
-        }
-        if ch == '\t' {
-            len += 4;
-        } else {
-            len += 1;
-        }
-    }
-    len
 }
 
 // === Application Lifecycle & Event Loop ===
@@ -140,6 +127,7 @@ async fn main() -> Result<()> {
             preferred_lsps: std::collections::HashMap::new(),
             line_wrap: true,
             theme: "gruber-darker".to_string(),
+            show_inlay_hints: true,
             source_path: editor.config.source_path.clone(),
         };
         editor.theme = Theme::gruber_darker();
@@ -176,12 +164,108 @@ async fn main() -> Result<()> {
                     editor.lsp_status = s;
                     if was_ready {
                         editor.request_semantic_tokens();
+                        editor.request_inlay_hints();
                     }
                 }
                 LspOutbound::SemanticTokens { tokens } => {
                     editor.syntax.set_semantic_tokens(tokens);
                 }
                 LspOutbound::Diagnostics(d) => editor.diagnostics = d,
+                LspOutbound::InlayHints { req_id: _, hints } => {
+                    editor.inlay_hints = hints;
+                }
+                LspOutbound::Hover { req_id: _, hover } => {
+                    if let Some(info) = hover {
+                        editor.hover_info = Some(info);
+                        editor.hover_scroll = 0;
+                        editor.status_msg = "Hover documentation loaded".to_string();
+                    } else {
+                        editor.status_msg = "No hover documentation available".to_string();
+                    }
+                }
+                LspOutbound::SignatureHelp { req_id: _, help } => {
+                    editor.signature_help = help;
+                }
+                LspOutbound::Definition {
+                    req_id: _,
+                    locations,
+                } => {
+                    if locations.is_empty() {
+                        editor.status_msg = "No definition found".to_string();
+                    } else if locations.len() == 1 {
+                        let loc = locations.into_iter().next().unwrap();
+                        editor.jump_to_location(loc);
+                    } else {
+                        editor.location_picker = Some(LocationPicker {
+                            title: "Go to Definition",
+                            locations,
+                            selected_idx: 0,
+                            scroll: 0,
+                        });
+                    }
+                }
+                LspOutbound::References {
+                    req_id: _,
+                    locations,
+                } => {
+                    if locations.is_empty() {
+                        editor.status_msg = "No references found".to_string();
+                    } else if locations.len() == 1 {
+                        let loc = locations.into_iter().next().unwrap();
+                        editor.jump_to_location(loc);
+                    } else {
+                        editor.location_picker = Some(LocationPicker {
+                            title: "Find References",
+                            locations,
+                            selected_idx: 0,
+                            scroll: 0,
+                        });
+                    }
+                }
+                LspOutbound::Formatting { req_id: _, edits } => {
+                    if edits.is_empty() {
+                        editor.status_msg = "Buffer already formatted".to_string();
+                    } else {
+                        editor.apply_text_edits(&edits);
+                        editor.status_msg = "Formatted document with LSP".to_string();
+                    }
+                }
+                LspOutbound::CodeActions { req_id: _, actions } => {
+                    if actions.is_empty() {
+                        editor.status_msg = "No code actions available at cursor".to_string();
+                    } else {
+                        editor.code_action_picker = Some(CodeActionPicker {
+                            actions,
+                            selected_idx: 0,
+                        });
+                    }
+                }
+                LspOutbound::Rename { req_id: _, changes } => {
+                    let mut count = 0;
+                    if let Some(cur_path) = editor.path.clone() {
+                        for (p, edits) in &changes {
+                            if p.canonicalize().ok() == cur_path.canonicalize().ok()
+                                || p == &cur_path
+                            {
+                                editor.apply_text_edits(edits);
+                                count += edits.len();
+                            }
+                        }
+                    }
+                    editor.status_msg = format!("Renamed symbol ({count} edits applied)");
+                }
+                LspOutbound::DocumentSymbols { req_id: _, symbols } => {
+                    if symbols.is_empty() {
+                        editor.status_msg = "No document symbols found".to_string();
+                    } else {
+                        editor.symbol_picker = Some(SymbolPicker {
+                            symbols,
+                            query: String::new(),
+                            selected_idx: 0,
+                            scroll: 0,
+                        });
+                    }
+                }
                 LspOutbound::Completions { req_id, items } => {
                     if req_id == editor.lsp_req_id && !items.is_empty() {
                         let prefix = editor.current_word_prefix();
@@ -284,7 +368,15 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
     let viewport_top = 1u16;
     let viewport_bottom = size.height.saturating_sub(3);
 
-    // 1. Intercept Help Modal
+    // Dismiss any active hover card on outside click
+    if editor.hover_info.is_some() {
+        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+            editor.hover_info = None;
+        }
+        return;
+    }
+
+    // Intercept In-Editor Help Modal
     if editor.show_help {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             let width = 64u16.min(size.width.saturating_sub(4));
@@ -303,7 +395,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         return;
     }
 
-    // 2. Intercept Theme Picker Modal
+    // Intercept Theme Picker Modal
     if editor.theme_picker.is_some() {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             let themes = Theme::all();
@@ -333,7 +425,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         return;
     }
 
-    // 3. Intercept LSP Server Picker Modal
+    // Intercept LSP Server Picker Modal
     if let Some(picker) = &editor.lsp_picker {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             let width = 48u16.min(size.width.saturating_sub(2));
@@ -372,7 +464,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         return;
     }
 
-    // 4. Intercept Command Palette Interactions (Click + Scroll support)
+    // Intercept Command Palette Interactions
     if editor.palette.visible {
         let width = 46u16.min(size.width.saturating_sub(2));
         let height = 12u16.min(size.height.saturating_sub(2));
@@ -426,7 +518,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         return;
     }
 
-    // 5. Statusline Interactions
+    // Statusline Interactions
     if mouse.row == status_row {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             let badge_len = match editor.mode {
@@ -485,7 +577,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         0u16
     };
 
-    // 6. File Explorer Sidebar Interactions
+    // File Explorer Sidebar Interactions
     if editor.explorer.visible && mouse.column < explorer_width {
         let max_visible = viewport_bottom.saturating_sub(viewport_top) as usize;
         match mouse.kind {
@@ -525,7 +617,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         return;
     }
 
-    // 7. Completion Dropdown Interactions
+    // Completion Dropdown Interactions
     if editor.completion_visible && !editor.completions.is_empty() {
         if let Some((px, py, pw, ph)) = editor.completion_rect {
             let in_popup = mouse.column >= px
@@ -570,84 +662,39 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         }
     }
 
-    // 8. Document Viewport Buffer Interactions
+    // Document Viewport Buffer Interactions
     let gutter_digits = editor.rope.len_lines().max(1).to_string().len().max(2);
     let gutter_width = gutter_digits + 5;
     let content_left = explorer_width + 1u16 + gutter_width as u16;
-    let text_area_width = (size.width as usize)
-        .saturating_sub(content_left as usize)
-        .max(1);
 
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {
             if mouse.row >= viewport_top && mouse.row < viewport_bottom {
                 let clicked_screen_row = (mouse.row - viewport_top) as usize;
+                let target_line = (editor.scroll_y + clicked_screen_row)
+                    .min(editor.rope.len_lines().saturating_sub(1));
+                editor.cursor_y = target_line;
 
-                if editor.line_wrap {
-                    let mut accumulated_rows = 0;
-                    let mut found_line = editor.rope.len_lines().saturating_sub(1);
-                    let mut found_col = 0;
-
-                    for y in editor.scroll_y..editor.rope.len_lines() {
-                        let l_len = visual_line_len(&editor.rope, y);
-                        let sub_rows = if l_len == 0 {
-                            1
-                        } else {
-                            l_len.div_ceil(text_area_width)
-                        };
-
-                        if clicked_screen_row < accumulated_rows + sub_rows {
-                            found_line = y;
-                            let sub_idx = clicked_screen_row - accumulated_rows;
-                            let sub_col = if mouse.column >= content_left {
-                                (mouse.column - content_left) as usize
-                            } else {
-                                0
-                            };
-                            let raw_line = editor.rope.line(y);
-                            let target_visual_x = sub_idx * text_area_width + sub_col;
-                            let mut current_vx = 0;
-                            let mut resolved_char_idx = 0;
-                            for (c_idx, ch) in raw_line.chars().enumerate() {
-                                if current_vx >= target_visual_x || ch == '\n' || ch == '\r' {
-                                    break;
-                                }
-                                current_vx += if ch == '\t' { 4 } else { 1 };
-                                resolved_char_idx = c_idx + 1;
-                            }
-                            found_col = resolved_char_idx;
+                if mouse.column >= content_left {
+                    let target_visual_x = editor.scroll_x + (mouse.column - content_left) as usize;
+                    let raw_line = editor.rope.line(target_line);
+                    let mut current_vx = 0;
+                    let mut resolved_char_idx = 0;
+                    for (c_idx, ch) in raw_line.chars().enumerate() {
+                        if current_vx >= target_visual_x || ch == '\n' || ch == '\r' {
                             break;
                         }
-                        accumulated_rows += sub_rows;
+                        current_vx += if ch == '\t' { 4 } else { 1 };
+                        resolved_char_idx = c_idx + 1;
                     }
-
-                    editor.cursor_y = found_line;
-                    editor.cursor_x = found_col;
+                    editor.cursor_x = resolved_char_idx;
                 } else {
-                    let target_line = (editor.scroll_y + clicked_screen_row)
-                        .min(editor.rope.len_lines().saturating_sub(1));
-                    editor.cursor_y = target_line;
-                    if mouse.column >= content_left {
-                        let target_visual_x =
-                            editor.scroll_x + (mouse.column - content_left) as usize;
-                        let raw_line = editor.rope.line(target_line);
-                        let mut current_vx = 0;
-                        let mut resolved_char_idx = 0;
-                        for (c_idx, ch) in raw_line.chars().enumerate() {
-                            if current_vx >= target_visual_x || ch == '\n' || ch == '\r' {
-                                break;
-                            }
-                            current_vx += if ch == '\t' { 4 } else { 1 };
-                            resolved_char_idx = c_idx + 1;
-                        }
-                        editor.cursor_x = resolved_char_idx;
-                    } else {
-                        editor.cursor_x = 0;
-                    }
+                    editor.cursor_x = 0;
                 }
 
                 editor.clamp_cursor();
                 editor.completion_visible = false;
+                editor.hover_info = None;
                 editor.focus = Focus::Editor;
 
                 if size.width < 70 && editor.explorer.visible {
@@ -660,12 +707,14 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
             editor.cursor_y = editor.cursor_y.saturating_sub(3);
             editor.clamp_cursor();
             editor.completion_visible = false;
+            editor.hover_info = None;
         }
         MouseEventKind::ScrollDown if editor.scroll_y + 3 < editor.rope.len_lines() => {
             editor.scroll_y += 3;
             editor.cursor_y = (editor.cursor_y + 3).min(editor.rope.len_lines().saturating_sub(1));
             editor.clamp_cursor();
             editor.completion_visible = false;
+            editor.hover_info = None;
         }
         _ => {}
     }
@@ -681,7 +730,179 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
     let prev_mode = editor.mode;
     let max_visible = 6usize;
 
-    // 1. Intercept In-Editor Help Modal Navigation
+    // 1. Rename Symbol Prompt Input
+    if let Some(mut name) = editor.rename_prompt.take() {
+        match key.code {
+            KeyCode::Esc => {
+                editor.status_msg = "Rename canceled".to_string();
+            }
+            KeyCode::Enter => {
+                editor.request_rename(&name);
+            }
+            KeyCode::Backspace => {
+                name.pop();
+                editor.rename_prompt = Some(name);
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                name.push(c);
+                editor.rename_prompt = Some(name);
+            }
+            _ => {
+                editor.rename_prompt = Some(name);
+            }
+        }
+        return;
+    }
+
+    // 2. Hover Card Viewer
+    if editor.hover_info.is_some() {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                editor.hover_info = None;
+                return;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                editor.hover_scroll = editor.hover_scroll.saturating_add(1);
+                return;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                editor.hover_scroll = editor.hover_scroll.saturating_sub(1);
+                return;
+            }
+            _ => {
+                editor.hover_info = None;
+            }
+        }
+    }
+
+    // 3. Code Actions Picker Modal
+    if let Some(mut picker) = editor.code_action_picker.take() {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                editor.status_msg = "Code actions canceled".to_string();
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                picker.selected_idx = (picker.selected_idx + 1) % picker.actions.len();
+                editor.code_action_picker = Some(picker);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                picker.selected_idx = if picker.selected_idx == 0 {
+                    picker.actions.len().saturating_sub(1)
+                } else {
+                    picker.selected_idx - 1
+                };
+                editor.code_action_picker = Some(picker);
+            }
+            KeyCode::Enter => {
+                if let Some(action) = picker.actions.get(picker.selected_idx) {
+                    if let Some(cur_path) = &editor.path {
+                        let mut found = false;
+                        for (p, edits) in &action.edits {
+                            if p.canonicalize().ok() == cur_path.canonicalize().ok()
+                                || p == cur_path
+                            {
+                                editor.apply_text_edits(edits);
+                                found = true;
+                                break;
+                            }
+                        }
+                        if !found && action.edits.len() == 1 {
+                            if let Some(edits) = action.edits.values().next() {
+                                editor.apply_text_edits(edits);
+                            }
+                        }
+                    }
+                    editor.status_msg = format!("Applied: {}", action.title);
+                }
+            }
+            _ => {
+                editor.code_action_picker = Some(picker);
+            }
+        }
+        return;
+    }
+
+    // 4. Symbol Outline Picker Modal
+    if let Some(mut picker) = editor.symbol_picker.take() {
+        let filtered_count = picker.filtered_symbols().len();
+        match key.code {
+            KeyCode::Esc => {
+                editor.status_msg = "Symbol search closed".to_string();
+            }
+            KeyCode::Down => {
+                if filtered_count > 0 {
+                    picker.selected_idx = (picker.selected_idx + 1) % filtered_count;
+                }
+                editor.symbol_picker = Some(picker);
+            }
+            KeyCode::Up => {
+                if filtered_count > 0 {
+                    picker.selected_idx = if picker.selected_idx == 0 {
+                        filtered_count.saturating_sub(1)
+                    } else {
+                        picker.selected_idx - 1
+                    };
+                }
+                editor.symbol_picker = Some(picker);
+            }
+            KeyCode::Enter => {
+                let filtered = picker.filtered_symbols();
+                if let Some(sym) = filtered.get(picker.selected_idx) {
+                    editor.cursor_y = sym.line.min(editor.rope.len_lines().saturating_sub(1));
+                    let line_str = editor.rope.line(editor.cursor_y).to_string();
+                    editor.cursor_x = utf16_to_char_col(&line_str, sym.col);
+                    editor.clamp_cursor();
+                    editor.status_msg = format!("Jumped to symbol {}", sym.name);
+                }
+            }
+            KeyCode::Backspace => {
+                picker.query.pop();
+                picker.selected_idx = 0;
+                editor.symbol_picker = Some(picker);
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                picker.query.push(c);
+                picker.selected_idx = 0;
+                editor.symbol_picker = Some(picker);
+            }
+            _ => {
+                editor.symbol_picker = Some(picker);
+            }
+        }
+        return;
+    }
+
+    // 5. Locations Picker (Definition / References)
+    if let Some(mut picker) = editor.location_picker.take() {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                editor.status_msg = "Location picker closed".to_string();
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                picker.selected_idx = (picker.selected_idx + 1) % picker.locations.len();
+                editor.location_picker = Some(picker);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                picker.selected_idx = if picker.selected_idx == 0 {
+                    picker.locations.len().saturating_sub(1)
+                } else {
+                    picker.selected_idx - 1
+                };
+                editor.location_picker = Some(picker);
+            }
+            KeyCode::Enter => {
+                if let Some(loc) = picker.locations.get(picker.selected_idx).cloned() {
+                    editor.jump_to_location(loc);
+                }
+            }
+            _ => {
+                editor.location_picker = Some(picker);
+            }
+        }
+        return;
+    }
+
+    // 6. Help Modal Navigation
     if editor.show_help {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q' | '?') => {
@@ -704,7 +925,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // 2. Intercept Theme Picker Modal
+    // 7. Theme Picker Modal
     if let Some(mut picker) = editor.theme_picker.take() {
         let themes = Theme::all();
         match key.code {
@@ -734,7 +955,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // 3. Intercept LSP Server Selection Modal
+    // 8. LSP Server Picker Modal
     if let Some(mut picker) = editor.lsp_picker.take() {
         if picker.candidates.is_empty() {
             editor.status_msg = "No LSP candidates available".to_string();
@@ -777,7 +998,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // 4. Intercept Command Palette Key Events
+    // 9. Command Palette Key Events
     if editor.palette.visible {
         let cmds = editor.palette.filtered_commands();
         match key.code {
@@ -831,7 +1052,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // 5. Global Shortcuts: Ctrl-E for File Explorer
+    // 10. Global Shortcuts: Ctrl-E for File Explorer
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('e') {
         editor.explorer.visible = !editor.explorer.visible;
         if editor.explorer.visible {
@@ -843,7 +1064,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // 6. File Explorer Navigation Focus
+    // 11. File Explorer Navigation Focus
     if editor.focus == Focus::Explorer && editor.explorer.visible {
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
@@ -879,10 +1100,11 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // 7. Modal Editing Handler
+    // 12. Modal Editing Handler
     match editor.mode {
         Mode::Normal => {
             editor.completion_visible = false;
+            editor.signature_help = None;
 
             if key.modifiers.contains(KeyModifiers::CONTROL) {
                 match key.code {
@@ -897,6 +1119,11 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                     }
                     _ => {}
                 }
+            }
+
+            if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('f') {
+                editor.request_formatting();
+                return;
             }
 
             if let Some(pending) = editor.pending_key.take() {
@@ -925,16 +1152,33 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                         editor.cursor_x = 0;
                         true
                     }
+                    ('g', KeyCode::Char('d')) => {
+                        editor.request_definition();
+                        true
+                    }
+                    ('g', KeyCode::Char('r')) => {
+                        editor.request_references();
+                        true
+                    }
+                    ('g', KeyCode::Char('a')) => {
+                        editor.request_code_actions();
+                        true
+                    }
                     _ => false,
                 };
                 if handled {
                     editor.clamp_cursor();
                     return;
                 }
-                // If unhandled multi-key combination, fall through so second key evaluates normally
             }
 
             match key.code {
+                KeyCode::F(2) => {
+                    editor.rename_prompt = Some(editor.current_word_prefix());
+                }
+                KeyCode::Char('K') => {
+                    editor.request_hover();
+                }
                 KeyCode::Char(' ') => {
                     editor.palette.visible = true;
                     editor.palette.query.clear();
@@ -976,11 +1220,6 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                 KeyCode::Char('d') => editor.pending_key = Some('d'),
                 KeyCode::Char('g') => editor.pending_key = Some('g'),
                 KeyCode::Char('G') => {
-                    let max_lines = editor.rope.len_lines().max(1);
-                    editor.cursor_y = max_lines - 1;
-                    editor.cursor_x = 0;
-                }
-                KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::SHIFT) => {
                     let max_lines = editor.rope.len_lines().max(1);
                     editor.cursor_y = max_lines - 1;
                     editor.cursor_x = 0;
@@ -1076,11 +1315,6 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                     editor.cursor_y = max_lines - 1;
                     editor.cursor_x = editor.current_line_len();
                 }
-                KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    let max_lines = editor.rope.len_lines().max(1);
-                    editor.cursor_y = max_lines - 1;
-                    editor.cursor_x = editor.current_line_len();
-                }
                 KeyCode::Char(' ') => {
                     editor.palette.visible = true;
                     editor.palette.query.clear();
@@ -1145,6 +1379,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                 KeyCode::Esc => {
                     editor.set_mode(Mode::Normal);
                     editor.completion_visible = false;
+                    editor.signature_help = None;
                     if editor.cursor_x > 0 && editor.cursor_x >= editor.current_line_len() {
                         editor.cursor_x = editor.cursor_x.saturating_sub(1);
                     }
@@ -1168,6 +1403,11 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                 KeyCode::Char('(') => {
                     editor.insert_pair('(', ')');
                     editor.completion_visible = false;
+                    editor.request_signature_help();
+                }
+                KeyCode::Char(',') => {
+                    editor.insert_char(',');
+                    editor.request_signature_help();
                 }
                 KeyCode::Char('[') => {
                     editor.insert_pair('[', ']');
@@ -1196,6 +1436,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                 KeyCode::Char(')') if editor.char_under_cursor() == Some(')') => {
                     editor.cursor_x += 1;
                     editor.completion_visible = false;
+                    editor.signature_help = None;
                 }
                 KeyCode::Char(']') if editor.char_under_cursor() == Some(']') => {
                     editor.cursor_x += 1;
@@ -1376,7 +1617,7 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             };
 
             tree_lines.push(Line::from(vec![
-                Span::raw(" "), // 1 column margin so icon never clips the left border
+                Span::raw(" "),
                 Span::raw(indent),
                 Span::styled(format!("{raw_icon} "), Style::default().fg(icon_color)),
                 Span::styled(entry.name.clone(), item_style),
@@ -1407,7 +1648,6 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
         ),
         if editor.modified {
-            // Clean white dot for modified/unsaved buffer state (not error-red)
             Span::styled(" ●", Style::default().fg(Color::Rgb(235, 235, 235)))
         } else {
             Span::raw("")
@@ -1431,7 +1671,6 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
     let total_lines = editor.rope.len_lines().max(1);
     let line_digits = total_lines.to_string().len().max(2);
-    // Gutter width: 2 cells for marker + line_digits + 3 for " │ "
     let gutter_width = line_digits + 5;
     let text_area_width = (inner_area.width as usize)
         .saturating_sub(gutter_width)
@@ -1454,12 +1693,11 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
         let is_cursor_line = y == editor.cursor_y;
 
-        // Diagnostic gutter marker: exactly 2 visual cells (glyph + space, or 2 spaces)
         let line_diag = editor.diagnostics.iter().find(|d| d.line == y);
         let (diag_marker, diag_style) = match line_diag.map(|d| d.severity) {
-            Some(1) => (" ", Style::default().fg(Color::Rgb(244, 56, 65))),
-            Some(2) => (" ", Style::default().fg(Color::Rgb(245, 185, 60))),
-            Some(_) => ("󰌵 ", Style::default().fg(Color::Rgb(100, 180, 255))),
+            Some(1) => (" ", Style::default().fg(theme.diag_error)),
+            Some(2) => (" ", Style::default().fg(theme.diag_warn)),
+            Some(_) => ("󰌵 ", Style::default().fg(theme.diag_info)),
             None => ("  ", Style::default()),
         };
 
@@ -1481,35 +1719,95 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         }
 
         let syntax_spans = editor.syntax.highlight_line(&line_str, y, &theme);
-        let mut char_cells: Vec<(char, Style, usize)> = Vec::with_capacity(line_str.len() * 2);
+        let mut base_cells: Vec<(char, Style, usize)> = Vec::with_capacity(line_str.len() * 2);
         let mut char_idx = 0;
         for span in syntax_spans {
             let st = span.style;
             for ch in span.content.chars() {
                 if ch == '\t' {
                     for _ in 0..4 {
-                        char_cells.push((' ', st, char_idx));
+                        base_cells.push((' ', st, char_idx));
                     }
                 } else {
-                    char_cells.push((ch, st, char_idx));
+                    base_cells.push((ch, st, char_idx));
                 }
                 char_idx += 1;
             }
         }
 
-        let visual_cursor_x = {
-            let mut vx = 0;
-            for (idx, ch) in line_str.chars().enumerate() {
-                if idx >= editor.cursor_x {
-                    break;
-                }
-                if ch == '\t' {
-                    vx += 4;
-                } else {
-                    vx += 1;
+        // Weave Inlay Hints (Inferred Types & Parameters)
+        let mut char_cells: Vec<(char, Style, Option<usize>)> = Vec::new();
+        let line_hints: Vec<&lsp::InlayHintItem> = if editor.show_inlay_hints {
+            editor.inlay_hints.iter().filter(|h| h.line == y).collect()
+        } else {
+            Vec::new()
+        };
+
+        let mut hint_map: std::collections::HashMap<usize, Vec<&lsp::InlayHintItem>> =
+            std::collections::HashMap::new();
+        for h in line_hints {
+            let col = utf16_to_char_col(&line_str, h.col);
+            hint_map.entry(col).or_default().push(h);
+        }
+
+        for (ch, st, idx) in base_cells {
+            if let Some(hints) = hint_map.remove(&idx) {
+                for h in hints {
+                    let h_style = match h.kind {
+                        InlayHintType::Parameter => Style::default()
+                            .fg(theme.inlay_hint_param_fg)
+                            .bg(theme.inlay_hint_bg),
+                        _ => Style::default()
+                            .fg(theme.inlay_hint_fg)
+                            .bg(theme.inlay_hint_bg),
+                    };
+
+                    if h.padding_left {
+                        char_cells.push((' ', h_style, None));
+                    }
+                    for hc in h.label.chars() {
+                        char_cells.push((hc, h_style, None));
+                    }
+                    if h.padding_right {
+                        char_cells.push((' ', h_style, None));
+                    }
                 }
             }
-            vx
+            char_cells.push((ch, st, Some(idx)));
+        }
+
+        // Tail hints (e.g. end-of-line return types)
+        if let Some(hints) = hint_map.remove(&line_str.chars().count()) {
+            for h in hints {
+                let h_style = match h.kind {
+                    InlayHintType::Parameter => Style::default()
+                        .fg(theme.inlay_hint_param_fg)
+                        .bg(theme.inlay_hint_bg),
+                    _ => Style::default()
+                        .fg(theme.inlay_hint_fg)
+                        .bg(theme.inlay_hint_bg),
+                };
+                if h.padding_left {
+                    char_cells.push((' ', h_style, None));
+                }
+                for hc in h.label.chars() {
+                    char_cells.push((hc, h_style, None));
+                }
+                if h.padding_right {
+                    char_cells.push((' ', h_style, None));
+                }
+            }
+        }
+
+        let visual_cursor_x = {
+            let mut resolved = None;
+            for (cell_idx, &(_, _, opt_idx)) in char_cells.iter().enumerate() {
+                if opt_idx == Some(editor.cursor_x) {
+                    resolved = Some(cell_idx);
+                    break;
+                }
+            }
+            resolved.unwrap_or(char_cells.len())
         };
 
         if editor.line_wrap && char_cells.len() > text_area_width {
@@ -1546,11 +1844,13 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
                 ];
 
                 for col_idx in chunk_start..chunk_end {
-                    let (ch, mut st, orig_char_idx) = char_cells[col_idx];
-                    if editor.is_char_selected(y, orig_char_idx) {
-                        st = st.bg(theme.selection_bg).fg(theme.selection_fg);
-                    } else if is_cursor_line {
-                        st = st.bg(theme.cursor_line_bg);
+                    let (ch, mut st, opt_orig_idx) = char_cells[col_idx];
+                    if let Some(orig_char_idx) = opt_orig_idx {
+                        if editor.is_char_selected(y, orig_char_idx) {
+                            st = st.bg(theme.selection_bg).fg(theme.selection_fg);
+                        } else if is_cursor_line {
+                            st = st.bg(theme.cursor_line_bg);
+                        }
                     }
                     sub_spans.push(Span::styled(ch.to_string(), st));
                 }
@@ -1595,16 +1895,18 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
                 let skip_count = if editor.line_wrap { 0 } else { editor.scroll_x };
                 let take_count = text_area_width;
 
-                for (_col_idx, (ch, mut st, orig_char_idx)) in char_cells
+                for (_col_idx, (ch, mut st, opt_orig_idx)) in char_cells
                     .into_iter()
                     .enumerate()
                     .skip(skip_count)
                     .take(take_count)
                 {
-                    if editor.is_char_selected(y, orig_char_idx) {
-                        st = st.bg(theme.selection_bg).fg(theme.selection_fg);
-                    } else if is_cursor_line {
-                        st = st.bg(theme.cursor_line_bg);
+                    if let Some(orig_char_idx) = opt_orig_idx {
+                        if editor.is_char_selected(y, orig_char_idx) {
+                            st = st.bg(theme.selection_bg).fg(theme.selection_fg);
+                        } else if is_cursor_line {
+                            st = st.bg(theme.cursor_line_bg);
+                        }
                     }
                     row_spans.push(Span::styled(ch.to_string(), st));
                 }
@@ -1669,6 +1971,11 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
     } else {
         " 󰖵 NoWrap "
     };
+    let hints_badge = if editor.show_inlay_hints {
+        " 󰌵 Hints "
+    } else {
+        " 󰌶 Hints "
+    };
 
     let status_left = Line::from(vec![
         Span::styled(
@@ -1696,6 +2003,14 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             }),
         ),
         Span::styled(
+            hints_badge,
+            Style::default().bg(pill_bg).fg(if editor.show_inlay_hints {
+                theme.syn_function
+            } else {
+                theme.line_number
+            }),
+        ),
+        Span::styled(
             " 󰍉 Cmd ",
             Style::default().bg(pill_bg).fg(theme.mode_command),
         ),
@@ -1703,7 +2018,6 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
     ]);
 
     let spinner_icon = SPINNER[(editor.spinner_tick / 3) % SPINNER.len()];
-
     let mut status_right_spans = Vec::new();
 
     match &editor.lsp_status {
@@ -1727,7 +2041,7 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
                 format!(" 󰅚 LSP: {err} "),
                 Style::default()
                     .bg(bar_bg)
-                    .fg(Color::Rgb(244, 56, 65))
+                    .fg(theme.diag_error)
                     .add_modifier(Modifier::BOLD),
             ));
         }
@@ -1743,13 +2057,13 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
     if error_count > 0 {
         status_right_spans.push(Span::styled(
             format!("  {error_count} "),
-            Style::default().bg(bar_bg).fg(Color::Rgb(244, 56, 65)),
+            Style::default().bg(bar_bg).fg(theme.diag_error),
         ));
     }
     if warn_count > 0 {
         status_right_spans.push(Span::styled(
             format!("  {warn_count} "),
-            Style::default().bg(bar_bg).fg(Color::Rgb(245, 185, 60)),
+            Style::default().bg(bar_bg).fg(theme.diag_warn),
         ));
     }
 
@@ -1779,7 +2093,10 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         main_chunks[1],
     );
 
-    // 4. Diagnostics / Command Bar Area
+    // 4. Command Bar & Status Messages
+    let (screen_x, screen_y) =
+        cursor_screen_pos.unwrap_or((inner_area.x + gutter_width as u16, inner_area.y));
+
     if editor.mode == Mode::Command {
         let prompt_line = Line::from(vec![
             Span::styled(
@@ -1801,9 +2118,9 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             .find(|d| d.line == editor.cursor_y);
         let msg_line = if let Some(diag) = active_diag {
             let (d_icon, icon_style) = match diag.severity {
-                1 => ("  ", Style::default().fg(Color::Rgb(244, 56, 65))),
-                2 => ("  ", Style::default().fg(Color::Rgb(245, 185, 60))),
-                _ => (" 󰌵 ", Style::default().fg(Color::Rgb(100, 180, 255))),
+                1 => ("  ", Style::default().fg(theme.diag_error)),
+                2 => ("  ", Style::default().fg(theme.diag_warn)),
+                _ => (" 󰌵 ", Style::default().fg(theme.diag_info)),
             };
             Line::from(vec![
                 Span::styled(d_icon, icon_style),
@@ -1821,95 +2138,6 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
         frame.render_widget(Paragraph::new(msg_line), main_chunks[2]);
 
-        let (screen_x, screen_y) =
-            cursor_screen_pos.unwrap_or((inner_area.x + gutter_width as u16, inner_area.y));
-
-        if !(editor.mode == Mode::Insert
-            && editor.completion_visible
-            && !editor.completions.is_empty())
-        {
-            editor.completion_rect = None;
-        }
-
-        // Floating Auto-Complete Dropdown
-        if editor.mode == Mode::Insert
-            && editor.completion_visible
-            && !editor.completions.is_empty()
-        {
-            let max_visible_items = 6usize;
-            let total_items = editor.completions.len();
-            let count = total_items.min(max_visible_items);
-            let popup_height = (count as u16) + 2;
-            let popup_width = 38u16.min(frame.area().width.saturating_sub(screen_x).max(22));
-
-            let mut popup_x = screen_x;
-            if popup_x + popup_width > frame.area().width {
-                popup_x = frame.area().width.saturating_sub(popup_width);
-            }
-
-            let popup_y = if screen_y + 1 + popup_height < frame.area().bottom() {
-                screen_y + 1
-            } else {
-                screen_y.saturating_sub(popup_height)
-            };
-
-            let popup_rect = Rect::new(popup_x, popup_y, popup_width, popup_height);
-            editor.completion_rect = Some((popup_x, popup_y, popup_width, popup_height));
-            frame.render_widget(Clear, popup_rect);
-
-            let scroll_start = editor.completion_scroll;
-            let scroll_end = (scroll_start + max_visible_items).min(total_items);
-
-            let mut list_lines = Vec::new();
-            for i in scroll_start..scroll_end {
-                let item = &editor.completions[i];
-                let is_sel = i == editor.completion_idx;
-
-                let (kind_icon, kind_color) = completion_kind_icon(item.kind);
-                let item_bg = if is_sel {
-                    theme.popup_sel_bg
-                } else {
-                    theme.popup_bg
-                };
-                let text_style = if is_sel {
-                    Style::default()
-                        .bg(item_bg)
-                        .fg(theme.popup_sel_fg)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().bg(item_bg).fg(theme.popup_text)
-                };
-
-                let avail_width = (popup_width as usize).saturating_sub(6);
-                let label_text = safe_truncate(&item.label, avail_width);
-                let padding = avail_width.saturating_sub(label_text.chars().count());
-
-                list_lines.push(Line::from(vec![
-                    Span::styled(" ", Style::default().bg(item_bg)),
-                    Span::styled(
-                        format!("{kind_icon} "),
-                        Style::default().bg(item_bg).fg(kind_color),
-                    ),
-                    Span::styled(" ", Style::default().bg(item_bg)),
-                    Span::styled(label_text, text_style),
-                    Span::styled(" ".repeat(padding), Style::default().bg(item_bg)),
-                ]));
-            }
-
-            let title_info = format!(" {}/{} ", editor.completion_idx + 1, total_items);
-            let comp_block = Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(theme.popup_border))
-                .style(Style::default().bg(theme.popup_bg))
-                .title(Line::from(Span::styled(
-                    title_info,
-                    Style::default().fg(theme.status_fg),
-                )));
-
-            frame.render_widget(Paragraph::new(list_lines).block(comp_block), popup_rect);
-        }
-
         if editor.focus == Focus::Editor {
             if let Some((cx, cy)) = cursor_screen_pos {
                 if cx < inner_area.right() && cy < inner_area.bottom() {
@@ -1919,7 +2147,434 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         }
     }
 
-    // 5. Render Command Palette Modal
+    // 5. Floating Autocomplete Dropdown
+    if editor.mode == Mode::Insert && editor.completion_visible && !editor.completions.is_empty() {
+        let max_visible_items = 6usize;
+        let total_items = editor.completions.len();
+        let count = total_items.min(max_visible_items);
+        let popup_height = (count as u16) + 2;
+        let popup_width = 38u16.min(frame.area().width.saturating_sub(screen_x).max(22));
+
+        let mut popup_x = screen_x;
+        if popup_x + popup_width > frame.area().width {
+            popup_x = frame.area().width.saturating_sub(popup_width);
+        }
+
+        let popup_y = if screen_y + 1 + popup_height < frame.area().bottom() {
+            screen_y + 1
+        } else {
+            screen_y.saturating_sub(popup_height)
+        };
+
+        let popup_rect = Rect::new(popup_x, popup_y, popup_width, popup_height);
+        editor.completion_rect = Some((popup_x, popup_y, popup_width, popup_height));
+        frame.render_widget(Clear, popup_rect);
+
+        let scroll_start = editor.completion_scroll;
+        let scroll_end = (scroll_start + max_visible_items).min(total_items);
+
+        let mut list_lines = Vec::new();
+        for i in scroll_start..scroll_end {
+            let item = &editor.completions[i];
+            let is_sel = i == editor.completion_idx;
+
+            let (kind_icon, kind_color) = completion_kind_icon(item.kind);
+            let item_bg = if is_sel {
+                theme.popup_sel_bg
+            } else {
+                theme.popup_bg
+            };
+            let text_style = if is_sel {
+                Style::default()
+                    .bg(item_bg)
+                    .fg(theme.popup_sel_fg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().bg(item_bg).fg(theme.popup_text)
+            };
+
+            let avail_width = (popup_width as usize).saturating_sub(6);
+            let label_text = safe_truncate(&item.label, avail_width);
+            let padding = avail_width.saturating_sub(label_text.chars().count());
+
+            list_lines.push(Line::from(vec![
+                Span::styled(" ", Style::default().bg(item_bg)),
+                Span::styled(
+                    format!("{kind_icon} "),
+                    Style::default().bg(item_bg).fg(kind_color),
+                ),
+                Span::styled(" ", Style::default().bg(item_bg)),
+                Span::styled(label_text, text_style),
+                Span::styled(" ".repeat(padding), Style::default().bg(item_bg)),
+            ]));
+        }
+
+        let title_info = format!(" {}/{} ", editor.completion_idx + 1, total_items);
+        let comp_block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.popup_border))
+            .style(Style::default().bg(theme.popup_bg))
+            .title(Line::from(Span::styled(
+                title_info,
+                Style::default().fg(theme.status_fg),
+            )));
+
+        frame.render_widget(Paragraph::new(list_lines).block(comp_block), popup_rect);
+    }
+
+    // 6. Floating Signature Help Tooltip
+    if editor.mode == Mode::Insert {
+        if let Some(help) = &editor.signature_help {
+            let width = (help.signature_label.len() as u16 + 4)
+                .min(frame.area().width.saturating_sub(4))
+                .max(30);
+            let height = 3u16;
+            let x = screen_x.min(frame.area().width.saturating_sub(width));
+            let y = if screen_y >= height + 1 {
+                screen_y.saturating_sub(height)
+            } else {
+                (screen_y + 1).min(frame.area().height.saturating_sub(height))
+            };
+
+            let tooltip_rect = Rect::new(x, y, width, height);
+            frame.render_widget(Clear, tooltip_rect);
+
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme.syn_function))
+                .style(Style::default().bg(theme.hover_bg))
+                .title(Line::from(Span::styled(
+                    " 󰊕 Signature ",
+                    Style::default()
+                        .fg(theme.syn_function)
+                        .add_modifier(Modifier::BOLD),
+                )));
+
+            let line = Line::from(vec![
+                Span::raw(" "),
+                Span::styled(
+                    &help.signature_label,
+                    Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
+                ),
+            ]);
+
+            frame.render_widget(Paragraph::new(line).block(block), tooltip_rect);
+        }
+    }
+
+    // 7. Floating Hover Documentation Card
+    if let Some(hover) = &editor.hover_info {
+        let max_content_len = hover.lines.iter().map(|l| l.len()).max().unwrap_or(30);
+        let width = (max_content_len as u16 + 4)
+            .min(frame.area().width.saturating_sub(4))
+            .max(40);
+        let height = (hover.lines.len() as u16 + 4)
+            .min(16)
+            .min(frame.area().height.saturating_sub(4));
+
+        let x = (frame.area().width.saturating_sub(width)) / 2;
+        let y = (frame.area().height.saturating_sub(height)) / 2;
+
+        let card_rect = Rect::new(x, y, width, height);
+        frame.render_widget(Clear, card_rect);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.hover_border))
+            .style(Style::default().bg(theme.hover_bg))
+            .title(Line::from(vec![
+                Span::styled(
+                    " 󰋽 Documentation & Types ",
+                    Style::default()
+                        .fg(theme.hover_border)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "(Esc/q to dismiss) ",
+                    Style::default().fg(theme.line_number),
+                ),
+            ]));
+
+        let inner_card = block.inner(card_rect);
+        frame.render_widget(block, card_rect);
+
+        let mut doc_lines = Vec::new();
+        let scroll_start = editor.hover_scroll;
+        let scroll_end = (scroll_start + inner_card.height as usize).min(hover.lines.len());
+
+        for i in scroll_start..scroll_end {
+            let l = &hover.lines[i];
+            let is_code = l.starts_with("```") || l.starts_with("    ");
+            let st = if is_code {
+                Style::default().fg(theme.syn_function)
+            } else {
+                Style::default().fg(theme.hover_fg)
+            };
+            doc_lines.push(Line::from(vec![Span::raw(" "), Span::styled(l, st)]));
+        }
+
+        frame.render_widget(Paragraph::new(doc_lines), inner_card);
+    }
+
+    // 8. Code Action Picker Modal
+    if let Some(picker) = &editor.code_action_picker {
+        let width = 56u16.min(size.width.saturating_sub(2));
+        let height = ((picker.actions.len() as u16) + 4).min(size.height.saturating_sub(2));
+        let x = (size.width.saturating_sub(width)) / 2;
+        let y = (size.height.saturating_sub(height)) / 2;
+
+        let rect = Rect::new(x, y, width, height);
+        frame.render_widget(Clear, rect);
+
+        let mut lines = Vec::new();
+        lines.push(Line::from(vec![
+            Span::styled(
+                " Quickfixes & Actions ",
+                Style::default().fg(theme.status_fg),
+            ),
+            Span::styled("(Enter to apply):", Style::default().fg(theme.line_number)),
+        ]));
+        lines.push(Line::from(Span::styled(
+            "─".repeat((width as usize).saturating_sub(2)),
+            Style::default().fg(theme.border),
+        )));
+
+        for (idx, action) in picker.actions.iter().enumerate() {
+            let is_sel = idx == picker.selected_idx;
+            let bg = if is_sel {
+                theme.popup_sel_bg
+            } else {
+                theme.popup_bg
+            };
+            let style = if is_sel {
+                Style::default()
+                    .bg(bg)
+                    .fg(theme.popup_sel_fg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().bg(bg).fg(theme.popup_text)
+            };
+
+            let mark = if is_sel { " 󰅂 " } else { "   " };
+            let pref = if action.is_preferred { " 󰄬" } else { "" };
+            lines.push(Line::from(vec![
+                Span::styled(mark, Style::default().bg(bg).fg(theme.mode_insert)),
+                Span::styled(format!("{}{}", action.title, pref), style),
+            ]));
+        }
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.popup_border))
+            .style(Style::default().bg(theme.popup_bg))
+            .title(Line::from(Span::styled(
+                " 󰌵 Available Code Actions ",
+                Style::default()
+                    .fg(theme.popup_text)
+                    .add_modifier(Modifier::BOLD),
+            )));
+
+        frame.render_widget(Paragraph::new(lines).block(block), rect);
+    }
+
+    // 9. Symbol Outline Picker Modal
+    if let Some(picker) = &editor.symbol_picker {
+        let width = 58u16.min(size.width.saturating_sub(2));
+        let height = 14u16.min(size.height.saturating_sub(2));
+        let x = (size.width.saturating_sub(width)) / 2;
+        let y = 1u16;
+
+        let rect = Rect::new(x, y, width, height);
+        frame.render_widget(Clear, rect);
+
+        let filtered = picker.filtered_symbols();
+        let max_visible = (height.saturating_sub(4)) as usize;
+
+        let mut lines = Vec::new();
+        lines.push(Line::from(vec![
+            Span::styled(
+                " 󰅩 > ",
+                Style::default()
+                    .fg(theme.mode_command)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                &picker.query,
+                Style::default()
+                    .fg(theme.popup_sel_fg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("█", Style::default().fg(theme.border_focused)),
+        ]));
+        lines.push(Line::from(Span::styled(
+            "─".repeat((width as usize).saturating_sub(2)),
+            Style::default().fg(theme.border),
+        )));
+
+        let scroll_start = picker.scroll;
+        let scroll_end = (scroll_start + max_visible).min(filtered.len());
+
+        for i in scroll_start..scroll_end {
+            let sym = filtered[i];
+            let is_sel = i == picker.selected_idx;
+            let row_bg = if is_sel {
+                theme.popup_sel_bg
+            } else {
+                theme.popup_bg
+            };
+            let (icon, icon_c) = symbol_kind_icon(sym.kind);
+
+            let style = if is_sel {
+                Style::default()
+                    .bg(row_bg)
+                    .fg(theme.popup_sel_fg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().bg(row_bg).fg(theme.popup_text)
+            };
+
+            lines.push(Line::from(vec![
+                Span::styled(" ", Style::default().bg(row_bg)),
+                Span::styled(format!("{icon} "), Style::default().bg(row_bg).fg(icon_c)),
+                Span::styled(sym.name.clone(), style),
+                Span::styled(
+                    format!(" :{}", sym.line + 1),
+                    Style::default().bg(row_bg).fg(theme.line_number),
+                ),
+            ]));
+        }
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.popup_border))
+            .style(Style::default().bg(theme.popup_bg))
+            .title(Line::from(Span::styled(
+                " 󰅩 Document Symbols (Esc to close) ",
+                Style::default()
+                    .fg(theme.popup_text)
+                    .add_modifier(Modifier::BOLD),
+            )));
+
+        frame.render_widget(Paragraph::new(lines).block(block), rect);
+    }
+
+    // 10. Location Picker Modal (Definitions / References)
+    if let Some(picker) = &editor.location_picker {
+        let width = 64u16.min(size.width.saturating_sub(2));
+        let height = ((picker.locations.len() as u16) + 4)
+            .min(14)
+            .min(size.height.saturating_sub(2));
+        let x = (size.width.saturating_sub(width)) / 2;
+        let y = (size.height.saturating_sub(height)) / 2;
+
+        let rect = Rect::new(x, y, width, height);
+        frame.render_widget(Clear, rect);
+
+        let mut lines = Vec::new();
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {} ", picker.title),
+                Style::default().fg(theme.status_fg),
+            ),
+            Span::styled("(Enter to jump):", Style::default().fg(theme.line_number)),
+        ]));
+        lines.push(Line::from(Span::styled(
+            "─".repeat((width as usize).saturating_sub(2)),
+            Style::default().fg(theme.border),
+        )));
+
+        let max_vis = height.saturating_sub(4) as usize;
+        let start = picker.scroll;
+        let end = (start + max_vis).min(picker.locations.len());
+
+        for i in start..end {
+            let loc = &picker.locations[i];
+            let is_sel = i == picker.selected_idx;
+            let bg = if is_sel {
+                theme.popup_sel_bg
+            } else {
+                theme.popup_bg
+            };
+            let style = if is_sel {
+                Style::default()
+                    .bg(bg)
+                    .fg(theme.popup_sel_fg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().bg(bg).fg(theme.popup_text)
+            };
+
+            let mark = if is_sel { " 󰅂 " } else { "   " };
+            let file_str = loc
+                .path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+
+            lines.push(Line::from(vec![
+                Span::styled(mark, Style::default().bg(bg).fg(theme.mode_insert)),
+                Span::styled(format!("{}:{}", file_str, loc.line + 1), style),
+            ]));
+        }
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.popup_border))
+            .style(Style::default().bg(theme.popup_bg))
+            .title(Line::from(Span::styled(
+                format!(" 󰌷 {} ", picker.title),
+                Style::default()
+                    .fg(theme.popup_text)
+                    .add_modifier(Modifier::BOLD),
+            )));
+
+        frame.render_widget(Paragraph::new(lines).block(block), rect);
+    }
+
+    // 11. Rename Symbol Prompt Modal
+    if let Some(name) = &editor.rename_prompt {
+        let width = 46u16.min(size.width.saturating_sub(2));
+        let height = 3u16;
+        let x = (size.width.saturating_sub(width)) / 2;
+        let y = (size.height.saturating_sub(height)) / 2;
+
+        let rect = Rect::new(x, y, width, height);
+        frame.render_widget(Clear, rect);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.mode_command))
+            .style(Style::default().bg(theme.popup_bg))
+            .title(Line::from(Span::styled(
+                " 󰑕 Rename Symbol (Enter to commit) ",
+                Style::default()
+                    .fg(theme.mode_command)
+                    .add_modifier(Modifier::BOLD),
+            )));
+
+        let line = Line::from(vec![
+            Span::styled(" New Name: ", Style::default().fg(theme.status_fg)),
+            Span::styled(
+                name,
+                Style::default()
+                    .fg(theme.popup_sel_fg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("█", Style::default().fg(theme.mode_command)),
+        ]);
+
+        frame.render_widget(Paragraph::new(line).block(block), rect);
+    }
+
+    // 12. Render Command Palette Modal
     if editor.palette.visible {
         let width = 46u16.min(size.width.saturating_sub(2));
         let height = 12u16.min(size.height.saturating_sub(2));
@@ -2015,7 +2670,7 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         frame.render_widget(Paragraph::new(palette_lines).block(p_block), palette_rect);
     }
 
-    // 6. Render Theme Picker Modal Overlay
+    // 13. Render Theme Picker Modal Overlay
     if let Some(picker) = &editor.theme_picker {
         let themes = Theme::all();
         let width = 48u16.min(size.width.saturating_sub(2));
@@ -2081,7 +2736,7 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         frame.render_widget(Paragraph::new(lines).block(block), picker_rect);
     }
 
-    // 7. Render LSP Picker Modal Overlay
+    // 14. Render LSP Picker Modal Overlay
     if let Some(picker) = &editor.lsp_picker {
         let width = 48u16.min(size.width.saturating_sub(2));
         let height = ((picker.candidates.len() as u16) + 4).min(size.height.saturating_sub(2));
@@ -2150,7 +2805,7 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         frame.render_widget(Paragraph::new(lines).block(block), picker_rect);
     }
 
-    // 8. Render In-Editor Help Modal
+    // 15. Render In-Editor Help Modal
     if editor.show_help {
         let width = 64u16.min(size.width.saturating_sub(4));
         let height = 22u16.min(size.height.saturating_sub(2));
@@ -2187,6 +2842,40 @@ fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         let c_desc = Style::default().fg(theme.popup_text);
 
         let content = vec![
+            Line::from(Span::styled("LSP INTELLIGENCE & CODE ACTIONS", c_sec)),
+            Line::from(vec![
+                Span::styled("  K              ", c_key),
+                Span::styled("Show Type & Documentation Hover card", c_desc),
+            ]),
+            Line::from(vec![
+                Span::styled("  gd             ", c_key),
+                Span::styled("Go to Definition", c_desc),
+            ]),
+            Line::from(vec![
+                Span::styled("  gr             ", c_key),
+                Span::styled("Find all References", c_desc),
+            ]),
+            Line::from(vec![
+                Span::styled("  ga             ", c_key),
+                Span::styled("Trigger Quickfixes & Code Actions", c_desc),
+            ]),
+            Line::from(vec![
+                Span::styled("  :fmt / Alt-F   ", c_key),
+                Span::styled("Format document with LSP server", c_desc),
+            ]),
+            Line::from(vec![
+                Span::styled("  :rn / F2       ", c_key),
+                Span::styled("Rename symbol across project", c_desc),
+            ]),
+            Line::from(vec![
+                Span::styled("  :sym / :symbols", c_key),
+                Span::styled("Fuzzy search document symbol outline", c_desc),
+            ]),
+            Line::from(vec![
+                Span::styled("  :hints         ", c_key),
+                Span::styled("Toggle inferred type & param inlay hints", c_desc),
+            ]),
+            Line::from(Span::raw("")),
             Line::from(Span::styled("NORMAL MODE MOTIONS", c_sec)),
             Line::from(vec![
                 Span::styled("  h, j, k, l     ", c_key),
