@@ -488,20 +488,20 @@ impl SupportedLanguage {
                 r#"
                 (identifier) @variable
                 (property_identifier) @property
-                (shorthand_property_identifier) @property
                 (call_expression function: (identifier) @function)
                 (call_expression function: (member_expression property: (property_identifier) @function))
                 (function_declaration name: (identifier) @function)
-                (function_expression name: (identifier) @function)
                 (method_definition name: (property_identifier) @function)
-                (arrow_function) @function
-                (formal_parameters (identifier) @parameter)
+
+                [ (this) (super) ] @variable
+
                 [
                   "function" "const" "let" "var" "return" "if" "else" "switch" "case"
                   "default" "for" "while" "do" "break" "continue" "try" "catch" "finally"
-                  "throw" "class" "extends" "import" "export" "from" "new" "static" "get" "set"
-                  "this" "super" "async" "await" "yield" "typeof" "instanceof" "void" "delete" "in" "of"
+                  "throw" "class" "extends" "import" "export" "from" "new"
+                  "async" "await" "yield" "typeof" "instanceof" "void" "delete" "in" "of"
                 ] @keyword
+
                 (comment) @comment
                 (string) @string
                 (template_string) @string
@@ -509,16 +509,6 @@ impl SupportedLanguage {
                 (number) @number
                 [ (true) (false) ] @number
                 (null) @keyword
-                (undefined) @keyword
-                ["=" "==" "===" "!=" "!==" "<" ">" "<=" ">=" "+" "-" "*" "/" "%" "&&" "||" "??" "=>" "..."] @operator
-                (jsx_opening_element (identifier) @tag)
-                (jsx_opening_element (member_expression) @tag)
-                (jsx_closing_element (identifier) @tag)
-                (jsx_closing_element (member_expression) @tag)
-                (jsx_self_closing_element (identifier) @tag)
-                (jsx_self_closing_element (member_expression) @tag)
-                (jsx_attribute (property_identifier) @property)
-                (jsx_text) @string
                 "#
             }
             SupportedLanguage::TypeScript => {
@@ -527,24 +517,22 @@ impl SupportedLanguage {
                 (type_identifier) @type
                 (predefined_type) @type
                 (property_identifier) @property
-                (shorthand_property_identifier) @property
                 (call_expression function: (identifier) @function)
                 (call_expression function: (member_expression property: (property_identifier) @function))
                 (function_declaration name: (identifier) @function)
-                (function_expression name: (identifier) @function)
                 (method_definition name: (property_identifier) @function)
-                (method_signature name: (property_identifier) @function)
-                (arrow_function) @function
-                (formal_parameters (required_parameter pattern: (identifier) @parameter))
-                (formal_parameters (identifier) @parameter)
+
+                [ (this) (super) ] @variable
+
                 [
                   "function" "const" "let" "var" "return" "if" "else" "switch" "case"
                   "default" "for" "while" "do" "break" "continue" "try" "catch" "finally"
-                  "throw" "class" "extends" "import" "export" "from" "new" "static" "get" "set"
-                  "this" "super" "async" "await" "yield" "typeof" "instanceof" "void" "delete" "in" "of"
+                  "throw" "class" "extends" "import" "export" "from" "new"
+                  "async" "await" "yield" "typeof" "instanceof" "void" "delete" "in" "of"
                   "type" "interface" "enum" "namespace" "declare" "abstract" "implements"
-                  "readonly" "as" "keyof" "is" "satisfies" "infer" "asserts" "override"
+                  "readonly" "as" "keyof" "is"
                 ] @keyword
+
                 (comment) @comment
                 (string) @string
                 (template_string) @string
@@ -552,10 +540,9 @@ impl SupportedLanguage {
                 (number) @number
                 [ (true) (false) ] @number
                 (null) @keyword
-                (undefined) @keyword
-                ["=" "==" "===" "!=" "!==" "<" ">" "<=" ">=" "+" "-" "*" "/" "%" "&&" "||" "??" "=>" "..." ":"] @operator
                 "#
             }
+
             // `.tsx` files parse with the dedicated TSX dialect grammar, which is a
             // superset of TypeScript that additionally understands JSX element syntax.
             SupportedLanguage::Tsx => {
