@@ -1,0 +1,11 @@
+{
+  "name": "subject0",
+  "version": 0.1,
+  "settings": {
+    "tab_size": 4,
+    "tree_sitter": true,
+    "fallback": null
+  },
+  "bindings": [1, 2, 3]
+}
+

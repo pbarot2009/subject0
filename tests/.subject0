@@ -1,0 +1,8 @@
+{
+  "line_wrap": true,
+  "preferred_lsps": {
+    "python": "pyright"
+  },
+  "show_inlay_hints": true,
+  "theme": "gruber-darker"
+}

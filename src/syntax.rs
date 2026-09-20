@@ -1,22 +1,7 @@
 //! # Tree-Sitter & Semantic Syntax Highlighting Engine
 //!
 //! Provides AST-based syntax highlighting, dynamic query evaluation, and icon/color
-//! resolution for languages supported by `subject0`:
-//!
-//! 1. **Compile-Time Static Tree-Sitter Highlighting (`SyntaxEngine`)**:
-//!    - Statically compiled Tree-sitter parsers and queries for core languages
-//!      (Rust, C, C++, Zig, Python, JavaScript, TypeScript, Go, JSON, TOML, YAML,
-//!      Bash, HTML, CSS, Markdown, and Java).
-//!    - Zero-copy line-rendering mapped against the active [`Theme`].
-//!    - Fallback to LSP Semantic Tokens when AST grammars are unavailable.
-//!
-//! 2. **Language Registry & Server Resolution (`SupportedLanguage`)**:
-//!    - File extension and special file name dispatching across 80+ languages.
-//!    - Path resolution for language servers installed in user and system paths.
-//!
-//! 3. **Icon & Visual Helper Subsystem**:
-//!    - Nerd Font glyph resolution and RGB color assignments for file extensions,
-//!      autocompletion suggestion kinds, and document symbols.
+//! resolution for languages supported by `subject0`.
 
 use std::{collections::HashMap, fs, path::PathBuf};
 
@@ -31,22 +16,7 @@ use crate::lsp::{
     CanonicalTokenType, SemanticTokenSpan, resolve_binary_path, subject0_config_dir,
     subject0_data_dir,
 };
-use crate::nerdfonts::{
-    FILE_ASM, FILE_ASTRO, FILE_C, FILE_CLOJURE, FILE_CMAKE, FILE_CONFIG, FILE_CPP, FILE_CRYSTAL,
-    FILE_CSHARP, FILE_CSS, FILE_D, FILE_DART, FILE_DOCKER, FILE_ELIXIR, FILE_ELM, FILE_ERLANG,
-    FILE_FISH, FILE_FORTRAN, FILE_FSHARP, FILE_GENERIC, FILE_GIT, FILE_GLEAM, FILE_GO, FILE_GRADLE,
-    FILE_GRAPHQL, FILE_HASKELL, FILE_HTML, FILE_JAVA, FILE_JAVASCRIPT, FILE_JSON, FILE_JULIA,
-    FILE_KOTLIN, FILE_LATEX, FILE_LISP, FILE_LUA, FILE_MAKE, FILE_MARKDOWN, FILE_NIM, FILE_NIX,
-    FILE_OCAML, FILE_ODIN, FILE_PERL, FILE_PHP, FILE_POWERSHELL, FILE_PROTO, FILE_PURESCRIPT,
-    FILE_PYTHON, FILE_R, FILE_RACKET, FILE_RUBY, FILE_RUST, FILE_SCALA, FILE_SHELL, FILE_SQL,
-    FILE_SVELTE, FILE_SWIFT, FILE_TERRAFORM, FILE_TOML, FILE_TYPESCRIPT, FILE_TYPST, FILE_V,
-    FILE_VIM, FILE_VUE, FILE_XML, FILE_YAML, FILE_ZIG, KIND_ARRAY, KIND_BOOLEAN, KIND_CLASS,
-    KIND_COLOR, KIND_CONSTANT, KIND_CONSTRUCTOR, KIND_DEFAULT, KIND_ENUM, KIND_ENUM_MEMBER,
-    KIND_EVENT, KIND_FIELD, KIND_FILE, KIND_FOLDER, KIND_FUNCTION, KIND_INTERFACE, KIND_KEY,
-    KIND_KEYWORD, KIND_METHOD, KIND_MODULE, KIND_NAMESPACE, KIND_NULL, KIND_NUMBER, KIND_OBJECT,
-    KIND_OPERATOR, KIND_PACKAGE, KIND_PROPERTY, KIND_REFERENCE, KIND_SNIPPET, KIND_STRING,
-    KIND_STRUCT, KIND_TEXT, KIND_TYPE_PARAM, KIND_UNIT, KIND_VALUE, KIND_VARIABLE,
-};
+use crate::nerdfonts::*;
 use crate::theme::Theme;
 
 // === Custom Highlight Query Paths & Dynamic Grammar Stubs ===
@@ -71,7 +41,6 @@ pub fn query_file_path(lang_name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Dynamic grammar facade maintaining clean compatibility with `cmd.rs`.
 pub struct DynamicGrammar;
 
 impl DynamicGrammar {
@@ -228,6 +197,7 @@ impl SupportedLanguage {
             "Makefile" | "makefile" | "GNUmakefile" => return SupportedLanguage::Makefile,
             "CMakeLists.txt" => return SupportedLanguage::Cmake,
             ".gitignore" | ".dockerignore" | ".npmignore" => return SupportedLanguage::Plain,
+            ".bashrc" | ".bash_profile" | ".zshrc" => return SupportedLanguage::Bash,
             ".env" => return SupportedLanguage::EnvFile,
             "nginx.conf" => return SupportedLanguage::Nginx,
             _ => {}
@@ -400,7 +370,6 @@ impl SupportedLanguage {
                 (call function: (attribute attribute: (identifier) @function))
                 (function_definition name: (identifier) @function)
                 (class_definition name: (identifier) @type)
-                (type (identifier) @type)
                 [
                   "def" "class" "return" "if" "elif" "else" "for" "while" "break"
                   "continue" "import" "from" "as" "try" "except" "finally" "raise"
@@ -415,7 +384,30 @@ impl SupportedLanguage {
                 (none) @keyword
                 "#
             }
-            SupportedLanguage::C | SupportedLanguage::Cpp => {
+            SupportedLanguage::C => {
+                r#"
+                (identifier) @variable
+                (type_identifier) @type
+                (primitive_type) @type
+                (field_identifier) @property
+                (call_expression function: (identifier) @function)
+                (call_expression function: (field_expression field: (field_identifier) @function))
+                (function_declarator declarator: (identifier) @function)
+                [
+                  "if" "else" "switch" "case" "default" "while" "do" "for" "break"
+                  "continue" "return" "goto" "struct" "union" "enum" "typedef"
+                  "sizeof" "static" "extern" "auto" "register" "const" "volatile"
+                ] @keyword
+                (comment) @comment
+                (string_literal) @string
+                (char_literal) @string
+                (number_literal) @number
+                (preproc_include) @macro
+                (preproc_def) @macro
+                (preproc_directive) @macro
+                "#
+            }
+            SupportedLanguage::Cpp => {
                 r#"
                 (identifier) @variable
                 (type_identifier) @type
@@ -482,30 +474,56 @@ impl SupportedLanguage {
                 (float_literal) @number
                 "#
             }
-            SupportedLanguage::JavaScript | SupportedLanguage::TypeScript => {
+            SupportedLanguage::JavaScript => {
                 r#"
                 (identifier) @variable
-                (type_identifier) @type
                 (property_identifier) @property
                 (call_expression function: (identifier) @function)
                 (call_expression function: (member_expression property: (property_identifier) @function))
                 (function_declaration name: (identifier) @function)
                 (method_definition name: (property_identifier) @function)
+                (arrow_function) @function
                 [
                   "function" "const" "let" "var" "return" "if" "else" "switch" "case"
                   "default" "for" "while" "do" "break" "continue" "try" "catch" "finally"
                   "throw" "class" "extends" "import" "export" "from" "new"
-                  "this" "super" "async" "await" "yield" "typeof" "instanceof" "void"
-                  "type" "interface" "enum" "namespace" "declare" "abstract" "implements"
+                  "this" "super" "async" "await" "yield" "typeof" "instanceof" "void" "delete" "in" "of"
                 ] @keyword
                 (comment) @comment
                 (string) @string
                 (template_string) @string
+                (regex) @string
                 (number) @number
-                (true) @number
-                (false) @number
+                [ (true) (false) ] @number
                 (null) @keyword
-                (undefined) @keyword
+                "#
+            }
+            SupportedLanguage::TypeScript => {
+                r#"
+                (identifier) @variable
+                (type_identifier) @type
+                (predefined_type) @type
+                (property_identifier) @property
+                (call_expression function: (identifier) @function)
+                (call_expression function: (member_expression property: (property_identifier) @function))
+                (function_declaration name: (identifier) @function)
+                (method_definition name: (property_identifier) @function)
+                (arrow_function) @function
+                [
+                  "function" "const" "let" "var" "return" "if" "else" "switch" "case"
+                  "default" "for" "while" "do" "break" "continue" "try" "catch" "finally"
+                  "throw" "class" "extends" "import" "export" "from" "new"
+                  "this" "super" "async" "await" "yield" "typeof" "instanceof" "void" "delete" "in" "of"
+                  "type" "interface" "enum" "namespace" "declare" "abstract" "implements"
+                  "readonly" "as" "keyof" "is"
+                ] @keyword
+                (comment) @comment
+                (string) @string
+                (template_string) @string
+                (regex) @string
+                (number) @number
+                [ (true) (false) ] @number
+                (null) @keyword
                 "#
             }
             SupportedLanguage::Bash | SupportedLanguage::Zsh => {
@@ -519,50 +537,51 @@ impl SupportedLanguage {
                 (comment) @comment
                 (string) @string
                 (raw_string) @string
-                (number) @number
                 "#
             }
             SupportedLanguage::Json => {
                 r#"
-                (pair key: (string) @property)
+                (pair key: (_) @property)
                 (string) @string
                 (number) @number
-                [ "true" "false" ] @number
-                "null" @keyword
+                [ (true) (false) ] @number
+                (null) @keyword
+                (comment) @comment
                 "#
             }
             SupportedLanguage::Toml => {
-                r"
+                r#"
                 (table (bare_key) @type)
-                (pair (bare_key) @property)
+                (pair [ (bare_key) (quoted_key) ] @property)
                 (string) @string
                 (integer) @number
                 (float) @number
                 (boolean) @number
                 (comment) @comment
-                "
+                "#
             }
             SupportedLanguage::Yaml => {
-                r"
-                (block_mapping_pair key: (flow_node) @property)
+                r#"
+                (block_mapping_pair key: (_) @property)
+                (flow_pair key: (_) @property)
                 (string_scalar) @string
                 (integer_scalar) @number
                 (float_scalar) @number
                 (boolean_scalar) @number
                 (null_scalar) @keyword
                 (comment) @comment
-                "
+                "#
             }
             SupportedLanguage::Html => {
-                r"
+                r#"
                 (tag_name) @tag
                 (attribute_name) @property
                 (attribute_value) @string
                 (comment) @comment
-                "
+                "#
             }
             SupportedLanguage::Css => {
-                r"
+                r#"
                 (tag_name) @tag
                 (class_name) @type
                 (id_name) @type
@@ -572,14 +591,17 @@ impl SupportedLanguage {
                 (float_value) @number
                 (string_value) @string
                 (comment) @comment
-                "
+                "#
             }
             SupportedLanguage::Markdown => {
-                r"
+                r#"
                 (atx_heading) @type
+                (setext_heading) @type
                 (fenced_code_block) @string
-                (link) @property
-                "
+                (indented_code_block) @string
+                (block_quote) @comment
+                (thematic_break) @keyword
+                "#
             }
             SupportedLanguage::Java => {
                 r#"
@@ -599,7 +621,10 @@ impl SupportedLanguage {
                 (string_literal) @string
                 (decimal_integer_literal) @number
                 (hex_integer_literal) @number
-                (floating_point_literal) @number
+                (octal_integer_literal) @number
+                (binary_integer_literal) @number
+                (decimal_floating_point_literal) @number
+                (hex_floating_point_literal) @number
                 (true) @number
                 (false) @number
                 (null_literal) @keyword
@@ -1171,7 +1196,6 @@ fn highlight_idx_to_token_type(idx: usize) -> CanonicalTokenType {
     }
 }
 
-/// Themed Syntax Highlighting Engine using compiled AST queries via `tree-sitter-highlight`.
 pub struct SyntaxEngine {
     pub language: SupportedLanguage,
     #[allow(dead_code)]
@@ -1199,16 +1223,24 @@ impl SyntaxEngine {
                 language.builtin_highlight_query().to_string()
             };
 
-            if let Ok(mut config) = HighlightConfiguration::new(
+            match HighlightConfiguration::new(
                 static_lang,
                 language.grammar_name(),
                 &query_src,
                 "",
                 "",
             ) {
-                config.configure(HIGHLIGHT_NAMES);
-                highlight_config = Some(config);
-                has_grammar = true;
+                Ok(mut config) => {
+                    config.configure(HIGHLIGHT_NAMES);
+                    highlight_config = Some(config);
+                    has_grammar = true;
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[subject0] Highlight config compilation error for {:?}: {err}",
+                        language
+                    );
+                }
             }
         }
 
@@ -1285,7 +1317,8 @@ impl SyntaxEngine {
                             Ok(idx) => idx,
                             Err(idx) => idx.saturating_sub(1),
                         };
-                        let end_line = match line_starts.binary_search(&end) {
+                        let end_target = end.saturating_sub(1).max(start);
+                        let end_line = match line_starts.binary_search(&end_target) {
                             Ok(idx) => idx,
                             Err(idx) => idx.saturating_sub(1),
                         };
@@ -1640,32 +1673,32 @@ pub fn completion_kind_icon(kind: u64) -> (&'static str, Color) {
 
 pub fn symbol_kind_icon(kind: u64) -> (&'static str, Color) {
     match kind {
-        1 => (KIND_FILE, Color::Rgb(120, 160, 255)),      // File
-        2 => (KIND_MODULE, Color::Rgb(220, 140, 80)),     // Module
-        3 => (KIND_NAMESPACE, Color::Rgb(150, 166, 200)), // Namespace
-        4 => (KIND_PACKAGE, Color::Rgb(220, 140, 80)),    // Package
-        5 => (KIND_CLASS, Color::Rgb(240, 180, 70)),      // Class
-        6 => (KIND_METHOD, Color::Rgb(80, 200, 240)),     // Method
-        7 => (KIND_PROPERTY, Color::Rgb(250, 210, 90)),   // Property
-        8 => (KIND_FIELD, Color::Rgb(250, 210, 90)),      // Field
-        9 => (KIND_CONSTRUCTOR, Color::Rgb(80, 200, 240)), // Constructor
-        10 => (KIND_ENUM, Color::Rgb(240, 180, 70)),      // Enum
-        11 => (KIND_INTERFACE, Color::Rgb(150, 166, 200)), // Interface
-        12 => (KIND_FUNCTION, Color::Rgb(80, 200, 240)),  // Function
-        13 => (KIND_VARIABLE, Color::Rgb(228, 228, 228)), // Variable
-        14 => (KIND_CONSTANT, Color::Rgb(255, 221, 51)),  // Constant
-        15 => (KIND_STRING, Color::Rgb(115, 201, 54)),    // String
-        16 => (KIND_NUMBER, Color::Rgb(149, 169, 159)),   // Number
-        17 => (KIND_BOOLEAN, Color::Rgb(255, 221, 51)),   // Boolean
-        18 => (KIND_ARRAY, Color::Rgb(150, 166, 200)),    // Array
-        19 => (KIND_OBJECT, Color::Rgb(240, 180, 70)),    // Object
-        20 => (KIND_KEY, Color::Rgb(220, 110, 240)),      // Key
-        21 => (KIND_NULL, Color::Rgb(149, 169, 159)),     // Null
-        22 => (KIND_ENUM_MEMBER, Color::Rgb(250, 210, 90)), // EnumMember
-        23 => (KIND_STRUCT, Color::Rgb(240, 180, 70)),    // Struct
-        24 => (KIND_EVENT, Color::Rgb(255, 180, 50)),     // Event
-        25 => (KIND_OPERATOR, Color::Rgb(220, 110, 240)), // Operator
-        26 => (KIND_TYPE_PARAM, Color::Rgb(149, 169, 159)), // TypeParameter
+        1 => (KIND_FILE, Color::Rgb(120, 160, 255)),
+        2 => (KIND_MODULE, Color::Rgb(220, 140, 80)),
+        3 => (KIND_NAMESPACE, Color::Rgb(150, 166, 200)),
+        4 => (KIND_PACKAGE, Color::Rgb(220, 140, 80)),
+        5 => (KIND_CLASS, Color::Rgb(240, 180, 70)),
+        6 => (KIND_METHOD, Color::Rgb(80, 200, 240)),
+        7 => (KIND_PROPERTY, Color::Rgb(250, 210, 90)),
+        8 => (KIND_FIELD, Color::Rgb(250, 210, 90)),
+        9 => (KIND_CONSTRUCTOR, Color::Rgb(80, 200, 240)),
+        10 => (KIND_ENUM, Color::Rgb(240, 180, 70)),
+        11 => (KIND_INTERFACE, Color::Rgb(150, 166, 200)),
+        12 => (KIND_FUNCTION, Color::Rgb(80, 200, 240)),
+        13 => (KIND_VARIABLE, Color::Rgb(228, 228, 228)),
+        14 => (KIND_CONSTANT, Color::Rgb(255, 221, 51)),
+        15 => (KIND_STRING, Color::Rgb(115, 201, 54)),
+        16 => (KIND_NUMBER, Color::Rgb(149, 169, 159)),
+        17 => (KIND_BOOLEAN, Color::Rgb(255, 221, 51)),
+        18 => (KIND_ARRAY, Color::Rgb(150, 166, 200)),
+        19 => (KIND_OBJECT, Color::Rgb(240, 180, 70)),
+        20 => (KIND_KEY, Color::Rgb(220, 110, 240)),
+        21 => (KIND_NULL, Color::Rgb(149, 169, 159)),
+        22 => (KIND_ENUM_MEMBER, Color::Rgb(250, 210, 90)),
+        23 => (KIND_STRUCT, Color::Rgb(240, 180, 70)),
+        24 => (KIND_EVENT, Color::Rgb(255, 180, 50)),
+        25 => (KIND_OPERATOR, Color::Rgb(220, 110, 240)),
+        26 => (KIND_TYPE_PARAM, Color::Rgb(149, 169, 159)),
         _ => (KIND_DEFAULT, Color::Rgb(170, 175, 190)),
     }
 }

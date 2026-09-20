@@ -1,0 +1,9 @@
+# YAML Syntax Test
+editor:
+  name: "subject0"
+  workers: 4
+  render_delay: 16.6
+  enable_lsp: true
+  backup_dir: null
+cache: { timeout: 30, persist: false }
+
