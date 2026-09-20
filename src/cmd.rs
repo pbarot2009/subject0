@@ -2,7 +2,7 @@
 //!
 //! Handles command-line arguments, flag decoding (`--help`, `--version`, `--clean`),
 //! jump-to-line specifiers (`+<line>`, `file:line:col`), path resolution across
-//! Termux, Linux, macOS, and Windows, grammar inspection, and language health diagnostics[`span_3`](start_span)[`span_3`](end_span).
+//! Termux, Linux, macOS, and Windows, grammar inspection, and language health diagnostics.
 
 use std::{
     env,
@@ -11,27 +11,28 @@ use std::{
 };
 
 use crate::lsp::{DynamicGrammar, SupportedLanguage, resolve_binary_path};
+use crate::nerdfonts::{CHECK, CHEVRON_RIGHT, FILE_DOCUMENT, HEALTH, LIGHTBULB, MISSING};
 
-/// Parsed command-line arguments[`span_4`](start_span)[`span_4`](end_span).
+/// Parsed command-line arguments.
 #[derive(Debug, Default, Clone)]
 pub struct CliArgs {
-    /// Path to target file or directory[`span_5`](start_span)[`span_5`](end_span).
+    /// Path to target file or directory.
     pub path: Option<PathBuf>,
-    /// Optional target line number to jump to on launch (1-based)[`span_6`](start_span)[`span_6`](end_span).
+    /// Optional target line number to jump to on launch (1-based).
     pub jump_line: Option<usize>,
-    /// Optional target column number to jump to on launch (1-based)[`span_7`](start_span)[`span_7`](end_span).
+    /// Optional target column number to jump to on launch (1-based).
     pub jump_col: Option<usize>,
-    /// Optional override for soft line wrapping[`span_8`](start_span)[`span_8`](end_span).
+    /// Optional override for soft line wrapping.
     pub line_wrap: Option<bool>,
-    /// When true, ignore `.subject0` configuration file[`span_9`](start_span)[`span_9`](end_span).
+    /// When true, ignore `.subject0` configuration file.
     pub ignore_config: bool,
 }
 
 impl CliArgs {
-    /// Parses CLI arguments from standard environment args[`span_10`](start_span)[`span_10`](end_span).
+    /// Parses CLI arguments from standard environment args.
     ///
     /// Intercepts `--help` and `--version` to print directly to stdout and exit
-    /// before terminal raw mode or alternate screen buffers are initialized[`span_11`](start_span)[`span_11`](end_span).
+    /// before terminal raw mode or alternate screen buffers are initialized.
     pub fn parse() -> Self {
         let raw_args: Vec<String> = env::args().skip(1).collect();
         let mut cli = Self::default();
@@ -94,13 +95,13 @@ impl CliArgs {
                 "-nw" | "--no-wrap" => {
                     cli.line_wrap = Some(false);
                 }
-                // Handle editor line-jump syntax (e.g., +42 or +100)[span_12](start_span)[span_12](end_span)
+                // Handle editor line-jump syntax (e.g., +42 or +100)
                 s if s.starts_with('+') => {
                     if let Ok(line_num) = s[1..].parse::<usize>() {
                         cli.jump_line = Some(line_num);
                     }
                 }
-                // Positional file or directory target[span_13](start_span)[span_13](end_span)
+                // Positional file or directory target
                 s if !s.starts_with('-') => {
                     Self::assign_target_path(&mut cli, s);
                 }
@@ -112,12 +113,12 @@ impl CliArgs {
         cli
     }
 
-    /// Strips enclosing quotes from argument flags[`span_14`](start_span)[`span_14`](end_span).
+    /// Strips enclosing quotes from argument flags.
     fn clean_lang_arg(raw: &str) -> String {
         raw.trim().trim_matches('\'').trim_matches('"').to_string()
     }
 
-    /// Assigns file path and checks for `path:line:col` or `path:line` format across Unix and Windows[`span_15`](start_span)[`span_15`](end_span).
+    /// Assigns file path and checks for `path:line:col` or `path:line` format across Unix and Windows.
     fn assign_target_path(cli: &mut Self, arg: &str) {
         if cli.path.is_some() {
             return;
@@ -175,7 +176,9 @@ impl CliArgs {
         let ver = env!("CARGO_PKG_VERSION");
 
         let lines = vec![
-            format!(" {blue}󰈙{r} {b}{white}subject0{r} {gray}(s0){r}  {green}v{ver}{r}"),
+            format!(
+                " {blue}{FILE_DOCUMENT}{r} {b}{white}subject0{r} {gray}(s0){r}  {green}v{ver}{r}"
+            ),
             format!(
                 " {gray}Modal terminal code editor with compile-time Tree-sitter & Full LSP engine{r}"
             ),
@@ -200,21 +203,21 @@ impl CliArgs {
         let ver = env!("CARGO_PKG_VERSION");
 
         let header = vec![format!(
-            " {blue}󰈙{r} {b}{white}subject0{r} {gray}(s0){r} {green}v{ver}{r} {gray}— Terminal Modal Code Editor with Full LSP{r}"
+            " {blue}{FILE_DOCUMENT}{r} {b}{white}subject0{r} {gray}(s0){r} {green}v{ver}{r} {gray}— Terminal Modal Code Editor with Full LSP{r}"
         )];
 
         Self::print_boxed_card(&header, 66);
 
         println!(
             "
-  {b}{blue}󰅂 USAGE:{r}
+  {b}{blue}{CHEVRON_RIGHT} USAGE:{r}
       {white}s0{r} {yellow}[OPTIONS]{r} {green}[PATH]{r} {magenta}[+LINE]{r}
 
-  {b}{blue}󰅂 ARGUMENTS:{r}
+  {b}{blue}{CHEVRON_RIGHT} ARGUMENTS:{r}
       {green}[PATH]{r}             File or folder path {gray}(opens scratch buffer if empty){r}
       {magenta}[+LINE]{r}            Jump directly to line number {gray}(e.g. +42 or path:42:10){r}
 
-  {b}{blue}󰅂 OPTIONS:{r}
+  {b}{blue}{CHEVRON_RIGHT} OPTIONS:{r}
       {yellow}-h, --help{r}                Show this formatted help menu and exit
       {yellow}-v, --version{r}             Print version information and metadata
       {yellow}-g, --install-grammar <L>{r}  Inspect status of built-in Tree-sitter grammar
@@ -224,7 +227,7 @@ impl CliArgs {
       {yellow}--clean{r}                   Bypass workspace and user {gray}.subject0{r} configs
       {yellow}--{r}                        Treat all subsequent arguments as positional paths
 
-  {b}{blue}󰅂 LSP KEYBINDINGS (IN-EDITOR):{r}
+  {b}{blue}{CHEVRON_RIGHT} LSP KEYBINDINGS (IN-EDITOR):{r}
       {magenta}K{r}                         Hover documentation and inferred type inspector
       {magenta}gd{r}                        Jump directly to definition under cursor
       {magenta}gr{r}                        Find all references across project
@@ -237,7 +240,7 @@ impl CliArgs {
       {magenta}:lsp-restart{r}             Reboot crashed or frozen Language Server
       {magenta}:hints{r}                   Toggle inline inferred type & parameter hints
 
-  {b}{blue}󰅂 EXAMPLES:{r}
+  {b}{blue}{CHEVRON_RIGHT} EXAMPLES:{r}
       {gray}# Open a file at line 50, column 10:{r}
       {white}s0 src/main.rs:50:10{r}
 
@@ -252,7 +255,7 @@ impl CliArgs {
         );
     }
 
-    /// Renders a bordered card with dynamic padding, guaranteeing border alignment[`span_16`](start_span)[`span_16`](end_span).
+    /// Renders a bordered card with dynamic padding, guaranteeing border alignment.
     fn print_boxed_card(lines: &[String], min_width: usize) {
         let r = "\x1b[0m";
         let border = "\x1b[38;2;70;75;95m";
@@ -275,7 +278,7 @@ impl CliArgs {
         println!("{border}╰{}╯{r}", "─".repeat(inner_width + 2));
     }
 
-    /// Computes terminal display character width handling escape codes and double-width glyphs[`span_17`](start_span)[`span_17`](end_span).
+    /// Computes terminal display character width handling escape codes and double-width glyphs.
     fn visible_width(s: &str) -> usize {
         let mut width = 0;
         let mut in_escape = false;
@@ -323,7 +326,7 @@ impl CliArgs {
                 .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     }
 
-    /// Inspects status of a Tree-sitter grammar[`span_18`](start_span)[`span_18`](end_span).
+    /// Inspects status of a Tree-sitter grammar.
     fn run_grammar_installer(lang: &str, _force: bool) {
         let r = "\x1b[0m";
         let b = "\x1b[1m";
@@ -369,7 +372,7 @@ impl CliArgs {
             };
 
             let lines = vec![
-                format!(" {green}󰄬 Built-in Static Grammar{r}"),
+                format!(" {green}{CHECK} Built-in Static Grammar{r}"),
                 format!(" Language:  {b}{canon_lang}{r}"),
                 format!(" Tier:      {green}Statically linked (zero runtime overhead){r}"),
                 format!(" Queries:   {query_status}"),
@@ -382,7 +385,7 @@ impl CliArgs {
         }
 
         let lines = vec![
-            format!(" {yellow}󰌵 LSP Semantic Highlighting & Intelligence Tier{r}"),
+            format!(" {yellow}{LIGHTBULB} LSP Semantic Highlighting & Intelligence Tier{r}"),
             format!(" Language:  {b}{canon_lang}{r}"),
             format!(" Status:    {gray}No built-in Tree-sitter grammar{r}"),
             String::new(),
@@ -397,7 +400,7 @@ impl CliArgs {
         Self::print_boxed_card(&lines, 66);
     }
 
-    /// Prints a comprehensive health report showing static grammars and LSP servers[`span_19`](start_span)[`span_19`](end_span).
+    /// Prints a comprehensive health report showing static grammars and LSP servers.
     fn run_health_check() {
         let r = "\x1b[0m";
         let b = "\x1b[1m";
@@ -407,11 +410,11 @@ impl CliArgs {
         let white = "\x1b[38;2;225;230;240m";
         let ver = env!("CARGO_PKG_VERSION");
 
-        let ok = format!("{green}󰄬{r}");
-        let missing = format!("{gray}󰚌{r}");
+        let ok = format!("{green}{CHECK}{r}");
+        let missing = format!("{gray}{MISSING}{r}");
 
         let header = vec![format!(
-            " {blue}󰆉{r} {b}{white}subject0{r} {gray}(s0){r} {green}v{ver}{r} {gray}— Language Support & Health Diagnostics{r}"
+            " {blue}{HEALTH}{r} {b}{white}subject0{r} {gray}(s0){r} {green}v{ver}{r} {gray}— Language Support & Health Diagnostics{r}"
         )];
         Self::print_boxed_card(&header, 66);
         println!();
@@ -462,11 +465,11 @@ impl CliArgs {
         for lang in langs {
             let (ast_badge, ast_pad) = if lang.static_language().is_some() {
                 static_count += 1;
-                (format!("{green}󰄬 Static{r}"), 4)
+                (format!("{green}{CHECK} Static{r}"), 4)
             } else if lang.grammar_name().is_empty() {
                 (format!("{gray}  ·{r}     "), 5)
             } else {
-                (format!("{blue}󰌵 LSP{r}   "), 5)
+                (format!("{blue}{LIGHTBULB} LSP{r}   "), 5)
             };
 
             let candidates = lang.candidate_servers();
@@ -523,7 +526,7 @@ impl CliArgs {
             ),
             String::new(),
             format!(
-                " {green}Static{r} = Built-in AST grammar   {blue}LSP{r} = Inlay hints, symbols, semantic tokens   {gray}󰚌{r} = Not found in PATH"
+                " {green}Static{r} = Built-in AST grammar   {blue}LSP{r} = Inlay hints, symbols, semantic tokens   {gray}{MISSING}{r} = Not found in PATH"
             ),
         ];
         Self::print_boxed_card(&summary, 64);

@@ -4,10 +4,10 @@
 //!
 //! 1. **Text Storage & Mutability ([`ropey::Rope`])**:
 //!    Buffer contents are stored as a chunked, reference-counted B-tree rope with $O(\log N)$
-//!    mutations and $O(1)$ copy-on-write structural sharing for undo/redo snapshots[`span_0`](start_span)[`span_0`](end_span).
+//!    mutations and $O(1)$ copy-on-write structural sharing for undo/redo snapshots.
 //!
 //! 2. **Modal Editing State Machine ([`Mode`])**:
-//!    Implements modal key semantics across `Normal`, `Insert`, `Command`, and `Visual` states[`span_1`](start_span)[`span_1`](end_span).
+//!    Implements modal key semantics across `Normal`, `Insert`, `Command`, and `Visual` states.
 //!
 //! 3. **Top-Tier Language Server Protocol (LSP) State Integration**:
 //!    - Multi-file workspace edit dispatcher applying atomic updates across disk and memory.
@@ -18,7 +18,7 @@
 //!
 //! 4. **Theming, Diagnostics Sync & Data Protection**:
 //!    Maintains AST highlighting trees, shifts diagnostic positions on row mutations,
-//!    tracks a bidirectional undo/redo ring, and protects unsaved buffers[`span_2`](start_span)[`span_2`](end_span).
+//!    tracks a bidirectional undo/redo ring, and protects unsaved buffers.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -33,6 +33,13 @@ use crate::lsp::{
     LspOutbound, LspStatus, SignatureHelpInfo, SuggestionItem, SymbolItem, SyntaxEngine,
     TextEditItem, char_to_utf16_col, run_lsp_actor, subject0_config_dir, utf16_to_char_col,
 };
+use crate::nerdfonts::{
+    ARROW_LEFT, ARROW_RIGHT, CMD_CODE_ACTIONS, CMD_DEFINITION, CMD_FORMAT, CMD_HOVER,
+    CMD_INSERT_ABOVE, CMD_INSERT_BELOW, CMD_JOIN, CMD_JUMP_BOTTOM, CMD_JUMP_TOP, CMD_PASTE,
+    CMD_QUIT, CMD_REDO, CMD_REFERENCES, CMD_RENAME, CMD_RESTART, CMD_SAVE, CMD_SAVE_QUIT,
+    CMD_SYMBOLS, CMD_TOGGLE_CASE, CMD_UNDO, CMD_VISUAL, CMD_YANK, DIAG_ERROR, DIAG_WARN,
+    FILE_DOCUMENT, FOLDER, GEAR_CONFIG, HELP, HINTS_ON, LIGHTBULB, SETTINGS_COGS, THEME, WRAP_ON,
+};
 use crate::theme::Theme;
 
 use anyhow::{Result, anyhow};
@@ -40,14 +47,14 @@ use ropey::Rope;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-/// Persistent editor configuration stored in `.subject0`[`span_3`](start_span)[`span_3`](end_span).
+/// Persistent editor configuration stored in `.subject0`.
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     pub preferred_lsps: HashMap<String, String>,
     pub line_wrap: bool,
     pub theme: String,
     pub show_inlay_hints: bool,
-    /// Resolved absolute path to the `.subject0` configuration file[`span_4`](start_span)[`span_4`](end_span).
+    /// Resolved absolute path to the `.subject0` configuration file.
     pub source_path: PathBuf,
 }
 
@@ -143,12 +150,12 @@ impl AppConfig {
     }
 }
 
-/// Interactive modal state when choosing from available color themes[`span_5`](start_span)[`span_5`](end_span).
+/// Interactive modal state when choosing from available color themes.
 pub struct ThemePicker {
     pub selected_idx: usize,
 }
 
-/// Interactive modal state when multiple language servers are detected for a language[`span_6`](start_span)[`span_6`](end_span).
+/// Interactive modal state when multiple language servers are detected for a language.
 pub struct LspPicker {
     pub language_id: String,
     pub candidates: Vec<String>,
@@ -193,7 +200,7 @@ pub struct LocationPicker {
     pub scroll: usize,
 }
 
-/// Active modal editing state[`span_7`](start_span)[`span_7`](end_span).
+/// Active modal editing state.
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum Mode {
     Normal,
@@ -202,7 +209,7 @@ pub enum Mode {
     Visual { anchor_x: usize, anchor_y: usize },
 }
 
-/// Identifies which viewport element currently holds keyboard input focus[`span_8`](start_span)[`span_8`](end_span).
+/// Identifies which viewport element currently holds keyboard input focus.
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum Focus {
     Editor,
@@ -272,217 +279,217 @@ pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand {
         title: "Format Document (LSP)",
         shortcut: ":fmt / Alt-F",
-        icon: "󰉠",
+        icon: CMD_FORMAT,
         id: CommandId::FormatDocument,
     },
     PaletteCommand {
         title: "Show Documentation / Type Hover",
         shortcut: "K / :hover",
-        icon: "󰋽",
+        icon: CMD_HOVER,
         id: CommandId::ShowHover,
     },
     PaletteCommand {
         title: "Code Actions & Quickfixes",
         shortcut: "ga / :ca",
-        icon: "󰌵",
+        icon: CMD_CODE_ACTIONS,
         id: CommandId::CodeActions,
     },
     PaletteCommand {
         title: "Go to Definition",
         shortcut: "gd",
-        icon: "󰌹",
+        icon: CMD_DEFINITION,
         id: CommandId::GoToDefinition,
     },
     PaletteCommand {
         title: "Find References",
         shortcut: "gr",
-        icon: "󰌷",
+        icon: CMD_REFERENCES,
         id: CommandId::FindReferences,
     },
     PaletteCommand {
         title: "Rename Symbol (Project-Wide)",
         shortcut: ":rn / F2",
-        icon: "󰑕",
+        icon: CMD_RENAME,
         id: CommandId::RenameSymbol,
     },
     PaletteCommand {
         title: "Document Symbol Outline",
         shortcut: ":symbols / :sym",
-        icon: "󰅩",
+        icon: CMD_SYMBOLS,
         id: CommandId::DocumentSymbols,
     },
     PaletteCommand {
         title: "Next Compiler Diagnostic",
         shortcut: ":nd / ]d",
-        icon: "",
+        icon: DIAG_ERROR,
         id: CommandId::NextDiagnostic,
     },
     PaletteCommand {
         title: "Previous Compiler Diagnostic",
         shortcut: ":pd / [d",
-        icon: "",
+        icon: DIAG_WARN,
         id: CommandId::PrevDiagnostic,
     },
     PaletteCommand {
         title: "Jump Backward (Location History)",
         shortcut: "Ctrl-O",
-        icon: "󰁍",
+        icon: ARROW_LEFT,
         id: CommandId::JumpBackward,
     },
     PaletteCommand {
         title: "Jump Forward (Location History)",
         shortcut: "Ctrl-I",
-        icon: "󰁔",
+        icon: ARROW_RIGHT,
         id: CommandId::JumpForward,
     },
     PaletteCommand {
         title: "Restart Active LSP Server",
         shortcut: ":lsp-restart",
-        icon: "󰑐",
+        icon: CMD_RESTART,
         id: CommandId::RestartLsp,
     },
     PaletteCommand {
         title: "Toggle Inferred Type & Param Inlay Hints",
         shortcut: ":hints",
-        icon: "󰌵",
+        icon: HINTS_ON,
         id: CommandId::ToggleInlayHints,
     },
     PaletteCommand {
         title: "Select All Buffer",
         shortcut: "%",
-        icon: "󰈙",
+        icon: FILE_DOCUMENT,
         id: CommandId::SelectAll,
     },
     PaletteCommand {
         title: "Toggle File Explorer",
         shortcut: "Ctrl-E / :e",
-        icon: "󰉓",
+        icon: FOLDER,
         id: CommandId::ToggleExplorer,
     },
     PaletteCommand {
         title: "Toggle Line Wrap",
         shortcut: ":wrap",
-        icon: "󰖶",
+        icon: WRAP_ON,
         id: CommandId::ToggleWrap,
     },
     PaletteCommand {
         title: "Save Buffer",
         shortcut: ":w",
-        icon: "󰆓",
+        icon: CMD_SAVE,
         id: CommandId::Save,
     },
     PaletteCommand {
         title: "Save and Quit",
         shortcut: ":wq",
-        icon: "󰆘",
+        icon: CMD_SAVE_QUIT,
         id: CommandId::SaveQuit,
     },
     PaletteCommand {
         title: "Quit Editor",
         shortcut: ":q",
-        icon: "󰈆",
+        icon: CMD_QUIT,
         id: CommandId::Quit,
     },
     PaletteCommand {
         title: "Force Quit",
         shortcut: ":q!",
-        icon: "󰈆",
+        icon: CMD_QUIT,
         id: CommandId::QuitForce,
     },
     PaletteCommand {
         title: "Enter Visual Selection",
         shortcut: "v",
-        icon: "󰒅",
+        icon: CMD_VISUAL,
         id: CommandId::EnterVisual,
     },
     PaletteCommand {
         title: "Insert Line Below",
         shortcut: "o",
-        icon: "󰙍",
+        icon: CMD_INSERT_BELOW,
         id: CommandId::InsertBelow,
     },
     PaletteCommand {
         title: "Insert Line Above",
         shortcut: "O",
-        icon: "󰙌",
+        icon: CMD_INSERT_ABOVE,
         id: CommandId::InsertAbove,
     },
     PaletteCommand {
         title: "Join Lines",
         shortcut: "J",
-        icon: "󰘥",
+        icon: CMD_JOIN,
         id: CommandId::JoinLines,
     },
     PaletteCommand {
         title: "Undo Change",
         shortcut: "u",
-        icon: "󰑌",
+        icon: CMD_UNDO,
         id: CommandId::Undo,
     },
     PaletteCommand {
         title: "Redo Change",
         shortcut: "Ctrl-R",
-        icon: "󰑎",
+        icon: CMD_REDO,
         id: CommandId::Redo,
     },
     PaletteCommand {
         title: "Yank Selection / Line",
         shortcut: "y",
-        icon: "󰅍",
+        icon: CMD_YANK,
         id: CommandId::Yank,
     },
     PaletteCommand {
         title: "Paste from Clipboard",
         shortcut: "p",
-        icon: "󰅒",
+        icon: CMD_PASTE,
         id: CommandId::Paste,
     },
     PaletteCommand {
         title: "Toggle Case (Upper/Lower)",
         shortcut: "~",
-        icon: "󰬴",
+        icon: CMD_TOGGLE_CASE,
         id: CommandId::ToggleCase,
     },
     PaletteCommand {
         title: "Jump to Top of File",
         shortcut: "gg",
-        icon: "󰗈",
+        icon: CMD_JUMP_TOP,
         id: CommandId::JumpTop,
     },
     PaletteCommand {
         title: "Jump to Bottom of File",
         shortcut: "G / ge",
-        icon: "󰗈",
+        icon: CMD_JUMP_BOTTOM,
         id: CommandId::JumpBottom,
     },
     PaletteCommand {
         title: "Trigger AI / LSP Completions",
         shortcut: "Ctrl-Space",
-        icon: "󰌵",
+        icon: LIGHTBULB,
         id: CommandId::TriggerCompletion,
     },
     PaletteCommand {
         title: "Select Active LSP Server",
         shortcut: ":lsp",
-        icon: "",
+        icon: SETTINGS_COGS,
         id: CommandId::SelectLsp,
     },
     PaletteCommand {
         title: "Select Color Theme",
         shortcut: ":theme",
-        icon: "󰔎",
+        icon: THEME,
         id: CommandId::SelectTheme,
     },
     PaletteCommand {
         title: "Save Config to .subject0",
         shortcut: ":cfg",
-        icon: "󰄛",
+        icon: GEAR_CONFIG,
         id: CommandId::SaveConfig,
     },
     PaletteCommand {
         title: "Show Keybindings & Help",
         shortcut: "? / :help",
-        icon: "󰋖",
+        icon: HELP,
         id: CommandId::ShowHelp,
     },
 ];
@@ -550,7 +557,7 @@ impl FileExplorer {
         explorer
     }
 
-    /// Refreshes the explorer tree while preserving expanded folders across refreshes[`span_9`](start_span)[`span_9`](end_span).
+    /// Refreshes the explorer tree while preserving expanded folders across refreshes.
     pub fn refresh(&mut self) {
         let expanded_paths: HashSet<PathBuf> = self
             .entries
@@ -895,7 +902,7 @@ impl Editor {
         })
     }
 
-    /// Switches the active color theme and writes it to `.subject0`[`span_10`](start_span)[`span_10`](end_span).
+    /// Switches the active color theme and writes it to `.subject0`.
     pub fn set_theme(&mut self, theme_name: &str) {
         self.theme = Theme::from_name(theme_name);
         self.config.theme = self.theme.name.to_string();
@@ -1004,7 +1011,7 @@ impl Editor {
         }
     }
 
-    /// Loads a new file from disk into the current editor buffer, protecting against unsaved modifications[`span_11`](start_span)[`span_11`](end_span).
+    /// Loads a new file from disk into the current editor buffer, protecting against unsaved modifications.
     pub fn open_file<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
         if self.modified {
             return Err(anyhow!(
@@ -1484,7 +1491,7 @@ impl Editor {
         }
     }
 
-    /// Pushes current buffer state into the undo stack and clears redo history[`span_12`](start_span)[`span_12`](end_span).
+    /// Pushes current buffer state into the undo stack and clears redo history.
     pub fn snapshot(&mut self) {
         if self.undo_stack.len() >= 64 {
             self.undo_stack.remove(0);
@@ -1498,7 +1505,7 @@ impl Editor {
         self.redo_stack.clear();
     }
 
-    /// Reverts the document rope to the most recent checkpoint on `undo_stack`[`span_13`](start_span)[`span_13`](end_span).
+    /// Reverts the document rope to the most recent checkpoint on `undo_stack`.
     pub fn undo(&mut self) {
         if let Some(prev) = self.undo_stack.pop() {
             if self.redo_stack.len() >= 64 {
@@ -1523,7 +1530,7 @@ impl Editor {
         }
     }
 
-    /// Steps forward through historical edits using `redo_stack`[`span_14`](start_span)[`span_14`](end_span).
+    /// Steps forward through historical edits using `redo_stack`.
     pub fn redo(&mut self) {
         if let Some(next) = self.redo_stack.pop() {
             if self.undo_stack.len() >= 64 {
@@ -1549,7 +1556,7 @@ impl Editor {
         }
     }
 
-    /// Shifts diagnostic coordinates down when lines are added strictly below them[`span_15`](start_span)[`span_15`](end_span).
+    /// Shifts diagnostic coordinates down when lines are added strictly below them.
     fn shift_diagnostics_down(&mut self, after_line: usize, count: usize) {
         for d in &mut self.diagnostics {
             if d.line > after_line {
@@ -1559,7 +1566,7 @@ impl Editor {
         }
     }
 
-    /// Shifts diagnostic coordinates down when lines are inserted at or above them[`span_16`](start_span)[`span_16`](end_span).
+    /// Shifts diagnostic coordinates down when lines are inserted at or above them.
     fn shift_diagnostics_down_from(&mut self, from_line: usize, count: usize) {
         for d in &mut self.diagnostics {
             if d.line >= from_line {
@@ -1569,7 +1576,7 @@ impl Editor {
         }
     }
 
-    /// Shifts diagnostic coordinates up when a line above them is removed[`span_17`](start_span)[`span_17`](end_span).
+    /// Shifts diagnostic coordinates up when a line above them is removed.
     fn shift_diagnostics_up(&mut self, removed_line: usize) {
         self.diagnostics
             .retain(|d| d.line != removed_line && d.end_line != removed_line);
@@ -2054,7 +2061,7 @@ impl Editor {
         self.on_buffer_modified();
     }
 
-    /// Dedents current line by up to 4 spaces or 1 tab[`span_18`](start_span)[`span_18`](end_span).
+    /// Dedents current line by up to 4 spaces or 1 tab.
     pub fn dedent_current_line(&mut self) {
         if self.cursor_y >= self.rope.len_lines() {
             return;
@@ -2568,7 +2575,7 @@ impl Editor {
         }
     }
 
-    /// Viewport updater that guarantees instant response on large files[`span_19`](start_span)[`span_19`](end_span).
+    /// Viewport updater that guarantees instant response on large files.
     pub fn update_scroll(&mut self, width: usize, height: usize) {
         if height == 0 || width == 0 {
             return;

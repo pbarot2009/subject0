@@ -65,6 +65,14 @@ use tokio::{
 };
 use tree_sitter_highlight::{Highlight, HighlightConfiguration, HighlightEvent, Highlighter};
 
+use crate::nerdfonts::{
+    FILE_C, FILE_CPP, FILE_CSHARP, FILE_CSS, FILE_DART, FILE_GENERIC, FILE_GO, FILE_HTML,
+    FILE_JAVA, FILE_JAVASCRIPT, FILE_JSON, FILE_KOTLIN, FILE_LUA, FILE_MARKDOWN, FILE_ODIN,
+    FILE_PHP, FILE_PYTHON, FILE_RUBY, FILE_RUST, FILE_SCALA, FILE_SHELL, FILE_SQL, FILE_SWIFT,
+    FILE_TOML, FILE_TYPESCRIPT, FILE_YAML, FILE_ZIG, KIND_BOOLEAN, KIND_CLASS, KIND_CONSTANT,
+    KIND_DEFAULT, KIND_FILE, KIND_FUNCTION, KIND_KEYWORD, KIND_MODULE, KIND_NAMESPACE, KIND_NUMBER,
+    KIND_OPERATOR, KIND_PROPERTY, KIND_STRING, KIND_TYPE_PARAM, KIND_VARIABLE,
+};
 use crate::theme::Theme;
 
 // === Standardized LSP Client Types ===
@@ -3541,64 +3549,64 @@ pub fn file_icon_and_color(path: Option<&PathBuf>) -> (&'static str, Color) {
         .unwrap_or("");
 
     match ext {
-        "rs" => ("", Color::Rgb(235, 102, 60)),
-        "py" | "pyi" => ("", Color::Rgb(255, 212, 59)),
-        "go" => ("", Color::Rgb(80, 200, 240)),
-        "zig" | "zon" => ("", Color::Rgb(245, 160, 60)),
-        "c" | "h" => ("", Color::Rgb(80, 140, 255)),
-        "cpp" | "hpp" | "cc" | "cxx" => ("", Color::Rgb(80, 140, 255)),
-        "js" | "jsx" | "mjs" | "cjs" => ("", Color::Rgb(245, 215, 75)),
-        "ts" | "tsx" | "mts" | "cts" => ("", Color::Rgb(80, 160, 240)),
-        "html" | "htm" => ("", Color::Rgb(240, 100, 60)),
-        "css" | "scss" | "less" => ("", Color::Rgb(80, 160, 240)),
-        "json" => ("", Color::Rgb(240, 200, 80)),
-        "toml" => ("", Color::Rgb(160, 80, 50)),
-        "yaml" | "yml" => ("", Color::Rgb(220, 100, 100)),
-        "sh" | "bash" | "zsh" => ("", Color::Rgb(100, 200, 140)),
-        "lua" => ("", Color::Rgb(80, 140, 240)),
-        "md" | "markdown" => ("", Color::Rgb(120, 180, 255)),
-        "java" => ("", Color::Rgb(240, 80, 80)),
-        "cs" => ("󰌛", Color::Rgb(180, 120, 240)),
-        "php" => ("", Color::Rgb(130, 140, 220)),
-        "rb" | "rake" => ("", Color::Rgb(220, 60, 60)),
-        "kt" | "kts" => ("", Color::Rgb(160, 100, 240)),
-        "swift" => ("", Color::Rgb(240, 120, 60)),
-        "dart" => ("", Color::Rgb(80, 180, 240)),
-        "sql" => ("", Color::Rgb(220, 140, 80)),
-        "scala" | "sc" => ("", Color::Rgb(220, 60, 60)),
-        "odin" => ("", Color::Rgb(80, 180, 220)),
-        _ => ("󰈔", Color::Rgb(160, 165, 175)),
+        "rs" => (FILE_RUST, Color::Rgb(235, 102, 60)),
+        "py" | "pyi" => (FILE_PYTHON, Color::Rgb(255, 212, 59)),
+        "go" => (FILE_GO, Color::Rgb(80, 200, 240)),
+        "zig" | "zon" => (FILE_ZIG, Color::Rgb(245, 160, 60)),
+        "c" | "h" => (FILE_C, Color::Rgb(80, 140, 255)),
+        "cpp" | "hpp" | "cc" | "cxx" => (FILE_CPP, Color::Rgb(80, 140, 255)),
+        "js" | "jsx" | "mjs" | "cjs" => (FILE_JAVASCRIPT, Color::Rgb(245, 215, 75)),
+        "ts" | "tsx" | "mts" | "cts" => (FILE_TYPESCRIPT, Color::Rgb(80, 160, 240)),
+        "html" | "htm" => (FILE_HTML, Color::Rgb(240, 100, 60)),
+        "css" | "scss" | "less" => (FILE_CSS, Color::Rgb(80, 160, 240)),
+        "json" => (FILE_JSON, Color::Rgb(240, 200, 80)),
+        "toml" => (FILE_TOML, Color::Rgb(160, 80, 50)),
+        "yaml" | "yml" => (FILE_YAML, Color::Rgb(220, 100, 100)),
+        "sh" | "bash" | "zsh" => (FILE_SHELL, Color::Rgb(100, 200, 140)),
+        "lua" => (FILE_LUA, Color::Rgb(80, 140, 240)),
+        "md" | "markdown" => (FILE_MARKDOWN, Color::Rgb(120, 180, 255)),
+        "java" => (FILE_JAVA, Color::Rgb(240, 80, 80)),
+        "cs" => (FILE_CSHARP, Color::Rgb(180, 120, 240)),
+        "php" => (FILE_PHP, Color::Rgb(130, 140, 220)),
+        "rb" | "rake" => (FILE_RUBY, Color::Rgb(220, 60, 60)),
+        "kt" | "kts" => (FILE_KOTLIN, Color::Rgb(160, 100, 240)),
+        "swift" => (FILE_SWIFT, Color::Rgb(240, 120, 60)),
+        "dart" => (FILE_DART, Color::Rgb(80, 180, 240)),
+        "sql" => (FILE_SQL, Color::Rgb(220, 140, 80)),
+        "scala" | "sc" => (FILE_SCALA, Color::Rgb(220, 60, 60)),
+        "odin" => (FILE_ODIN, Color::Rgb(80, 180, 220)),
+        _ => (FILE_GENERIC, Color::Rgb(160, 165, 175)),
     }
 }
 
 pub fn completion_kind_icon(kind: u64) -> (&'static str, Color) {
     match kind {
-        2 | 3 => ("󰊕", Color::Rgb(80, 200, 240)),
-        4 => ("󰌗", Color::Rgb(240, 180, 70)),
-        5 | 6 => ("󰫧", Color::Rgb(250, 210, 90)),
-        7 | 8 => ("󱡠", Color::Rgb(120, 160, 255)),
-        9 => ("󰏗", Color::Rgb(140, 220, 120)),
-        14 => ("󰌆", Color::Rgb(220, 110, 240)),
-        _ => ("󰈚", Color::Rgb(170, 175, 190)),
+        2 | 3 => (KIND_FUNCTION, Color::Rgb(80, 200, 240)),
+        4 => (KIND_CLASS, Color::Rgb(240, 180, 70)),
+        5 | 6 => (KIND_PROPERTY, Color::Rgb(250, 210, 90)),
+        7 | 8 => (KIND_VARIABLE, Color::Rgb(120, 160, 255)),
+        9 => (KIND_MODULE, Color::Rgb(140, 220, 120)),
+        14 => (KIND_KEYWORD, Color::Rgb(220, 110, 240)),
+        _ => (KIND_DEFAULT, Color::Rgb(170, 175, 190)),
     }
 }
 
 pub fn symbol_kind_icon(kind: u64) -> (&'static str, Color) {
     match kind {
-        1 => ("󰅩", Color::Rgb(120, 160, 255)),          // File
-        2 | 4 => ("󰏗", Color::Rgb(220, 140, 80)),       // Module, Package
-        3 | 18 => ("󰅲", Color::Rgb(150, 166, 200)),     // Namespace, Array
-        5 | 10 | 23 => ("󰌗", Color::Rgb(240, 180, 70)), // Class, Enum, Struct
-        6 | 9 | 12 => ("󰊕", Color::Rgb(80, 200, 240)),  // Method, Constructor, Function
-        7 | 8 => ("󰫧", Color::Rgb(250, 210, 90)),       // Property, Field
-        11 => ("󰌗", Color::Rgb(150, 166, 200)),         // Interface
-        13 => ("󱡠", Color::Rgb(228, 228, 228)),         // Variable
-        14 => ("󰌆", Color::Rgb(255, 221, 51)),          // Constant
-        15 => ("󰈙", Color::Rgb(115, 201, 54)),          // String
-        16 => ("󰎠", Color::Rgb(149, 169, 159)),         // Number
-        17 => ("󰨚", Color::Rgb(255, 221, 51)),          // Boolean
-        25 => ("󰊕", Color::Rgb(220, 110, 240)),         // Operator
-        26 => ("󰌗", Color::Rgb(149, 169, 159)),         // TypeParameter
-        _ => ("󰈚", Color::Rgb(170, 175, 190)),
+        1 => (KIND_FILE, Color::Rgb(120, 160, 255)),      // File
+        2 | 4 => (KIND_MODULE, Color::Rgb(220, 140, 80)), // Module, Package
+        3 | 18 => (KIND_NAMESPACE, Color::Rgb(150, 166, 200)), // Namespace, Array
+        5 | 10 | 23 => (KIND_CLASS, Color::Rgb(240, 180, 70)), // Class, Enum, Struct
+        6 | 9 | 12 => (KIND_FUNCTION, Color::Rgb(80, 200, 240)), // Method, Constructor, Function
+        7 | 8 => (KIND_PROPERTY, Color::Rgb(250, 210, 90)), // Property, Field
+        11 => (KIND_CLASS, Color::Rgb(150, 166, 200)),    // Interface
+        13 => (KIND_VARIABLE, Color::Rgb(228, 228, 228)), // Variable
+        14 => (KIND_CONSTANT, Color::Rgb(255, 221, 51)),  // Constant
+        15 => (KIND_STRING, Color::Rgb(115, 201, 54)),    // String
+        16 => (KIND_NUMBER, Color::Rgb(149, 169, 159)),   // Number
+        17 => (KIND_BOOLEAN, Color::Rgb(255, 221, 51)),   // Boolean
+        25 => (KIND_OPERATOR, Color::Rgb(220, 110, 240)), // Operator
+        26 => (KIND_TYPE_PARAM, Color::Rgb(149, 169, 159)), // TypeParameter
+        _ => (KIND_DEFAULT, Color::Rgb(170, 175, 190)),
     }
 }
