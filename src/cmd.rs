@@ -10,8 +10,14 @@ use std::{
     process,
 };
 
-use crate::lsp::{DynamicGrammar, SupportedLanguage, resolve_binary_path};
-use crate::nerdfonts::{CHECK, CHEVRON_RIGHT, FILE_DOCUMENT, HEALTH, LIGHTBULB, MISSING};
+use crate::lsp::resolve_binary_path;
+use crate::syntax::{DynamicGrammar, SupportedLanguage};
+
+use crate::nerdfonts::{
+    BOX_HORIZONTAL, BOX_ROUND_BOTTOM_LEFT, BOX_ROUND_BOTTOM_RIGHT, BOX_ROUND_TOP_LEFT,
+    BOX_ROUND_TOP_RIGHT, BOX_VERTICAL, CHECK, CHEVRON_RIGHT, DOT_MIDDLE, FILE_DOCUMENT, HEALTH,
+    LIGHTBULB, MISSING,
+};
 
 /// Parsed command-line arguments.
 #[derive(Debug, Default, Clone)]
@@ -267,15 +273,24 @@ impl CliArgs {
             .unwrap_or(0);
         let inner_width = max_content_width.max(min_width);
 
-        println!("{border}╭{}╮{r}", "─".repeat(inner_width + 2));
+        println!(
+            "{border}{BOX_ROUND_TOP_LEFT}{}{BOX_ROUND_TOP_RIGHT}{r}",
+            BOX_HORIZONTAL.repeat(inner_width + 2)
+        );
 
         for line in lines {
             let line_w = Self::visible_width(line);
             let pad = inner_width.saturating_sub(line_w);
-            println!("{border}│{r} {line}{}{border} │{r}", " ".repeat(pad));
+            println!(
+                "{border}{BOX_VERTICAL}{r} {line}{}{border} {BOX_VERTICAL}{r}",
+                " ".repeat(pad)
+            );
         }
 
-        println!("{border}╰{}╯{r}", "─".repeat(inner_width + 2));
+        println!(
+            "{border}{BOX_ROUND_BOTTOM_LEFT}{}{BOX_ROUND_BOTTOM_RIGHT}{r}",
+            BOX_HORIZONTAL.repeat(inner_width + 2)
+        );
     }
 
     /// Computes terminal display character width handling escape codes and double-width glyphs.
@@ -453,10 +468,10 @@ impl CliArgs {
         );
         println!(
             "  {gray}{}  {}  {}  {}{r}",
-            "─".repeat(name_w),
-            "─".repeat(ast_hdr_w),
-            "─".repeat(server_w),
-            "─".repeat(4)
+            BOX_HORIZONTAL.repeat(name_w),
+            BOX_HORIZONTAL.repeat(ast_hdr_w),
+            BOX_HORIZONTAL.repeat(server_w),
+            BOX_HORIZONTAL.repeat(4)
         );
 
         let mut static_count = 0usize;
@@ -467,7 +482,7 @@ impl CliArgs {
                 static_count += 1;
                 (format!("{green}{CHECK} Static{r}"), 4)
             } else if lang.grammar_name().is_empty() {
-                (format!("{gray}  ·{r}     "), 5)
+                (format!("{gray}  {DOT_MIDDLE}{r}     "), 5)
             } else {
                 (format!("{blue}{LIGHTBULB} LSP{r}   "), 5)
             };
@@ -485,7 +500,7 @@ impl CliArgs {
                 (
                     "(none available)".to_string(),
                     format!("{gray}(none available){r}"),
-                    format!("{gray}  ·{r} "),
+                    format!("{gray}  {DOT_MIDDLE}{r} "),
                 )
             } else if let Some(found) = installed_server {
                 (

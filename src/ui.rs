@@ -13,23 +13,24 @@ use ratatui::{
 };
 
 use crate::editor::{Editor, Focus, Mode};
-use crate::lsp::{
-    InlayHintType, LspStatus, completion_kind_icon, file_icon_and_color, symbol_kind_icon,
-    utf16_to_char_col,
-};
+use crate::lsp::{InlayHintType, LspStatus, utf16_to_char_col};
+use crate::syntax::{completion_kind_icon, file_icon_and_color, symbol_kind_icon};
+
 use crate::nerdfonts::{
-    CHECK, CHEVRON_RIGHT, CMD_RENAME, CMD_SYMBOLS, DIAG_ERROR, DIAG_ERROR_PAD, DIAG_HINT,
-    DIAG_HINT_PAD, DIAG_INFO, DIAG_INFO_PAD, DIAG_WARN, DIAG_WARN_PAD, FOLDER, FOLDER_CLOSED,
-    FOLDER_OPEN, FOLDER_OUTLINE, HELP, HINTS_OFF, HINTS_ON, INFO_DOC, KIND_FUNCTION, LIGHTBULB,
-    LINE_WRAP, LOCATION, LSP_ERROR, LSP_NOT_FOUND, LSP_READY, MODIFIED_DOT, PALETTE,
-    POWERLINE_LEFT, POWERLINE_RIGHT, SETTINGS_COGS, SPINNER, THEME, TOOL_LINK, WRAP_OFF, WRAP_ON,
+    BOX_HORIZONTAL, BOX_VERTICAL, CHECK, CHEVRON_RIGHT, CMD_RENAME, CMD_SYMBOLS, CURSOR_BLOCK,
+    DIAG_ERROR, DIAG_ERROR_PAD, DIAG_HINT, DIAG_HINT_PAD, DIAG_INFO, DIAG_INFO_PAD, DIAG_WARN,
+    DIAG_WARN_PAD, ELLIPSIS, FOLDER, FOLDER_CLOSED, FOLDER_OPEN, FOLDER_OUTLINE, GUTTER_EMPTY,
+    HELP, HINTS_OFF, HINTS_ON, INFO_DOC, KIND_FUNCTION, LIGHTBULB, LINE_WRAP, LOCATION, LSP_ERROR,
+    LSP_NOT_FOUND, LSP_READY, MODIFIED_DOT, PALETTE, POWERLINE_LEFT, POWERLINE_RIGHT,
+    PROMPT_CHEVRON, PROMPT_COLON, SELECTION_BLANK, SETTINGS_COGS, SPINNER, THEME, TILDE, TOOL_LINK,
+    WRAP_OFF, WRAP_ON,
 };
 
 /// Safely truncates a string by Unicode scalar count without slicing mid-codepoint.
 pub fn safe_truncate(s: &str, max_chars: usize) -> String {
     if s.chars().count() > max_chars {
         let mut result: String = s.chars().take(max_chars.saturating_sub(1)).collect();
-        result.push('…');
+        result.push_str(ELLIPSIS);
         result
     } else {
         s.to_string()
@@ -214,7 +215,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             Some(2) => (DIAG_WARN_PAD, Style::default().fg(theme.diag_warn)),
             Some(3) => (DIAG_INFO_PAD, Style::default().fg(theme.diag_info)),
             Some(_) => (DIAG_HINT_PAD, Style::default().fg(theme.diag_hint)),
-            None => ("  ", Style::default()),
+            None => (GUTTER_EMPTY, Style::default()),
         };
 
         let gutter_style = if is_cursor_line {
@@ -336,12 +337,12 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
                 let (marker, gutter_str, g_style) = if is_first_sub {
                     (
                         diag_marker,
-                        format!("{:>width$} │ ", y + 1, width = line_digits),
+                        format!("{:>width$} {BOX_VERTICAL} ", y + 1, width = line_digits),
                         gutter_style,
                     )
                 } else {
                     (
-                        "  ",
+                        GUTTER_EMPTY,
                         format!("{:>width$} {LINE_WRAP} ", "", width = line_digits),
                         Style::default().fg(theme.line_number),
                     )
@@ -393,7 +394,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         } else {
             let (marker, gutter_str, g_style) = (
                 diag_marker,
-                format!("{:>width$} │ ", y + 1, width = line_digits),
+                format!("{:>width$} {BOX_VERTICAL} ", y + 1, width = line_digits),
                 gutter_style,
             );
             let mut row_spans = vec![
@@ -444,9 +445,9 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
     for _ in (current_row as usize)..inner_area.height as usize {
         visible_lines.push(Line::from(vec![
-            Span::raw("  "),
+            Span::raw(GUTTER_EMPTY),
             Span::styled(
-                format!("{:>width$} │ ", "~", width = line_digits),
+                format!("{:>width$} {BOX_VERTICAL} ", TILDE, width = line_digits),
                 Style::default().fg(theme.line_number),
             ),
         ]));
@@ -623,7 +624,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
     if editor.mode == Mode::Command {
         let prompt_line = Line::from(vec![
             Span::styled(
-                " :",
+                format!(" {PROMPT_COLON}"),
                 Style::default()
                     .fg(theme.mode_command)
                     .add_modifier(Modifier::BOLD),
@@ -877,7 +878,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             Span::styled("(Enter to apply):", Style::default().fg(theme.line_number)),
         ]));
         lines.push(Line::from(Span::styled(
-            "─".repeat((width as usize).saturating_sub(2)),
+            BOX_HORIZONTAL.repeat((width as usize).saturating_sub(2)),
             Style::default().fg(theme.border),
         )));
 
@@ -900,7 +901,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             let mark = if is_sel {
                 format!(" {CHEVRON_RIGHT} ")
             } else {
-                "   ".to_string()
+                SELECTION_BLANK.to_string()
             };
             let pref = if action.is_preferred {
                 format!(" {CHECK}")
@@ -944,7 +945,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         let mut lines = Vec::new();
         lines.push(Line::from(vec![
             Span::styled(
-                format!(" {CMD_SYMBOLS} > "),
+                format!(" {CMD_SYMBOLS} {PROMPT_CHEVRON} "),
                 Style::default()
                     .fg(theme.mode_command)
                     .add_modifier(Modifier::BOLD),
@@ -955,10 +956,10 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
                     .fg(theme.popup_sel_fg)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("█", Style::default().fg(theme.border_focused)),
+            Span::styled(CURSOR_BLOCK, Style::default().fg(theme.border_focused)),
         ]));
         lines.push(Line::from(Span::styled(
-            "─".repeat((width as usize).saturating_sub(2)),
+            BOX_HORIZONTAL.repeat((width as usize).saturating_sub(2)),
             Style::default().fg(theme.border),
         )));
 
@@ -1031,7 +1032,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             Span::styled("(Enter to jump):", Style::default().fg(theme.line_number)),
         ]));
         lines.push(Line::from(Span::styled(
-            "─".repeat((width as usize).saturating_sub(2)),
+            BOX_HORIZONTAL.repeat((width as usize).saturating_sub(2)),
             Style::default().fg(theme.border),
         )));
 
@@ -1059,7 +1060,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             let mark = if is_sel {
                 format!(" {CHEVRON_RIGHT} ")
             } else {
-                "   ".to_string()
+                SELECTION_BLANK.to_string()
             };
             let file_str = loc
                 .path
@@ -1119,7 +1120,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
                     .fg(theme.popup_sel_fg)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("█", Style::default().fg(theme.mode_command)),
+            Span::styled(CURSOR_BLOCK, Style::default().fg(theme.mode_command)),
         ]);
 
         frame.render_widget(Paragraph::new(line).block(block), rect);
@@ -1147,7 +1148,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         let mut palette_lines = Vec::new();
         palette_lines.push(Line::from(vec![
             Span::styled(
-                format!(" {PALETTE} > "),
+                format!(" {PALETTE} {PROMPT_CHEVRON} "),
                 Style::default()
                     .fg(theme.mode_command)
                     .add_modifier(Modifier::BOLD),
@@ -1158,10 +1159,10 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
                     .fg(theme.popup_sel_fg)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("█", Style::default().fg(theme.border_focused)),
+            Span::styled(CURSOR_BLOCK, Style::default().fg(theme.border_focused)),
         ]));
         palette_lines.push(Line::from(Span::styled(
-            "─".repeat((width as usize).saturating_sub(2)),
+            BOX_HORIZONTAL.repeat((width as usize).saturating_sub(2)),
             Style::default().fg(theme.border),
         )));
 
@@ -1238,7 +1239,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             Span::styled("(Enter to apply):", Style::default().fg(theme.line_number)),
         ]));
         lines.push(Line::from(Span::styled(
-            "─".repeat((width as usize).saturating_sub(2)),
+            BOX_HORIZONTAL.repeat((width as usize).saturating_sub(2)),
             Style::default().fg(theme.border),
         )));
 
@@ -1264,7 +1265,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             } else if is_sel {
                 format!(" {CHEVRON_RIGHT} ")
             } else {
-                "   ".to_string()
+                SELECTION_BLANK.to_string()
             };
             lines.push(Line::from(vec![
                 Span::styled(mark, Style::default().bg(bg).fg(theme.mode_normal)),
@@ -1312,7 +1313,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             ),
         ]));
         lines.push(Line::from(Span::styled(
-            "─".repeat((width as usize).saturating_sub(2)),
+            BOX_HORIZONTAL.repeat((width as usize).saturating_sub(2)),
             Style::default().fg(theme.border),
         )));
 
@@ -1337,7 +1338,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
                     if is_sel {
                         format!(" {CHECK} ")
                     } else {
-                        "   ".to_string()
+                        SELECTION_BLANK.to_string()
                     },
                     Style::default().bg(bg).fg(theme.mode_insert),
                 ),

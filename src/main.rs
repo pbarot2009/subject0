@@ -10,6 +10,7 @@ mod cmd;
 mod editor;
 mod lsp;
 mod nerdfonts;
+mod syntax;
 mod theme;
 mod ui;
 

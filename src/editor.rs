@@ -30,9 +30,11 @@ use std::{
 
 use crate::lsp::{
     CodeActionItem, DiagnosticItem, HoverInfo, InlayHintItem, LocationItem, LspInbound,
-    LspOutbound, LspStatus, SignatureHelpInfo, SuggestionItem, SymbolItem, SyntaxEngine,
-    TextEditItem, char_to_utf16_col, run_lsp_actor, subject0_config_dir, utf16_to_char_col,
+    LspOutbound, LspStatus, SignatureHelpInfo, SuggestionItem, SymbolItem, TextEditItem,
+    char_to_utf16_col, run_lsp_actor, subject0_config_dir, utf16_to_char_col,
 };
+use crate::syntax::SyntaxEngine;
+
 use crate::nerdfonts::{
     ARROW_LEFT, ARROW_RIGHT, CMD_CODE_ACTIONS, CMD_DEFINITION, CMD_FORMAT, CMD_HOVER,
     CMD_INSERT_ABOVE, CMD_INSERT_BELOW, CMD_JOIN, CMD_JUMP_BOTTOM, CMD_JUMP_TOP, CMD_PASTE,
