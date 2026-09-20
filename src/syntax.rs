@@ -79,6 +79,7 @@ pub enum SupportedLanguage {
     Zig,
     JavaScript,
     TypeScript,
+    Tsx,
     Html,
     Css,
     Json,
@@ -211,7 +212,8 @@ impl SupportedLanguage {
             "cpp" | "hpp" | "cc" | "cxx" | "hh" | "hxx" | "c++" => SupportedLanguage::Cpp,
             "zig" | "zon" => SupportedLanguage::Zig,
             "js" | "jsx" | "mjs" | "cjs" => SupportedLanguage::JavaScript,
-            "ts" | "tsx" | "mts" | "cts" => SupportedLanguage::TypeScript,
+            "ts" | "mts" | "cts" => SupportedLanguage::TypeScript,
+            "tsx" => SupportedLanguage::Tsx,
             "html" | "htm" | "xhtml" => SupportedLanguage::Html,
             "css" | "scss" | "less" => SupportedLanguage::Css,
             "json" | "jsonc" | "json5" => SupportedLanguage::Json,
@@ -318,9 +320,14 @@ impl SupportedLanguage {
             SupportedLanguage::Zig => Some(tree_sitter_zig::LANGUAGE.into()),
             SupportedLanguage::Python => Some(tree_sitter_python::LANGUAGE.into()),
             SupportedLanguage::JavaScript => Some(tree_sitter_javascript::LANGUAGE.into()),
+            // Plain `.ts`/`.mts`/`.cts` use the TypeScript dialect grammar (no JSX syntax).
             SupportedLanguage::TypeScript => {
                 Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
             }
+            // `.tsx` is a genuinely different grammar (TSX dialect) that additionally
+            // understands JSX syntax; reusing LANGUAGE_TYPESCRIPT for `.tsx` files is
+            // what previously caused parse/query errors on JSX-containing TypeScript.
+            SupportedLanguage::Tsx => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
             SupportedLanguage::Go => Some(tree_sitter_go::LANGUAGE.into()),
             SupportedLanguage::Json => Some(tree_sitter_json::LANGUAGE.into()),
             SupportedLanguage::Toml => Some(tree_sitter_toml_ng::LANGUAGE.into()),
@@ -332,6 +339,9 @@ impl SupportedLanguage {
             SupportedLanguage::Css => Some(tree_sitter_css::LANGUAGE.into()),
             SupportedLanguage::Markdown => Some(tree_sitter_md::LANGUAGE.into()),
             SupportedLanguage::Java => Some(tree_sitter_java::LANGUAGE.into()),
+            SupportedLanguage::CSharp => Some(tree_sitter_c_sharp::LANGUAGE.into()),
+            SupportedLanguage::Ruby => Some(tree_sitter_ruby::LANGUAGE.into()),
+            SupportedLanguage::Lua => Some(tree_sitter_lua::LANGUAGE.into()),
             _ => None,
         }
     }
@@ -478,15 +488,18 @@ impl SupportedLanguage {
                 r#"
                 (identifier) @variable
                 (property_identifier) @property
+                (shorthand_property_identifier) @property
                 (call_expression function: (identifier) @function)
                 (call_expression function: (member_expression property: (property_identifier) @function))
                 (function_declaration name: (identifier) @function)
+                (function_expression name: (identifier) @function)
                 (method_definition name: (property_identifier) @function)
                 (arrow_function) @function
+                (formal_parameters (identifier) @parameter)
                 [
                   "function" "const" "let" "var" "return" "if" "else" "switch" "case"
                   "default" "for" "while" "do" "break" "continue" "try" "catch" "finally"
-                  "throw" "class" "extends" "import" "export" "from" "new"
+                  "throw" "class" "extends" "import" "export" "from" "new" "static" "get" "set"
                   "this" "super" "async" "await" "yield" "typeof" "instanceof" "void" "delete" "in" "of"
                 ] @keyword
                 (comment) @comment
@@ -496,6 +509,16 @@ impl SupportedLanguage {
                 (number) @number
                 [ (true) (false) ] @number
                 (null) @keyword
+                (undefined) @keyword
+                ["=" "==" "===" "!=" "!==" "<" ">" "<=" ">=" "+" "-" "*" "/" "%" "&&" "||" "??" "=>" "..."] @operator
+                (jsx_opening_element (identifier) @tag)
+                (jsx_opening_element (member_expression) @tag)
+                (jsx_closing_element (identifier) @tag)
+                (jsx_closing_element (member_expression) @tag)
+                (jsx_self_closing_element (identifier) @tag)
+                (jsx_self_closing_element (member_expression) @tag)
+                (jsx_attribute (property_identifier) @property)
+                (jsx_text) @string
                 "#
             }
             SupportedLanguage::TypeScript => {
@@ -504,18 +527,23 @@ impl SupportedLanguage {
                 (type_identifier) @type
                 (predefined_type) @type
                 (property_identifier) @property
+                (shorthand_property_identifier) @property
                 (call_expression function: (identifier) @function)
                 (call_expression function: (member_expression property: (property_identifier) @function))
                 (function_declaration name: (identifier) @function)
+                (function_expression name: (identifier) @function)
                 (method_definition name: (property_identifier) @function)
+                (method_signature name: (property_identifier) @function)
                 (arrow_function) @function
+                (formal_parameters (required_parameter pattern: (identifier) @parameter))
+                (formal_parameters (identifier) @parameter)
                 [
                   "function" "const" "let" "var" "return" "if" "else" "switch" "case"
                   "default" "for" "while" "do" "break" "continue" "try" "catch" "finally"
-                  "throw" "class" "extends" "import" "export" "from" "new"
+                  "throw" "class" "extends" "import" "export" "from" "new" "static" "get" "set"
                   "this" "super" "async" "await" "yield" "typeof" "instanceof" "void" "delete" "in" "of"
                   "type" "interface" "enum" "namespace" "declare" "abstract" "implements"
-                  "readonly" "as" "keyof" "is"
+                  "readonly" "as" "keyof" "is" "satisfies" "infer" "asserts" "override"
                 ] @keyword
                 (comment) @comment
                 (string) @string
@@ -524,6 +552,53 @@ impl SupportedLanguage {
                 (number) @number
                 [ (true) (false) ] @number
                 (null) @keyword
+                (undefined) @keyword
+                ["=" "==" "===" "!=" "!==" "<" ">" "<=" ">=" "+" "-" "*" "/" "%" "&&" "||" "??" "=>" "..." ":"] @operator
+                "#
+            }
+            // `.tsx` files parse with the dedicated TSX dialect grammar, which is a
+            // superset of TypeScript that additionally understands JSX element syntax.
+            SupportedLanguage::Tsx => {
+                r#"
+                (identifier) @variable
+                (type_identifier) @type
+                (predefined_type) @type
+                (property_identifier) @property
+                (shorthand_property_identifier) @property
+                (call_expression function: (identifier) @function)
+                (call_expression function: (member_expression property: (property_identifier) @function))
+                (function_declaration name: (identifier) @function)
+                (function_expression name: (identifier) @function)
+                (method_definition name: (property_identifier) @function)
+                (method_signature name: (property_identifier) @function)
+                (arrow_function) @function
+                (formal_parameters (required_parameter pattern: (identifier) @parameter))
+                (formal_parameters (identifier) @parameter)
+                [
+                  "function" "const" "let" "var" "return" "if" "else" "switch" "case"
+                  "default" "for" "while" "do" "break" "continue" "try" "catch" "finally"
+                  "throw" "class" "extends" "import" "export" "from" "new" "static" "get" "set"
+                  "this" "super" "async" "await" "yield" "typeof" "instanceof" "void" "delete" "in" "of"
+                  "type" "interface" "enum" "namespace" "declare" "abstract" "implements"
+                  "readonly" "as" "keyof" "is" "satisfies" "infer" "asserts" "override"
+                ] @keyword
+                (comment) @comment
+                (string) @string
+                (template_string) @string
+                (regex) @string
+                (number) @number
+                [ (true) (false) ] @number
+                (null) @keyword
+                (undefined) @keyword
+                ["=" "==" "===" "!=" "!==" "<" ">" "<=" ">=" "+" "-" "*" "/" "%" "&&" "||" "??" "=>" "..." ":"] @operator
+                (jsx_opening_element (identifier) @tag)
+                (jsx_opening_element (member_expression) @tag)
+                (jsx_closing_element (identifier) @tag)
+                (jsx_closing_element (member_expression) @tag)
+                (jsx_self_closing_element (identifier) @tag)
+                (jsx_self_closing_element (member_expression) @tag)
+                (jsx_attribute (property_identifier) @property)
+                (jsx_text) @string
                 "#
             }
             SupportedLanguage::Bash | SupportedLanguage::Zsh => {
@@ -630,6 +705,82 @@ impl SupportedLanguage {
                 (null_literal) @keyword
                 "#
             }
+            SupportedLanguage::CSharp => {
+                r#"
+                (identifier) @variable
+                (predefined_type) @type
+                (invocation_expression function: (identifier) @function)
+                (invocation_expression function: (member_access_expression name: (identifier) @function))
+                (method_declaration name: (identifier) @function)
+                (local_function_statement name: (identifier) @function)
+                (class_declaration name: (identifier) @type)
+                (interface_declaration name: (identifier) @type)
+                (struct_declaration name: (identifier) @type)
+                (enum_declaration name: (identifier) @type)
+                (namespace_declaration name: (identifier) @namespace)
+                [
+                  "class" "interface" "struct" "enum" "namespace" "using" "public" "private"
+                  "protected" "internal" "static" "readonly" "const" "return" "if" "else"
+                  "switch" "case" "default" "for" "foreach" "while" "do" "break" "continue"
+                  "try" "catch" "finally" "throw" "new" "this" "base" "async" "await" "var"
+                  "void" "override" "virtual" "abstract" "sealed" "partial" "in" "out" "ref"
+                  "get" "set" "yield" "is" "as"
+                ] @keyword
+                (comment) @comment
+                (string_literal) @string
+                (verbatim_string_literal) @string
+                (raw_string_literal) @string
+                (character_literal) @string
+                (integer_literal) @number
+                (real_literal) @number
+                (boolean_literal) @number
+                (null_literal) @keyword
+                "#
+            }
+            SupportedLanguage::Ruby => {
+                r#"
+                (identifier) @variable
+                (constant) @type
+                (call method: [(identifier) (constant)] @function)
+                (method name: (identifier) @function)
+                (method_parameters (identifier) @parameter)
+                (block_parameters (identifier) @parameter)
+                (instance_variable) @property
+                (class_variable) @property
+                [
+                  "alias" "and" "begin" "break" "case" "class" "def" "do" "else" "elsif"
+                  "end" "ensure" "for" "if" "in" "module" "next" "or" "rescue" "retry"
+                  "return" "then" "unless" "until" "when" "while" "yield" "not" "self" "super"
+                ] @keyword
+                (comment) @comment
+                [ (string) (bare_string) (heredoc_body) (heredoc_beginning) (subshell) ] @string
+                [ (simple_symbol) (delimited_symbol) (hash_key_symbol) (bare_symbol) ] @string
+                (regex) @string
+                [ (integer) (float) ] @number
+                [ (nil) (true) (false) ] @keyword
+                "#
+            }
+            SupportedLanguage::Lua => {
+                r#"
+                (identifier) @variable
+                (function_call name: (identifier) @function)
+                (function_call name: (dot_index_expression field: (identifier) @function))
+                (function_call name: (method_index_expression method: (identifier) @function))
+                (function_declaration name: (identifier) @function)
+                (function_declaration name: (dot_index_expression field: (identifier) @function))
+                (function_declaration name: (method_index_expression method: (identifier) @function))
+                (parameters (identifier) @parameter)
+                [
+                  "function" "local" "end" "if" "then" "else" "elseif" "for" "while"
+                  "repeat" "until" "do" "break" "return" "in" "and" "or" "not" "goto"
+                ] @keyword
+                (comment) @comment
+                (string) @string
+                (number) @number
+                [ (true) (false) ] @number
+                (nil) @keyword
+                "#
+            }
             _ => "",
         }
     }
@@ -644,6 +795,7 @@ impl SupportedLanguage {
             SupportedLanguage::Zig => "Zig",
             SupportedLanguage::JavaScript => "JavaScript",
             SupportedLanguage::TypeScript => "TypeScript",
+            SupportedLanguage::Tsx => "TSX",
             SupportedLanguage::Html => "HTML",
             SupportedLanguage::Css => "CSS",
             SupportedLanguage::Json => "JSON",
@@ -754,6 +906,7 @@ impl SupportedLanguage {
             SupportedLanguage::Zig => "zig",
             SupportedLanguage::JavaScript => "javascript",
             SupportedLanguage::TypeScript => "typescript",
+            SupportedLanguage::Tsx => "tsx",
             SupportedLanguage::Html => "html",
             SupportedLanguage::Css => "css",
             SupportedLanguage::Json => "json",
@@ -860,6 +1013,10 @@ impl SupportedLanguage {
             SupportedLanguage::Zig => "zig",
             SupportedLanguage::JavaScript => "javascript",
             SupportedLanguage::TypeScript => "typescript",
+            // typescript-language-server / vtsls require the exact "typescriptreact"
+            // languageId for .tsx — sending "typescript" causes JSX-aware features
+            // (and in some server versions, the whole didOpen) to misbehave.
+            SupportedLanguage::Tsx => "typescriptreact",
             SupportedLanguage::Html => "html",
             SupportedLanguage::Css => "css",
             SupportedLanguage::Json => "json",
@@ -969,7 +1126,9 @@ impl SupportedLanguage {
             ],
             SupportedLanguage::C | SupportedLanguage::Cpp => &["clangd", "ccls"],
             SupportedLanguage::Zig => &["zls"],
-            SupportedLanguage::JavaScript | SupportedLanguage::TypeScript => &[
+            SupportedLanguage::JavaScript
+            | SupportedLanguage::TypeScript
+            | SupportedLanguage::Tsx => &[
                 "typescript-language-server",
                 "vtsls",
                 "quick-lint-js",
@@ -1059,6 +1218,7 @@ impl SupportedLanguage {
             SupportedLanguage::Zig,
             SupportedLanguage::JavaScript,
             SupportedLanguage::TypeScript,
+            SupportedLanguage::Tsx,
             SupportedLanguage::Html,
             SupportedLanguage::Css,
             SupportedLanguage::Json,
