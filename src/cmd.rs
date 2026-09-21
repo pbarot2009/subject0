@@ -5,12 +5,12 @@
 //! Termux, Linux, macOS, and Windows, grammar inspection, and language health diagnostics.
 
 use std::{
-    env,
+    env, fs,
     path::{Path, PathBuf},
-    process,
+    process::{self, Command},
 };
 
-use crate::lsp::resolve_binary_path;
+use crate::lsp::{resolve_binary_path, subject0_config_dir};
 use crate::syntax::{DynamicGrammar, SupportedLanguage};
 
 use crate::nerdfonts::{
@@ -37,7 +37,7 @@ pub struct CliArgs {
 impl CliArgs {
     /// Parses CLI arguments from standard environment args.
     ///
-    /// Intercepts `--help` and `--version` to print directly to stdout and exit
+    /// Intercepts `--help`, `--version`, and `setup` to print directly to stdout and exit
     /// before terminal raw mode or alternate screen buffers are initialized.
     pub fn parse() -> Self {
         let raw_args: Vec<String> = env::args().skip(1).collect();
@@ -69,6 +69,10 @@ impl CliArgs {
                 }
                 "-v" | "-V" | "--version" => {
                     Self::print_version();
+                    process::exit(0);
+                }
+                "setup" | "--setup" => {
+                    Self::run_setup(force_grammar);
                     process::exit(0);
                 }
                 "-g" | "--install-grammar" => {
@@ -122,6 +126,166 @@ impl CliArgs {
     /// Strips enclosing quotes from argument flags.
     fn clean_lang_arg(raw: &str) -> String {
         raw.trim().trim_matches('\'').trim_matches('"').to_string()
+    }
+
+    /// Copies or clones the queries directory into the user configuration directory.
+    fn run_setup(force: bool) {
+        let r = "\x1b[0m";
+        let b = "\x1b[1m";
+        let green = "\x1b[38;2;100;200;140m";
+        let blue = "\x1b[38;2;100;180;255m";
+        let yellow = "\x1b[38;2;240;200;90m";
+        let red = "\x1b[38;2;240;90;90m";
+        let gray = "\x1b[38;2;140;145;160m";
+        let white = "\x1b[38;2;225;230;240m";
+
+        let target_dir = subject0_config_dir().join("queries");
+
+        if target_dir.exists() && !force {
+            let files_count = Self::count_subdirs(&target_dir);
+            let target_disp = Self::shorten_home(&target_dir);
+            let lines = vec![
+                format!(" {green}{CHECK} Queries Already Configured{r}"),
+                format!(" Destination: {b}{target_disp}{r}"),
+                format!(" Languages:   {green}{files_count} installed{r}"),
+                String::new(),
+                format!(" {gray}Run {white}s0 setup --force{gray} to overwrite or resync.{r}"),
+            ];
+            Self::print_boxed_card(&lines, 64);
+            return;
+        }
+
+        // Search for existing local queries in source/dev trees
+        let local_candidates = [
+            PathBuf::from("./src/queries"),
+            PathBuf::from("./queries"),
+            PathBuf::from("../queries"),
+            PathBuf::from("../../src/queries"),
+        ];
+
+        let local_source = local_candidates.iter().find(|p| p.is_dir());
+
+        if let Some(src) = local_source {
+            println!(
+                "  {blue}{CHEVRON_RIGHT}{r} Copying queries from {white}{}{r}...",
+                src.display()
+            );
+            match Self::copy_dir_recursive(src, &target_dir) {
+                Ok(count) => {
+                    let target_disp = Self::shorten_home(&target_dir);
+                    let langs_count = Self::count_subdirs(&target_dir);
+                    let lines = vec![
+                        format!(" {green}{CHECK} Query Synchronization Successful{r}"),
+                        format!(" Source:      {white}{}{r}", src.display()),
+                        format!(" Destination: {b}{target_disp}{r}"),
+                        format!(" Synced:      {green}{langs_count} languages ({count} files){r}"),
+                        String::new(),
+                        format!(" {gray}Tree-sitter queries are now active system-wide.{r}"),
+                    ];
+                    Self::print_boxed_card(&lines, 64);
+                }
+                Err(err) => {
+                    eprintln!("{red}Error copying queries: {err}{r}");
+                    process::exit(1);
+                }
+            }
+        } else {
+            // If running standalone without local repository files, clone via git
+            println!(
+                "  {yellow}{LIGHTBULB}{r} No local queries found. Fetching from subject0 repository..."
+            );
+
+            if resolve_binary_path("git").is_none() {
+                eprintln!("{red}Error: 'git' is not installed or not in PATH.{r}");
+                eprintln!(
+                    "{gray}Please install git or run 's0 setup' inside the subject0 repository.{r}"
+                );
+                process::exit(1);
+            }
+
+            let temp_dir = env::temp_dir().join(format!("s0_queries_{}", process::id()));
+            let status = Command::new("git")
+                .args([
+                    "clone",
+                    "--depth",
+                    "1",
+                    "https://github.com/pbarot2009/subject0.git",
+                ])
+                .arg(&temp_dir)
+                .status();
+
+            match status {
+                Ok(s) if s.success() => {
+                    let candidates = [
+                        temp_dir.join("src").join("queries"),
+                        temp_dir.join("queries"),
+                    ];
+                    let repo_queries = candidates.into_iter().find(|p| p.is_dir());
+
+                    if let Some(src_queries) = repo_queries {
+                        let _ = Self::copy_dir_recursive(&src_queries, &target_dir);
+                        let _ = fs::remove_dir_all(&temp_dir);
+
+                        let target_disp = Self::shorten_home(&target_dir);
+                        let langs_count = Self::count_subdirs(&target_dir);
+                        let lines = vec![
+                            format!(" {green}{CHECK} Subject0 Queries Cloned & Configured{r}"),
+                            format!(
+                                " Source:      {blue}https://github.com/pbarot2009/subject0{r}"
+                            ),
+                            format!(" Destination: {b}{target_disp}{r}"),
+                            format!(" Languages:   {green}{langs_count} installed{r}"),
+                            String::new(),
+                            format!(" {gray}Tree-sitter queries are now active system-wide.{r}"),
+                        ];
+                        Self::print_boxed_card(&lines, 64);
+                    } else {
+                        let _ = fs::remove_dir_all(&temp_dir);
+                        eprintln!(
+                            "{red}Error: Failed to locate 'src/queries' in cloned repository.{r}"
+                        );
+                        process::exit(1);
+                    }
+                }
+                _ => {
+                    let _ = fs::remove_dir_all(&temp_dir);
+                    eprintln!("{red}Error: Failed to clone subject0 repository via git.{r}");
+                    process::exit(1);
+                }
+            }
+        }
+    }
+
+    /// Recursively copies directories and files.
+    fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<usize> {
+        fs::create_dir_all(dst)?;
+        let mut count = 0;
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            let ty = entry.file_type()?;
+            let src_path = entry.path();
+            let dst_path = dst.join(entry.file_name());
+
+            if ty.is_dir() {
+                count += Self::copy_dir_recursive(&src_path, &dst_path)?;
+            } else {
+                fs::copy(&src_path, &dst_path)?;
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Counts subdirectories inside a given path.
+    fn count_subdirs(p: &Path) -> usize {
+        fs::read_dir(p)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                    .count()
+            })
+            .unwrap_or(0)
     }
 
     /// Assigns file path and checks for `path:line:col` or `path:line` format across Unix and Windows.
@@ -223,7 +387,8 @@ impl CliArgs {
       {green}[PATH]{r}             File or folder path {gray}(opens scratch buffer if empty){r}
       {magenta}[+LINE]{r}            Jump directly to line number {gray}(e.g. +42 or path:42:10){r}
 
-  {b}{blue}{CHEVRON_RIGHT} OPTIONS:{r}
+  {b}{blue}{CHEVRON_RIGHT} COMMANDS & OPTIONS:{r}
+      {yellow}setup, --setup{r}            Synchronize runtime queries to ~/.config/subject0/queries
       {yellow}-h, --help{r}                Show this formatted help menu and exit
       {yellow}-v, --version{r}             Print version information and metadata
       {yellow}-g, --install-grammar <L>{r}  Inspect status of built-in Tree-sitter grammar
@@ -247,6 +412,9 @@ impl CliArgs {
       {magenta}:hints{r}                   Toggle inline inferred type & parameter hints
 
   {b}{blue}{CHEVRON_RIGHT} EXAMPLES:{r}
+      {gray}# Sync queries to user config directory:{r}
+      {white}s0 setup{r}
+
       {gray}# Open a file at line 50, column 10:{r}
       {white}s0 src/main.rs:50:10{r}
 
@@ -254,10 +422,7 @@ impl CliArgs {
       {white}s0 .{r}
 
       {gray}# Check syntax grammars and LSP servers across your system:{r}
-      {white}s0 --health{r}
-
-      {gray}# Check status of a built-in grammar:{r}
-      {white}s0 -g rust{r}"
+      {white}s0 --health{r}"
         );
     }
 
