@@ -430,58 +430,58 @@ impl SupportedLanguage {
     /// Compile-time embedded queries, resolving inheritance hierarchies statically as a zero-dependency fallback.
     pub fn builtin_highlight_query(self) -> &'static str {
         match self {
-            SupportedLanguage::Rust => include_str!("queries/rust/highlights.scm"),
-            SupportedLanguage::C => include_str!("queries/c/highlights.scm"),
+            SupportedLanguage::Rust => include_str!("../queries/rust/highlights.scm"),
+            SupportedLanguage::C => include_str!("../queries/c/highlights.scm"),
 
             // C++ inherits C
             SupportedLanguage::Cpp => concat!(
-                include_str!("queries/c/highlights.scm"),
+                include_str!("../queries/c/highlights.scm"),
                 "\n",
-                include_str!("queries/cpp/highlights.scm")
+                include_str!("../queries/cpp/highlights.scm")
             ),
 
-            SupportedLanguage::Zig => include_str!("queries/zig/highlights.scm"),
-            SupportedLanguage::Go => include_str!("queries/go/highlights.scm"),
-            SupportedLanguage::Python => include_str!("queries/python/highlights.scm"),
+            SupportedLanguage::Zig => include_str!("../queries/zig/highlights.scm"),
+            SupportedLanguage::Go => include_str!("../queries/go/highlights.scm"),
+            SupportedLanguage::Python => include_str!("../queries/python/highlights.scm"),
 
             // JavaScript inherits ECMAScript
             SupportedLanguage::JavaScript => concat!(
-                include_str!("queries/ecma/highlights.scm"),
+                include_str!("../queries/ecma/highlights.scm"),
                 "\n",
-                include_str!("queries/javascript/highlights.scm")
+                include_str!("../queries/javascript/highlights.scm")
             ),
 
             // TypeScript inherits ECMAScript
             SupportedLanguage::TypeScript => concat!(
-                include_str!("queries/ecma/highlights.scm"),
+                include_str!("../queries/ecma/highlights.scm"),
                 "\n",
-                include_str!("queries/typescript/highlights.scm")
+                include_str!("../queries/typescript/highlights.scm")
             ),
 
             // TSX inherits ECMAScript, JSX, and TypeScript
             SupportedLanguage::Tsx => concat!(
-                include_str!("queries/ecma/highlights.scm"),
+                include_str!("../queries/ecma/highlights.scm"),
                 "\n",
-                include_str!("queries/jsx/highlights.scm"),
+                include_str!("../queries/jsx/highlights.scm"),
                 "\n",
-                include_str!("queries/typescript/highlights.scm"),
+                include_str!("../queries/typescript/highlights.scm"),
                 "\n",
-                include_str!("queries/tsx/highlights.scm")
+                include_str!("../queries/tsx/highlights.scm")
             ),
 
-            SupportedLanguage::Json => include_str!("queries/json/highlights.scm"),
-            SupportedLanguage::Toml => include_str!("queries/toml/highlights.scm"),
-            SupportedLanguage::Yaml => include_str!("queries/yaml/highlights.scm"),
+            SupportedLanguage::Json => include_str!("../queries/json/highlights.scm"),
+            SupportedLanguage::Toml => include_str!("../queries/toml/highlights.scm"),
+            SupportedLanguage::Yaml => include_str!("../queries/yaml/highlights.scm"),
             SupportedLanguage::Bash | SupportedLanguage::Zsh => {
-                include_str!("queries/bash/highlights.scm")
+                include_str!("../queries/bash/highlights.scm")
             }
-            SupportedLanguage::Html => include_str!("queries/html/highlights.scm"),
-            SupportedLanguage::Css => include_str!("queries/css/highlights.scm"),
-            SupportedLanguage::Markdown => include_str!("queries/markdown/highlights.scm"),
-            SupportedLanguage::Java => include_str!("queries/java/highlights.scm"),
-            SupportedLanguage::CSharp => include_str!("queries/c-sharp/highlights.scm"),
-            SupportedLanguage::Ruby => include_str!("queries/ruby/highlights.scm"),
-            SupportedLanguage::Lua => include_str!("queries/lua/highlights.scm"),
+            SupportedLanguage::Html => include_str!("../queries/html/highlights.scm"),
+            SupportedLanguage::Css => include_str!("../queries/css/highlights.scm"),
+            SupportedLanguage::Markdown => include_str!("../queries/markdown/highlights.scm"),
+            SupportedLanguage::Java => include_str!("../queries/java/highlights.scm"),
+            SupportedLanguage::CSharp => include_str!("../queries/c-sharp/highlights.scm"),
+            SupportedLanguage::Ruby => include_str!("../queries/ruby/highlights.scm"),
+            SupportedLanguage::Lua => include_str!("../queries/lua/highlights.scm"),
             _ => "",
         }
     }
