@@ -1,9 +1,13 @@
 //! # Tree-Sitter & Semantic Syntax Highlighting Engine
 //!
-//! Provides AST-based syntax highlighting, dynamic query evaluation, and icon/color
-//! resolution for languages supported by `subject0`.
+//! Provides AST-based syntax highlighting, dynamic query evaluation, inheritance resolution,
+//! and icon/color resolution for languages supported by `subject0`.
 
-use std::{collections::HashMap, fs, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Result, anyhow};
 use ratatui::{
@@ -19,33 +23,114 @@ use crate::lsp::{
 use crate::nerdfonts::*;
 use crate::theme::Theme;
 
-// === Custom Highlight Query Paths & Dynamic Grammar Stubs ===
+// === Dynamic Runtime Query Resolver with Inheritance ===
 
-pub fn query_file_path(lang_name: &str) -> Option<PathBuf> {
-    if lang_name.is_empty() {
-        return None;
-    }
-    let dirs = [
-        subject0_config_dir().join("queries").join(lang_name),
-        subject0_data_dir().join("queries").join(lang_name),
-        PathBuf::from("./queries").join(lang_name),
-        PathBuf::from("./runtime/queries").join(lang_name),
-    ];
-
-    for d in &dirs {
-        let p = d.join("highlights.scm");
-        if p.is_file() {
+/// Finds the directory containing language query folders across environments.
+pub fn find_queries_root() -> Option<PathBuf> {
+    // 1. Explicit environment variable override
+    if let Ok(env_path) = std::env::var("SUBJECT0_QUERIES_DIR") {
+        let p = PathBuf::from(env_path);
+        if p.is_dir() {
             return Some(p);
         }
     }
+
+    // 2. Relative to the running executable
+    if let Ok(mut exe) = std::env::current_exe() {
+        exe.pop();
+        let candidates = [
+            exe.join("queries"),
+            exe.join("../queries"),
+            exe.join("../../src/queries"),
+            exe.join("../share/subject0/queries"),
+        ];
+        for c in candidates {
+            if c.is_dir() {
+                return Some(c);
+            }
+        }
+    }
+
+    // 3. Project source & system directories
+    let dev_and_sys_dirs = [
+        PathBuf::from("./src/queries"),
+        PathBuf::from("./queries"),
+        PathBuf::from("./runtime/queries"),
+        subject0_config_dir().join("queries"),
+        subject0_data_dir().join("queries"),
+        PathBuf::from("/usr/share/subject0/queries"),
+    ];
+
+    for dir in dev_and_sys_dirs {
+        if dir.is_dir() {
+            return Some(dir);
+        }
+    }
+
     None
+}
+
+/// Recursively loads a query file from disk, automatically resolving any `;; inherits: <parent>`
+/// directives (e.g. cpp -> c, typescript -> ecma, tsx -> jsx, typescript).
+pub fn load_runtime_query(lang_name: &str) -> Option<String> {
+    let root = find_queries_root()?;
+    let mut visited = HashSet::new();
+    let mut combined_query = String::new();
+
+    load_query_recursive(&root, lang_name, &mut visited, &mut combined_query);
+
+    if combined_query.trim().is_empty() {
+        None
+    } else {
+        Some(combined_query)
+    }
+}
+
+fn load_query_recursive(
+    root: &Path,
+    lang_name: &str,
+    visited: &mut HashSet<String>,
+    acc: &mut String,
+) {
+    if !visited.insert(lang_name.to_string()) {
+        return; // Prevent cyclic inheritance
+    }
+
+    let file_path = root.join(lang_name).join("highlights.scm");
+    let content = match fs::read_to_string(&file_path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    // Parse `;; inherits: parent1,parent2` in the query header
+    for line in content.lines().take(10) {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix(';') {
+            let rest_trimmed = rest.trim_start_matches(';').trim();
+            if let Some(parent_str) = rest_trimmed.strip_prefix("inherits:") {
+                for parent in parent_str.split(',') {
+                    let parent_name = parent.trim();
+                    if !parent_name.is_empty() {
+                        load_query_recursive(root, parent_name, visited, acc);
+                    }
+                }
+            }
+        }
+    }
+
+    // Append child query rules after parent rules so specific patterns take precedence
+    acc.push('\n');
+    acc.push_str(&content);
+    acc.push('\n');
 }
 
 pub struct DynamicGrammar;
 
 impl DynamicGrammar {
     pub fn grammar_file_path(lang_name: &str) -> Option<PathBuf> {
-        query_file_path(lang_name)
+        let root = find_queries_root()?;
+        let p = root.join(lang_name).join("highlights.scm");
+        if p.is_file() { Some(p) } else { None }
     }
 
     #[allow(dead_code)]
@@ -311,7 +396,7 @@ impl SupportedLanguage {
         }
     }
 
-    /// Resolves compiled, statically linked grammar for top-tier languages.
+    /// Resolves compiled, statically linked grammar for supported languages.
     pub fn static_language(self) -> Option<tree_sitter::Language> {
         match self {
             SupportedLanguage::Rust => Some(tree_sitter_rust::LANGUAGE.into()),
@@ -320,13 +405,9 @@ impl SupportedLanguage {
             SupportedLanguage::Zig => Some(tree_sitter_zig::LANGUAGE.into()),
             SupportedLanguage::Python => Some(tree_sitter_python::LANGUAGE.into()),
             SupportedLanguage::JavaScript => Some(tree_sitter_javascript::LANGUAGE.into()),
-            // Plain `.ts`/`.mts`/`.cts` use the TypeScript dialect grammar (no JSX syntax).
             SupportedLanguage::TypeScript => {
                 Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
             }
-            // `.tsx` is a genuinely different grammar (TSX dialect) that additionally
-            // understands JSX syntax; reusing LANGUAGE_TYPESCRIPT for `.tsx` files is
-            // what previously caused parse/query errors on JSX-containing TypeScript.
             SupportedLanguage::Tsx => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
             SupportedLanguage::Go => Some(tree_sitter_go::LANGUAGE.into()),
             SupportedLanguage::Json => Some(tree_sitter_json::LANGUAGE.into()),
@@ -346,428 +427,61 @@ impl SupportedLanguage {
         }
     }
 
+    /// Compile-time embedded queries, resolving inheritance hierarchies statically as a zero-dependency fallback.
     pub fn builtin_highlight_query(self) -> &'static str {
         match self {
-            SupportedLanguage::Rust => {
-                r#"
-                (identifier) @variable
-                (type_identifier) @type
-                (primitive_type) @type
-                (field_identifier) @property
-                (call_expression function: (identifier) @function)
-                (call_expression function: (field_expression field: (field_identifier) @function))
-                (function_item name: (identifier) @function)
-                (macro_invocation macro: (identifier) @macro)
-                [
-                  "fn" "let" "mut" "pub" "struct" "enum" "impl" "trait" "use" "mod" "crate"
-                  "match" "if" "else" "while" "for" "in" "loop" "return" "break" "continue"
-                  "as" "const" "static" "type" "unsafe" "async" "await" "where" "ref" "move"
-                ] @keyword
-                (line_comment) @comment
-                (block_comment) @comment
-                (string_literal) @string
-                (raw_string_literal) @string
-                (char_literal) @string
-                (integer_literal) @number
-                (float_literal) @number
-                (boolean_literal) @number
-                "#
-            }
-            SupportedLanguage::Python => {
-                r#"
-                (identifier) @variable
-                (call function: (identifier) @function)
-                (call function: (attribute attribute: (identifier) @function))
-                (function_definition name: (identifier) @function)
-                (class_definition name: (identifier) @type)
-                [
-                  "def" "class" "return" "if" "elif" "else" "for" "while" "break"
-                  "continue" "import" "from" "as" "try" "except" "finally" "raise"
-                  "with" "pass" "lambda" "yield" "global" "nonlocal" "assert" "async" "await"
-                ] @keyword
-                (comment) @comment
-                (string) @string
-                (integer) @number
-                (float) @number
-                (true) @number
-                (false) @number
-                (none) @keyword
-                "#
-            }
-            SupportedLanguage::C => {
-                r#"
-                (identifier) @variable
-                (type_identifier) @type
-                (primitive_type) @type
-                (field_identifier) @property
-                (call_expression function: (identifier) @function)
-                (call_expression function: (field_expression field: (field_identifier) @function))
-                (function_declarator declarator: (identifier) @function)
-                [
-                  "if" "else" "switch" "case" "default" "while" "do" "for" "break"
-                  "continue" "return" "goto" "struct" "union" "enum" "typedef"
-                  "sizeof" "static" "extern" "auto" "register" "const" "volatile"
-                ] @keyword
-                (comment) @comment
-                (string_literal) @string
-                (char_literal) @string
-                (number_literal) @number
-                (preproc_include) @macro
-                (preproc_def) @macro
-                (preproc_directive) @macro
-                "#
-            }
-            SupportedLanguage::Cpp => {
-                r#"
-                (identifier) @variable
-                (type_identifier) @type
-                (primitive_type) @type
-                (field_identifier) @property
-                (call_expression function: (identifier) @function)
-                (call_expression function: (field_expression field: (field_identifier) @function))
-                (function_declarator declarator: (identifier) @function)
-                [
-                  "if" "else" "switch" "case" "default" "while" "do" "for" "break"
-                  "continue" "return" "goto" "struct" "union" "enum" "typedef"
-                  "sizeof" "static" "extern" "auto" "register" "const" "volatile"
-                  "class" "public" "private" "protected" "virtual" "template" "typename"
-                  "namespace" "using" "new" "delete" "this" "try" "catch" "throw"
-                ] @keyword
-                (comment) @comment
-                (string_literal) @string
-                (char_literal) @string
-                (number_literal) @number
-                (preproc_include) @macro
-                (preproc_def) @macro
-                (preproc_directive) @macro
-                "#
-            }
-            SupportedLanguage::Zig => {
-                r#"
-                (identifier) @variable
-                (type_identifier) @type
-                (field_identifier) @property
-                (call_expression function: (identifier) @function)
-                (call_expression function: (field_expression field: (field_identifier) @function))
-                [
-                  "const" "var" "fn" "pub" "return" "if" "else" "switch" "while" "for"
-                  "break" "continue" "defer" "errdefer" "try" "catch" "unreachable"
-                  "test" "usingnamespace" "opaque" "enum" "struct" "union" "error"
-                  "and" "or" "orelse"
-                ] @keyword
-                (line_comment) @comment
-                (string_literal) @string
-                (char_literal) @string
-                (integer_literal) @number
-                (float_literal) @number
-                "#
-            }
-            SupportedLanguage::Go => {
-                r#"
-                (identifier) @variable
-                (type_identifier) @type
-                (field_identifier) @property
-                (package_identifier) @namespace
-                (call_expression function: (identifier) @function)
-                (call_expression function: (selector_expression field: (field_identifier) @function))
-                (function_declaration name: (identifier) @function)
-                (method_declaration name: (field_identifier) @function)
-                [
-                  "func" "return" "var" "const" "type" "struct" "interface" "package"
-                  "import" "for" "range" "if" "else" "switch" "case" "default" "select"
-                  "go" "defer" "chan" "map" "break" "continue" "fallthrough"
-                ] @keyword
-                (comment) @comment
-                (raw_string_literal) @string
-                (interpreted_string_literal) @string
-                (int_literal) @number
-                (float_literal) @number
-                "#
-            }
-            SupportedLanguage::JavaScript => {
-                r#"
-                (identifier) @variable
-                (property_identifier) @property
-                (call_expression function: (identifier) @function)
-                (call_expression function: (member_expression property: (property_identifier) @function))
-                (function_declaration name: (identifier) @function)
-                (method_definition name: (property_identifier) @function)
+            SupportedLanguage::Rust => include_str!("queries/rust/highlights.scm"),
+            SupportedLanguage::C => include_str!("queries/c/highlights.scm"),
 
-                [ (this) (super) ] @variable
+            // C++ inherits C
+            SupportedLanguage::Cpp => concat!(
+                include_str!("queries/c/highlights.scm"),
+                "\n",
+                include_str!("queries/cpp/highlights.scm")
+            ),
 
-                [
-                  "function" "const" "let" "var" "return" "if" "else" "switch" "case"
-                  "default" "for" "while" "do" "break" "continue" "try" "catch" "finally"
-                  "throw" "class" "extends" "import" "export" "from" "new"
-                  "async" "await" "yield" "typeof" "instanceof" "void" "delete" "in" "of"
-                ] @keyword
+            SupportedLanguage::Zig => include_str!("queries/zig/highlights.scm"),
+            SupportedLanguage::Go => include_str!("queries/go/highlights.scm"),
+            SupportedLanguage::Python => include_str!("queries/python/highlights.scm"),
 
-                (comment) @comment
-                (string) @string
-                (template_string) @string
-                (regex) @string
-                (number) @number
-                [ (true) (false) ] @number
-                (null) @keyword
-                "#
-            }
-            SupportedLanguage::TypeScript => {
-                r#"
-                (identifier) @variable
-                (type_identifier) @type
-                (predefined_type) @type
-                (property_identifier) @property
-                (call_expression function: (identifier) @function)
-                (call_expression function: (member_expression property: (property_identifier) @function))
-                (function_declaration name: (identifier) @function)
-                (method_definition name: (property_identifier) @function)
+            // JavaScript inherits ECMAScript
+            SupportedLanguage::JavaScript => concat!(
+                include_str!("queries/ecma/highlights.scm"),
+                "\n",
+                include_str!("queries/javascript/highlights.scm")
+            ),
 
-                [ (this) (super) ] @variable
+            // TypeScript inherits ECMAScript
+            SupportedLanguage::TypeScript => concat!(
+                include_str!("queries/ecma/highlights.scm"),
+                "\n",
+                include_str!("queries/typescript/highlights.scm")
+            ),
 
-                [
-                  "function" "const" "let" "var" "return" "if" "else" "switch" "case"
-                  "default" "for" "while" "do" "break" "continue" "try" "catch" "finally"
-                  "throw" "class" "extends" "import" "export" "from" "new"
-                  "async" "await" "yield" "typeof" "instanceof" "void" "delete" "in" "of"
-                  "type" "interface" "enum" "namespace" "declare" "abstract" "implements"
-                  "readonly" "as" "keyof" "is"
-                ] @keyword
+            // TSX inherits ECMAScript, JSX, and TypeScript
+            SupportedLanguage::Tsx => concat!(
+                include_str!("queries/ecma/highlights.scm"),
+                "\n",
+                include_str!("queries/jsx/highlights.scm"),
+                "\n",
+                include_str!("queries/typescript/highlights.scm"),
+                "\n",
+                include_str!("queries/tsx/highlights.scm")
+            ),
 
-                (comment) @comment
-                (string) @string
-                (template_string) @string
-                (regex) @string
-                (number) @number
-                [ (true) (false) ] @number
-                (null) @keyword
-                "#
-            }
-
-            // `.tsx` files parse with the dedicated TSX dialect grammar, which is a
-            // superset of TypeScript that additionally understands JSX element syntax.
-            SupportedLanguage::Tsx => {
-                r#"
-                (identifier) @variable
-                (type_identifier) @type
-                (predefined_type) @type
-                (property_identifier) @property
-                (shorthand_property_identifier) @property
-                (call_expression function: (identifier) @function)
-                (call_expression function: (member_expression property: (property_identifier) @function))
-                (function_declaration name: (identifier) @function)
-                (function_expression name: (identifier) @function)
-                (method_definition name: (property_identifier) @function)
-                (method_signature name: (property_identifier) @function)
-                (arrow_function) @function
-                (formal_parameters (required_parameter pattern: (identifier) @parameter))
-                (formal_parameters (identifier) @parameter)
-                [
-                  "function" "const" "let" "var" "return" "if" "else" "switch" "case"
-                  "default" "for" "while" "do" "break" "continue" "try" "catch" "finally"
-                  "throw" "class" "extends" "import" "export" "from" "new" "static" "get" "set"
-                  "this" "super" "async" "await" "yield" "typeof" "instanceof" "void" "delete" "in" "of"
-                  "type" "interface" "enum" "namespace" "declare" "abstract" "implements"
-                  "readonly" "as" "keyof" "is" "satisfies" "infer" "asserts" "override"
-                ] @keyword
-                (comment) @comment
-                (string) @string
-                (template_string) @string
-                (regex) @string
-                (number) @number
-                [ (true) (false) ] @number
-                (null) @keyword
-                (undefined) @keyword
-                ["=" "==" "===" "!=" "!==" "<" ">" "<=" ">=" "+" "-" "*" "/" "%" "&&" "||" "??" "=>" "..." ":"] @operator
-                (jsx_opening_element (identifier) @tag)
-                (jsx_opening_element (member_expression) @tag)
-                (jsx_closing_element (identifier) @tag)
-                (jsx_closing_element (member_expression) @tag)
-                (jsx_self_closing_element (identifier) @tag)
-                (jsx_self_closing_element (member_expression) @tag)
-                (jsx_attribute (property_identifier) @property)
-                (jsx_text) @string
-                "#
-            }
+            SupportedLanguage::Json => include_str!("queries/json/highlights.scm"),
+            SupportedLanguage::Toml => include_str!("queries/toml/highlights.scm"),
+            SupportedLanguage::Yaml => include_str!("queries/yaml/highlights.scm"),
             SupportedLanguage::Bash | SupportedLanguage::Zsh => {
-                r#"
-                (variable_name) @variable
-                (command_name) @function
-                [
-                  "if" "then" "else" "elif" "fi" "case" "esac" "for" "while" "until"
-                  "do" "done" "in" "function" "select" "time"
-                ] @keyword
-                (comment) @comment
-                (string) @string
-                (raw_string) @string
-                "#
+                include_str!("queries/bash/highlights.scm")
             }
-            SupportedLanguage::Json => {
-                r#"
-                (pair key: (_) @property)
-                (string) @string
-                (number) @number
-                [ (true) (false) ] @number
-                (null) @keyword
-                (comment) @comment
-                "#
-            }
-            SupportedLanguage::Toml => {
-                r#"
-                (table (bare_key) @type)
-                (pair [ (bare_key) (quoted_key) ] @property)
-                (string) @string
-                (integer) @number
-                (float) @number
-                (boolean) @number
-                (comment) @comment
-                "#
-            }
-            SupportedLanguage::Yaml => {
-                r#"
-                (block_mapping_pair key: (_) @property)
-                (flow_pair key: (_) @property)
-                (string_scalar) @string
-                (integer_scalar) @number
-                (float_scalar) @number
-                (boolean_scalar) @number
-                (null_scalar) @keyword
-                (comment) @comment
-                "#
-            }
-            SupportedLanguage::Html => {
-                r#"
-                (tag_name) @tag
-                (attribute_name) @property
-                (attribute_value) @string
-                (comment) @comment
-                "#
-            }
-            SupportedLanguage::Css => {
-                r#"
-                (tag_name) @tag
-                (class_name) @type
-                (id_name) @type
-                (property_name) @property
-                (color_value) @number
-                (integer_value) @number
-                (float_value) @number
-                (string_value) @string
-                (comment) @comment
-                "#
-            }
-            SupportedLanguage::Markdown => {
-                r#"
-                (atx_heading) @type
-                (setext_heading) @type
-                (fenced_code_block) @string
-                (indented_code_block) @string
-                (block_quote) @comment
-                (thematic_break) @keyword
-                "#
-            }
-            SupportedLanguage::Java => {
-                r#"
-                (identifier) @variable
-                (type_identifier) @type
-                (field_access field: (identifier) @property)
-                (method_invocation name: (identifier) @function)
-                (method_declaration name: (identifier) @function)
-                [
-                  "public" "private" "protected" "class" "interface" "enum" "extends"
-                  "implements" "return" "if" "else" "for" "while" "do" "break" "continue"
-                  "switch" "case" "default" "new" "this" "super" "try" "catch" "finally"
-                  "throw" "throws" "static" "final" "void" "package" "import"
-                ] @keyword
-                (line_comment) @comment
-                (block_comment) @comment
-                (string_literal) @string
-                (decimal_integer_literal) @number
-                (hex_integer_literal) @number
-                (octal_integer_literal) @number
-                (binary_integer_literal) @number
-                (decimal_floating_point_literal) @number
-                (hex_floating_point_literal) @number
-                (true) @number
-                (false) @number
-                (null_literal) @keyword
-                "#
-            }
-            SupportedLanguage::CSharp => {
-                r#"
-                (identifier) @variable
-                (predefined_type) @type
-                (invocation_expression function: (identifier) @function)
-                (invocation_expression function: (member_access_expression name: (identifier) @function))
-                (method_declaration name: (identifier) @function)
-                (local_function_statement name: (identifier) @function)
-                (class_declaration name: (identifier) @type)
-                (interface_declaration name: (identifier) @type)
-                (struct_declaration name: (identifier) @type)
-                (enum_declaration name: (identifier) @type)
-                (namespace_declaration name: (identifier) @namespace)
-                [
-                  "class" "interface" "struct" "enum" "namespace" "using" "public" "private"
-                  "protected" "internal" "static" "readonly" "const" "return" "if" "else"
-                  "switch" "case" "default" "for" "foreach" "while" "do" "break" "continue"
-                  "try" "catch" "finally" "throw" "new" "this" "base" "async" "await" "var"
-                  "void" "override" "virtual" "abstract" "sealed" "partial" "in" "out" "ref"
-                  "get" "set" "yield" "is" "as"
-                ] @keyword
-                (comment) @comment
-                (string_literal) @string
-                (verbatim_string_literal) @string
-                (raw_string_literal) @string
-                (character_literal) @string
-                (integer_literal) @number
-                (real_literal) @number
-                (boolean_literal) @number
-                (null_literal) @keyword
-                "#
-            }
-            SupportedLanguage::Ruby => {
-                r#"
-                (identifier) @variable
-                (constant) @type
-                (call method: [(identifier) (constant)] @function)
-                (method name: (identifier) @function)
-                (method_parameters (identifier) @parameter)
-                (block_parameters (identifier) @parameter)
-                (instance_variable) @property
-                (class_variable) @property
-                [
-                  "alias" "and" "begin" "break" "case" "class" "def" "do" "else" "elsif"
-                  "end" "ensure" "for" "if" "in" "module" "next" "or" "rescue" "retry"
-                  "return" "then" "unless" "until" "when" "while" "yield" "not" "self" "super"
-                ] @keyword
-                (comment) @comment
-                [ (string) (bare_string) (heredoc_body) (heredoc_beginning) (subshell) ] @string
-                [ (simple_symbol) (delimited_symbol) (hash_key_symbol) (bare_symbol) ] @string
-                (regex) @string
-                [ (integer) (float) ] @number
-                [ (nil) (true) (false) ] @keyword
-                "#
-            }
-            SupportedLanguage::Lua => {
-                r#"
-                (identifier) @variable
-                (function_call name: (identifier) @function)
-                (function_call name: (dot_index_expression field: (identifier) @function))
-                (function_call name: (method_index_expression method: (identifier) @function))
-                (function_declaration name: (identifier) @function)
-                (function_declaration name: (dot_index_expression field: (identifier) @function))
-                (function_declaration name: (method_index_expression method: (identifier) @function))
-                (parameters (identifier) @parameter)
-                [
-                  "function" "local" "end" "if" "then" "else" "elseif" "for" "while"
-                  "repeat" "until" "do" "break" "return" "in" "and" "or" "not" "goto"
-                ] @keyword
-                (comment) @comment
-                (string) @string
-                (number) @number
-                [ (true) (false) ] @number
-                (nil) @keyword
-                "#
-            }
+            SupportedLanguage::Html => include_str!("queries/html/highlights.scm"),
+            SupportedLanguage::Css => include_str!("queries/css/highlights.scm"),
+            SupportedLanguage::Markdown => include_str!("queries/markdown/highlights.scm"),
+            SupportedLanguage::Java => include_str!("queries/java/highlights.scm"),
+            SupportedLanguage::CSharp => include_str!("queries/c-sharp/highlights.scm"),
+            SupportedLanguage::Ruby => include_str!("queries/ruby/highlights.scm"),
+            SupportedLanguage::Lua => include_str!("queries/lua/highlights.scm"),
             _ => "",
         }
     }
@@ -903,7 +617,7 @@ impl SupportedLanguage {
             SupportedLanguage::Lua => "lua",
             SupportedLanguage::Markdown => "markdown",
             SupportedLanguage::Java => "java",
-            SupportedLanguage::CSharp => "c_sharp",
+            SupportedLanguage::CSharp => "c-sharp",
             SupportedLanguage::Php => "php",
             SupportedLanguage::Ruby => "ruby",
             SupportedLanguage::Kotlin => "kotlin",
@@ -1000,9 +714,6 @@ impl SupportedLanguage {
             SupportedLanguage::Zig => "zig",
             SupportedLanguage::JavaScript => "javascript",
             SupportedLanguage::TypeScript => "typescript",
-            // typescript-language-server / vtsls require the exact "typescriptreact"
-            // languageId for .tsx — sending "typescript" causes JSX-aware features
-            // (and in some server versions, the whole didOpen) to misbehave.
             SupportedLanguage::Tsx => "typescriptreact",
             SupportedLanguage::Html => "html",
             SupportedLanguage::Css => "css",
@@ -1322,6 +1033,11 @@ pub const HIGHLIGHT_NAMES: &[&str] = &[
     "macro",
     "namespace",
     "tag",
+    "constant",
+    "constructor",
+    "attribute",
+    "module",
+    "label",
 ];
 
 fn highlight_idx_to_token_type(idx: usize) -> CanonicalTokenType {
@@ -1339,6 +1055,11 @@ fn highlight_idx_to_token_type(idx: usize) -> CanonicalTokenType {
         10 => CanonicalTokenType::Macro,
         11 => CanonicalTokenType::Namespace,
         12 => CanonicalTokenType::Tag,
+        13 => CanonicalTokenType::Variable,  // constant
+        14 => CanonicalTokenType::Function,  // constructor
+        15 => CanonicalTokenType::Property,  // attribute
+        16 => CanonicalTokenType::Namespace, // module
+        17 => CanonicalTokenType::Keyword,   // label
         _ => CanonicalTokenType::Other,
     }
 }
@@ -1363,30 +1084,45 @@ impl SyntaxEngine {
 
         if let Some(static_lang) = language.static_language() {
             let _ = parser.set_language(&static_lang);
-            let query_src = if let Some(qp) = query_file_path(language.grammar_name()) {
-                fs::read_to_string(qp)
-                    .unwrap_or_else(|_| language.builtin_highlight_query().to_string())
-            } else {
-                language.builtin_highlight_query().to_string()
-            };
 
-            match HighlightConfiguration::new(
-                static_lang,
-                language.grammar_name(),
-                &query_src,
-                "",
-                "",
-            ) {
-                Ok(mut config) => {
-                    config.configure(HIGHLIGHT_NAMES);
-                    highlight_config = Some(config);
-                    has_grammar = true;
-                }
-                Err(err) => {
-                    eprintln!(
-                        "[subject0] Highlight config compilation error for {:?}: {err}",
-                        language
-                    );
+            // 1. Attempt runtime loading with recursive inheritance resolution
+            // 2. Fall back to compile-time embedded strings
+            let query_src = load_runtime_query(language.grammar_name())
+                .unwrap_or_else(|| language.builtin_highlight_query().to_string());
+
+            if !query_src.is_empty() {
+                match HighlightConfiguration::new(
+                    static_lang.clone(),
+                    language.grammar_name(),
+                    &query_src,
+                    "",
+                    "",
+                ) {
+                    Ok(mut config) => {
+                        config.configure(HIGHLIGHT_NAMES);
+                        highlight_config = Some(config);
+                        has_grammar = true;
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "[subject0] Runtime query error for {:?}: {err}. Trying builtin fallback...",
+                            language
+                        );
+                        let builtin = language.builtin_highlight_query();
+                        if !builtin.is_empty() && builtin != query_src {
+                            if let Ok(mut config) = HighlightConfiguration::new(
+                                static_lang,
+                                language.grammar_name(),
+                                builtin,
+                                "",
+                                "",
+                            ) {
+                                config.configure(HIGHLIGHT_NAMES);
+                                highlight_config = Some(config);
+                                has_grammar = true;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1847,5 +1583,128 @@ pub fn symbol_kind_icon(kind: u64) -> (&'static str, Color) {
         25 => (KIND_OPERATOR, Color::Rgb(220, 110, 240)),
         26 => (KIND_TYPE_PARAM, Color::Rgb(149, 169, 159)),
         _ => (KIND_DEFAULT, Color::Rgb(170, 175, 190)),
+    }
+}
+
+// === Comprehensive Test Suite ===
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_all_static_languages() {
+        let mut passed = Vec::new();
+        let mut failed = Vec::new();
+
+        println!("\nTesting all statically linked tree-sitter grammars (Runtime + Builtin)...\n");
+
+        for &lang in SupportedLanguage::all() {
+            let Some(static_lang) = lang.static_language() else {
+                continue;
+            };
+
+            // Test runtime query first (with inheritance), falling back to embedded
+            let query_src = load_runtime_query(lang.grammar_name())
+                .unwrap_or_else(|| lang.builtin_highlight_query().to_string());
+
+            if query_src.is_empty() {
+                continue;
+            }
+
+            match HighlightConfiguration::new(static_lang, lang.grammar_name(), &query_src, "", "")
+            {
+                Ok(mut config) => {
+                    config.configure(HIGHLIGHT_NAMES);
+                    passed.push(lang);
+                    println!("  ✓ {:<14} OK", format!("{:?}", lang));
+                }
+                Err(err) => {
+                    let err_msg = err.to_string();
+                    let context = extract_error_context(&err_msg, &query_src);
+                    failed.push((lang, err_msg, context));
+                    println!("  ✗ {:<14} FAILED", format!("{:?}", lang));
+                }
+            }
+        }
+
+        println!("\n======================= SUMMARY =======================");
+        println!("  Passed: {}", passed.len());
+        println!("  Failed: {}", failed.len());
+        println!("=======================================================\n");
+
+        if !failed.is_empty() {
+            println!("------------------- ERROR DETAILS -------------------");
+            for (lang, err, ctx) in &failed {
+                println!("\nLanguage: {:?}", lang);
+                println!("Error:    {}", err);
+                if let Some(code) = ctx {
+                    println!("Location:\n{}", code);
+                }
+            }
+            println!("-----------------------------------------------------\n");
+
+            let failed_names: Vec<String> =
+                failed.iter().map(|(l, _, _)| format!("{:?}", l)).collect();
+            panic!(
+                "Query compilation failed for {} language(s): {}",
+                failed.len(),
+                failed_names.join(", ")
+            );
+        }
+    }
+
+    #[test]
+    fn test_cpp_engine_end_to_end() {
+        let path = PathBuf::from("tests/test.cpp");
+        let mut engine = SyntaxEngine::new(Some(&path));
+
+        assert!(
+            engine.has_treesitter(),
+            "Tree-sitter engine failed to initialize for C++!"
+        );
+
+        let code = r#"
+        #include <iostream>
+        struct Document { int id; bool is_saved; };
+        int main() {
+            std::cout << "Hello World\n";
+            return 0;
+        }
+        "#;
+
+        engine.reparse(code);
+
+        assert!(
+            !engine.ts_tokens.is_empty(),
+            "Engine produced 0 syntax tokens for C++!"
+        );
+    }
+
+    fn extract_error_context(err_msg: &str, query_src: &str) -> Option<String> {
+        let pos = err_msg.find("at ")?;
+        let sub = &err_msg[pos + 3..];
+        let colon = sub.find(':')?;
+        let row: usize = sub[..colon].parse().ok()?;
+
+        let lines: Vec<&str> = query_src.lines().collect();
+        if lines.is_empty() {
+            return None;
+        }
+
+        let start = row.saturating_sub(3);
+        let end = (row + 4).min(lines.len());
+
+        let mut snippet = String::new();
+        for i in start..end {
+            let line_num = i + 1;
+            let marker = if i == row || line_num == row {
+                ">> "
+            } else {
+                "   "
+            };
+            snippet.push_str(&format!("{}{:>4} | {}\n", marker, line_num, lines[i]));
+        }
+        Some(snippet)
     }
 }
