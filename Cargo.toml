@@ -32,6 +32,10 @@ tokio = { version = "1.38", features = [
     "time",
 ] }
 
+# Pure Rust Git engine and line diffing
+gix = { version = "0.68", default-features = false, features = ["revision", "blob-diff", "parallel"] }
+imara-diff = "0.1"
+
 # Cross-platform executable and directory resolution across Termux, Linux, macOS, and Windows
 which = "7.0"
 dirs = "6.0"

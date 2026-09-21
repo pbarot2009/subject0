@@ -11,6 +11,8 @@ struct DocumentItem {
   const bool is_saved;
 };
 
+
+
 template <typename T>
 concept IsDocument = requires(T doc) {
   { doc.id } -> std::convertible_to<int>;

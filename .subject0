@@ -4,5 +4,6 @@
     "python": "pyright",
     "rust": "rust-analyzer"
   },
-  "theme": "gruvbox-dark"
+  "show_inlay_hints": true,
+  "theme": "dracula"
 }

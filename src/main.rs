@@ -3,11 +3,11 @@
 //! This module serves as the runtime orchestrator for `subject0`. It integrates the
 //! terminal lifecycle, asynchronous event multiplexing, input decoding, themed frame
 //! rendering, and modal subsystem coordination for full Language Server Protocol (LSP)
-//! intelligence (inferred types & parameter inlay hints, hover docs, signature assistance,
-//! definition jumps, formatting, code actions, and symbol outlines).
+//! intelligence and real-time Git diff tracking.
 
 mod cmd;
 mod editor;
+mod git;
 mod lsp;
 mod nerdfonts;
 mod syntax;
@@ -33,12 +33,13 @@ use ratatui::{Terminal, backend::CrosstermBackend, layout::Size};
 use tokio::sync::mpsc;
 
 use editor::{CodeActionPicker, Editor, Focus, LocationPicker, Mode, SymbolPicker};
+use git::{GitInbound, GitOutbound, run_git_actor};
 use lsp::{LspOutbound, LspStatus, SuggestionItem, utf16_to_char_col};
 use theme::Theme;
 use ui::render_ui;
 
 /// RAII Terminal Guard ensuring the host terminal is reliably restored
-/// to canonical mode regardless of exit status.
+/// to canonical mode regardless of exit status[span_8](start_span)[span_8](end_span).
 struct TerminalGuard;
 
 impl TerminalGuard {
@@ -60,7 +61,7 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// Configures the terminal hardware cursor geometry based on the active modal editing state.
+/// Configures the terminal hardware cursor geometry based on the active modal editing state[span_9](start_span)[span_9](end_span).
 fn set_terminal_cursor_style(mode: Mode) {
     let mut stdout = stdout();
     match mode {
@@ -74,7 +75,7 @@ fn set_terminal_cursor_style(mode: Mode) {
     let _ = stdout.flush();
 }
 
-/// Registers a secondary panic hook ensuring screen recovery during thread unwinding.
+/// Registers a secondary panic hook ensuring screen recovery during thread unwinding[span_10](start_span)[span_10](end_span).
 fn setup_panic_hook() {
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -119,13 +120,21 @@ async fn main() -> Result<()> {
         editor.clamp_cursor();
     }
 
+    // Initialize LSP messaging pipeline[span_11](start_span)[span_11](end_span)
     let (lsp_out_tx, mut lsp_out_rx) = mpsc::unbounded_channel::<LspOutbound>();
     editor.lsp_out_tx = Some(lsp_out_tx.clone());
+
+    // Initialize background Git actor pipeline
+    let (git_in_tx, git_in_rx) = mpsc::unbounded_channel::<GitInbound>();
+    let (git_out_tx, mut git_out_rx) = mpsc::unbounded_channel::<GitOutbound>();
+    editor.git_tx = Some(git_in_tx);
+    tokio::spawn(run_git_actor(git_in_rx, git_out_tx));
 
     if let Some(path) = &target_path
         && path.is_file()
     {
         editor.ensure_lsp_for_file(path);
+        editor.request_git_diff();
     }
 
     set_terminal_cursor_style(editor.mode);
@@ -133,10 +142,11 @@ async fn main() -> Result<()> {
     let mut needs_redraw = true;
 
     while !editor.should_quit {
-        let mut received_lsp_msg = false;
+        let mut received_bg_msg = false;
 
+        // Drain LSP background messages[span_12](start_span)[span_12](end_span)
         while let Ok(msg) = lsp_out_rx.try_recv() {
-            received_lsp_msg = true;
+            received_bg_msg = true;
             match msg {
                 LspOutbound::Status(s) => {
                     let was_ready = matches!(s, LspStatus::Ready(_));
@@ -294,7 +304,25 @@ async fn main() -> Result<()> {
             }
         }
 
-        if received_lsp_msg {
+        // Drain Git background messages
+        while let Ok(msg) = git_out_rx.try_recv() {
+            received_bg_msg = true;
+            match msg {
+                GitOutbound::DiffSummary { path, summary } => {
+                    let is_current = editor
+                        .path
+                        .as_ref()
+                        .is_some_and(|p| p.canonicalize().ok() == path.canonicalize().ok())
+                        || editor.path.as_ref() == Some(&path);
+
+                    if is_current {
+                        editor.git_diff = summary;
+                    }
+                }
+            }
+        }
+
+        if received_bg_msg {
             needs_redraw = true;
         }
 
@@ -344,7 +372,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
     let viewport_top = 1u16;
     let viewport_bottom = size.height.saturating_sub(3);
 
-    // Dismiss active hover card on outside click
+    // Dismiss active hover card on outside click[span_13](start_span)[span_13](end_span)
     if editor.hover_info.is_some() {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             editor.hover_info = None;
@@ -352,7 +380,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         return;
     }
 
-    // Intercept In-Editor Help Modal
+    // Intercept In-Editor Help Modal[span_14](start_span)[span_14](end_span)
     if editor.show_help {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             let width = 64u16.min(size.width.saturating_sub(4));
@@ -371,7 +399,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         return;
     }
 
-    // Intercept Theme Picker Modal
+    // Intercept Theme Picker Modal[span_15](start_span)[span_15](end_span)
     if editor.theme_picker.is_some() {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             let themes = Theme::all();
@@ -401,7 +429,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         return;
     }
 
-    // Intercept LSP Server Picker Modal
+    // Intercept LSP Server Picker Modal[span_16](start_span)[span_16](end_span)
     if let Some(picker) = &editor.lsp_picker {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             let width = 48u16.min(size.width.saturating_sub(2));
@@ -440,7 +468,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         return;
     }
 
-    // Intercept Command Palette Interactions
+    // Intercept Command Palette Interactions[span_17](start_span)[span_17](end_span)
     if editor.palette.visible {
         let width = 46u16.min(size.width.saturating_sub(2));
         let height = 12u16.min(size.height.saturating_sub(2));
@@ -494,18 +522,13 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         return;
     }
 
-    // Statusline Interactions
+    // Statusline Interactions[span_18](start_span)[span_18](end_span)
     if mouse.row == status_row {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             let badge_len = match editor.mode {
                 Mode::Normal | Mode::Insert | Mode::Visual { .. } => 8,
                 Mode::Command => 9,
             } + 1;
-
-            let files_end = badge_len + 10;
-            let wrap_badge_len = if editor.line_wrap { 8 } else { 10 };
-            let wrap_end = files_end + wrap_badge_len;
-            let cmd_end = wrap_end + 9;
 
             let col = mouse.column as usize;
             if col <= badge_len {
@@ -515,23 +538,6 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
                 });
                 set_terminal_cursor_style(editor.mode);
                 editor.completion_visible = false;
-            } else if col <= files_end {
-                editor.explorer.visible = !editor.explorer.visible;
-                if editor.explorer.visible {
-                    editor.explorer.refresh();
-                    editor.focus = Focus::Explorer;
-                } else {
-                    editor.focus = Focus::Editor;
-                }
-            } else if col <= wrap_end {
-                editor.line_wrap = !editor.line_wrap;
-                editor.status_msg =
-                    format!("Line Wrap: {}", if editor.line_wrap { "ON" } else { "OFF" });
-            } else if col <= cmd_end {
-                editor.palette.visible = true;
-                editor.palette.query.clear();
-                editor.palette.selected_idx = 0;
-                editor.palette.scroll = 0;
             }
         }
         return;
@@ -551,7 +557,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         0u16
     };
 
-    // File Explorer Sidebar Interactions
+    // File Explorer Sidebar Interactions[span_19](start_span)[span_19](end_span)
     if editor.explorer.visible && mouse.column < explorer_width {
         let max_visible = viewport_bottom.saturating_sub(viewport_top) as usize;
         match mouse.kind {
@@ -591,7 +597,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         return;
     }
 
-    // Completion Dropdown Interactions
+    // Completion Dropdown Interactions[span_20](start_span)[span_20](end_span)
     if editor.completion_visible
         && !editor.completions.is_empty()
         && let Some((px, py, pw, ph)) = editor.completion_rect
@@ -635,9 +641,9 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         }
     }
 
-    // Document Viewport Buffer Interactions
+    // Document Viewport Buffer Interactions[span_21](start_span)[span_21](end_span)
     let gutter_digits = editor.rope.len_lines().max(1).to_string().len().max(2);
-    let gutter_width = gutter_digits + 5;
+    let gutter_width = gutter_digits + 7;
     let content_left = explorer_width + 1u16 + gutter_width as u16;
 
     match mouse.kind {
@@ -703,7 +709,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
     let prev_mode = editor.mode;
     let max_visible = 6usize;
 
-    // 1. Rename Symbol Prompt Input
+    // 1. Rename Symbol Prompt Input[span_22](start_span)[span_22](end_span)
     if let Some(mut name) = editor.rename_prompt.take() {
         match key.code {
             KeyCode::Esc => {
@@ -727,7 +733,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // 2. Hover Card Viewer
+    // 2. Hover Card Viewer[span_23](start_span)[span_23](end_span)
     if editor.hover_info.is_some() {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
@@ -748,7 +754,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         }
     }
 
-    // 3. Code Actions Picker Modal
+    // 3. Code Actions Picker Modal[span_24](start_span)[span_24](end_span)
     if let Some(mut picker) = editor.code_action_picker.take() {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
@@ -785,7 +791,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // 4. Symbol Outline Picker Modal
+    // 4. Symbol Outline Picker Modal[span_25](start_span)[span_25](end_span)
     if let Some(mut picker) = editor.symbol_picker.take() {
         let filtered_count = picker.filtered_symbols().len();
         match key.code {
@@ -836,7 +842,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // 5. Locations Picker (Definition / References)
+    // 5. Locations Picker (Definition / References)[span_26](start_span)[span_26](end_span)
     if let Some(mut picker) = editor.location_picker.take() {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
@@ -866,7 +872,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // 6. Help Modal Navigation
+    // 6. Help Modal Navigation[span_27](start_span)[span_27](end_span)
     if editor.show_help {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q' | '?') => {
@@ -889,7 +895,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // 7. Theme Picker Modal
+    // 7. Theme Picker Modal[span_28](start_span)[span_28](end_span)
     if let Some(mut picker) = editor.theme_picker.take() {
         let themes = Theme::all();
         match key.code {
@@ -919,7 +925,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // 8. LSP Server Picker Modal
+    // 8. LSP Server Picker Modal[span_29](start_span)[span_29](end_span)
     if let Some(mut picker) = editor.lsp_picker.take() {
         if picker.candidates.is_empty() {
             editor.status_msg = "No LSP candidates available".to_string();
@@ -962,7 +968,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // 9. Command Palette Key Events
+    // 9. Command Palette Key Events[span_30](start_span)[span_30](end_span)
     if editor.palette.visible {
         let cmds = editor.palette.filtered_commands();
         match key.code {
@@ -1016,7 +1022,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // 10. Global Shortcuts: Ctrl-E for File Explorer
+    // 10. Global Shortcuts: Ctrl-E for File Explorer[span_31](start_span)[span_31](end_span)
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('e') {
         editor.explorer.visible = !editor.explorer.visible;
         if editor.explorer.visible {
@@ -1028,7 +1034,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // 11. File Explorer Navigation Focus
+    // 11. File Explorer Navigation Focus[span_32](start_span)[span_32](end_span)
     if editor.focus == Focus::Explorer && editor.explorer.visible {
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
@@ -1064,7 +1070,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // 12. Modal Editing Handler
+    // 12. Modal Editing Handler[span_33](start_span)[span_33](end_span)
     match editor.mode {
         Mode::Normal => {
             editor.completion_visible = false;
@@ -1142,6 +1148,14 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                     }
                     ('[', KeyCode::Char('d')) => {
                         editor.prev_diagnostic();
+                        true
+                    }
+                    (']', KeyCode::Char('c')) => {
+                        editor.jump_next_hunk();
+                        true
+                    }
+                    ('[', KeyCode::Char('c')) => {
+                        editor.jump_prev_hunk();
                         true
                     }
                     _ => false,

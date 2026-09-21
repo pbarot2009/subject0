@@ -4,21 +4,26 @@
 //!
 //! 1. **Text Storage & Mutability ([`ropey::Rope`])**:
 //!    Buffer contents are stored as a chunked, reference-counted B-tree rope with $O(\log N)$
-//!    mutations and $O(1)$ copy-on-write structural sharing for undo/redo snapshots.
+//!    mutations and $O(1)$ copy-on-write structural sharing for undo/redo snapshots[span_7](start_span)[span_7](end_span).
 //!
 //! 2. **Modal Editing State Machine ([`Mode`])**:
-//!    Implements modal key semantics across `Normal`, `Insert`, `Command`, and `Visual` states.
+//!    Implements modal key semantics across `Normal`, `Insert`, `Command`, and `Visual` states[span_8](start_span)[span_8](end_span).
 //!
 //! 3. **Top-Tier Language Server Protocol (LSP) State Integration**:
-//!    - Multi-file workspace edit dispatcher applying atomic updates across disk and memory.
-//!    - Additional text edits on completion acceptance (auto-imports).
-//!    - Jump history tracking across document definition/reference navigations.
-//!    - Bidirectional diagnostic traversal (`next_diagnostic`, `prev_diagnostic`).
-//!    - Request cancellation and server reboot triggers (`:lsp-restart`).
+//!    - Multi-file workspace edit dispatcher applying atomic updates across disk and memory[span_9](start_span)[span_9](end_span).
+//!    - Additional text edits on completion acceptance (auto-imports)[span_10](start_span)[span_10](end_span).
+//!    - Jump history tracking across document definition/reference navigations[span_11](start_span)[span_11](end_span).
+//!    - Bidirectional diagnostic traversal (`next_diagnostic`, `prev_diagnostic`)[span_12](start_span)[span_12](end_span).
+//!    - Request cancellation and server reboot triggers (`:lsp-restart`)[span_13](start_span)[span_13](end_span).
 //!
-//! 4. **Theming, Diagnostics Sync & Data Protection**:
+//! 4. **Git Version Control & Real-Time Diff Integration**:
+//!    - Asynchronous line-level diff tracking against the repository `HEAD` blob.
+//!    - Modal hunk navigation motions (`]c`, `[c`).
+//!    - Single-action hunk reversion restoring baseline Git objects directly into memory.
+//!
+//! 5. **Theming, Diagnostics Sync & Data Protection**:
 //!    Maintains AST highlighting trees, shifts diagnostic positions on row mutations,
-//!    tracks a bidirectional undo/redo ring, and protects unsaved buffers.
+//!    tracks a bidirectional undo/redo ring, and protects unsaved buffers[span_14](start_span)[span_14](end_span).
 
 use std::{
     collections::{HashMap, HashSet},
@@ -28,6 +33,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::git::{GitDiffSummary, GitHunk, GitInbound, GutterChange};
 use crate::lsp::{
     CodeActionItem, DiagnosticItem, HoverInfo, InlayHintItem, LocationItem, LspInbound,
     LspOutbound, LspStatus, SignatureHelpInfo, SuggestionItem, SymbolItem, TextEditItem,
@@ -40,7 +46,8 @@ use crate::nerdfonts::{
     CMD_INSERT_ABOVE, CMD_INSERT_BELOW, CMD_JOIN, CMD_JUMP_BOTTOM, CMD_JUMP_TOP, CMD_PASTE,
     CMD_QUIT, CMD_REDO, CMD_REFERENCES, CMD_RENAME, CMD_RESTART, CMD_SAVE, CMD_SAVE_QUIT,
     CMD_SYMBOLS, CMD_TOGGLE_CASE, CMD_UNDO, CMD_VISUAL, CMD_YANK, DIAG_ERROR, DIAG_WARN,
-    FILE_DOCUMENT, FOLDER, GEAR_CONFIG, HELP, HINTS_ON, LIGHTBULB, SETTINGS_COGS, THEME, WRAP_ON,
+    FILE_DOCUMENT, FOLDER, GEAR_CONFIG, GIT_BRANCH, GIT_DIFF_ADDED, GIT_DIFF_MODIFIED,
+    GIT_DIFF_REMOVED, HELP, HINTS_ON, LIGHTBULB, SETTINGS_COGS, THEME, WRAP_ON,
 };
 use crate::theme::Theme;
 
@@ -49,14 +56,14 @@ use ropey::Rope;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-/// Persistent editor configuration stored in `.subject0`.
+/// Persistent editor configuration stored in `.subject0`[span_15](start_span)[span_15](end_span).
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     pub preferred_lsps: HashMap<String, String>,
     pub line_wrap: bool,
     pub theme: String,
     pub show_inlay_hints: bool,
-    /// Resolved absolute path to the `.subject0` configuration file.
+    /// Resolved absolute path to the `.subject0` configuration file[span_16](start_span)[span_16](end_span).
     pub source_path: PathBuf,
 }
 
@@ -152,25 +159,25 @@ impl AppConfig {
     }
 }
 
-/// Interactive modal state when choosing from available color themes.
+/// Interactive modal state when choosing from available color themes[span_17](start_span)[span_17](end_span).
 pub struct ThemePicker {
     pub selected_idx: usize,
 }
 
-/// Interactive modal state when multiple language servers are detected for a language.
+/// Interactive modal state when multiple language servers are detected for a language[span_18](start_span)[span_18](end_span).
 pub struct LspPicker {
     pub language_id: String,
     pub candidates: Vec<String>,
     pub selected_idx: usize,
 }
 
-/// Interactive modal state when choosing a Code Action / Quickfix.
+/// Interactive modal state when choosing a Code Action / Quickfix[span_19](start_span)[span_19](end_span).
 pub struct CodeActionPicker {
     pub actions: Vec<CodeActionItem>,
     pub selected_idx: usize,
 }
 
-/// Interactive modal state for fuzzy symbol search across document outlines.
+/// Interactive modal state for fuzzy symbol search across document outlines[span_20](start_span)[span_20](end_span).
 pub struct SymbolPicker {
     pub symbols: Vec<SymbolItem>,
     pub query: String,
@@ -194,7 +201,7 @@ impl SymbolPicker {
     }
 }
 
-/// Interactive modal state when choosing from multiple definition or reference locations.
+/// Interactive modal state when choosing from multiple definition or reference locations[span_21](start_span)[span_21](end_span).
 pub struct LocationPicker {
     pub title: &'static str,
     pub locations: Vec<LocationItem>,
@@ -202,7 +209,7 @@ pub struct LocationPicker {
     pub scroll: usize,
 }
 
-/// Active modal editing state.
+/// Active modal editing state[span_22](start_span)[span_22](end_span).
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum Mode {
     Normal,
@@ -211,14 +218,14 @@ pub enum Mode {
     Visual { anchor_x: usize, anchor_y: usize },
 }
 
-/// Identifies which viewport element currently holds keyboard input focus.
+/// Identifies which viewport element currently holds keyboard input focus[span_23](start_span)[span_23](end_span).
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum Focus {
     Editor,
     Explorer,
 }
 
-/// Navigation jump checkpoint for jump-list history.
+/// Navigation jump checkpoint for jump-list history[span_24](start_span)[span_24](end_span).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JumpCheckpoint {
     pub path: PathBuf,
@@ -253,7 +260,11 @@ pub enum CommandId {
     SelectTheme,
     SaveConfig,
     ShowHelp,
-    // LSP-Powered Capabilities
+    // Git Capabilities
+    NextHunk,
+    PrevHunk,
+    RevertHunk,
+    // LSP Capabilities
     FormatDocument,
     RenameSymbol,
     ShowHover,
@@ -278,6 +289,24 @@ pub struct PaletteCommand {
 }
 
 pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
+    PaletteCommand {
+        title: "Next Git Diff Hunk",
+        shortcut: "]c / :nh",
+        icon: GIT_DIFF_ADDED,
+        id: CommandId::NextHunk,
+    },
+    PaletteCommand {
+        title: "Previous Git Diff Hunk",
+        shortcut: "[c / :ph",
+        icon: GIT_DIFF_REMOVED,
+        id: CommandId::PrevHunk,
+    },
+    PaletteCommand {
+        title: "Revert Current Git Hunk",
+        shortcut: ":revert-hunk / :rh",
+        icon: GIT_DIFF_MODIFIED,
+        id: CommandId::RevertHunk,
+    },
     PaletteCommand {
         title: "Format Document (LSP)",
         shortcut: ":fmt / Alt-F",
@@ -559,7 +588,7 @@ impl FileExplorer {
         explorer
     }
 
-    /// Refreshes the explorer tree while preserving expanded folders across refreshes.
+    /// Refreshes the explorer tree while preserving expanded folders across refreshes[span_25](start_span)[span_25](end_span).
     pub fn refresh(&mut self) {
         let expanded_paths: HashSet<PathBuf> = self
             .entries
@@ -761,6 +790,10 @@ pub struct Editor {
     pub lsp_req_id: i64,
     pub doc_version: i32,
 
+    // Git Version Control State
+    pub git_diff: GitDiffSummary,
+    pub git_tx: Option<mpsc::UnboundedSender<GitInbound>>,
+
     // Completions State
     pub completions: Vec<SuggestionItem>,
     pub completion_idx: usize,
@@ -858,6 +891,9 @@ impl Editor {
             theme_picker: None,
             lsp_picker: None,
 
+            git_diff: GitDiffSummary::default(),
+            git_tx: None,
+
             clipboard: String::new(),
             modified: false,
             saved_undo_len: 0,
@@ -904,7 +940,87 @@ impl Editor {
         })
     }
 
-    /// Switches the active color theme and writes it to `.subject0`.
+    /// Dispatches a background request to recompute Git diffs for the current buffer.
+    pub fn request_git_diff(&mut self) {
+        if let (Some(tx), Some(path)) = (&self.git_tx, &self.path) {
+            let _ = tx.send(GitInbound::UpdateBuffer {
+                path: path.clone(),
+                text: self.rope.to_string(),
+            });
+        }
+    }
+
+    /// Navigates cursor to the starting line of the next Git hunk.
+    pub fn jump_next_hunk(&mut self) {
+        if let Some(target_line) = self.git_diff.next_hunk_line(self.cursor_y) {
+            self.cursor_y = target_line.min(self.rope.len_lines().saturating_sub(1));
+            self.cursor_x = 0;
+            self.clamp_cursor();
+            self.status_msg = format!("Jumped to hunk at line {}", self.cursor_y + 1);
+        } else {
+            self.status_msg = "No Git diff hunks in buffer".to_string();
+        }
+    }
+
+    /// Navigates cursor to the starting line of the previous Git hunk.
+    pub fn jump_prev_hunk(&mut self) {
+        if let Some(target_line) = self.git_diff.prev_hunk_line(self.cursor_y) {
+            self.cursor_y = target_line.min(self.rope.len_lines().saturating_sub(1));
+            self.cursor_x = 0;
+            self.clamp_cursor();
+            self.status_msg = format!("Jumped to hunk at line {}", self.cursor_y + 1);
+        } else {
+            self.status_msg = "No Git diff hunks in buffer".to_string();
+        }
+    }
+
+    /// Reverts the Git hunk under or nearest to the cursor back to the `HEAD` commit state.
+    pub fn revert_hunk_at_cursor(&mut self) {
+        let Some(hunk) = self.git_diff.hunk_at_line(self.cursor_y).cloned() else {
+            self.status_msg = "No Git hunk at current cursor line".to_string();
+            return;
+        };
+
+        self.snapshot();
+
+        let after_start = hunk.after_start;
+        let after_len = hunk.after_len;
+        let head_text = hunk.head_text;
+
+        let num_lines = self.rope.len_lines();
+        let start_char = if after_start < num_lines {
+            self.rope.line_to_char(after_start)
+        } else {
+            self.rope.len_chars()
+        };
+
+        let end_char = if after_len > 0 {
+            let end_line = (after_start + after_len).min(num_lines);
+            if end_line < num_lines {
+                self.rope.line_to_char(end_line)
+            } else {
+                self.rope.len_chars()
+            }
+        } else {
+            start_char
+        };
+
+        if start_char < end_char {
+            self.rope.remove(start_char..end_char);
+        }
+        if !head_text.is_empty() {
+            self.rope.insert(start_char, &head_text);
+        }
+
+        self.modified = true;
+        self.cursor_y = after_start.min(self.rope.len_lines().saturating_sub(1));
+        self.cursor_x = 0;
+        self.clamp_cursor();
+        self.on_buffer_modified();
+        self.status_msg = format!("Reverted Git hunk at line {}", after_start + 1);
+    }
+
+    /// Switches the active color theme and writes it to `.subject0`[span_26](start_span)[span_26](end_span).
     pub fn set_theme(&mut self, theme_name: &str) {
         self.theme = Theme::from_name(theme_name);
         self.config.theme = self.theme.name.to_string();
@@ -949,7 +1065,7 @@ impl Editor {
         char_to_utf16_col(&line, self.cursor_x)
     }
 
-    /// Records current file position in the jump history.
+    /// Records current file position in the jump history[span_27](start_span)[span_27](end_span).
     pub fn record_jump_checkpoint(&mut self) {
         if let Some(p) = &self.path {
             let cp = JumpCheckpoint {
@@ -967,7 +1083,7 @@ impl Editor {
         }
     }
 
-    /// Jumps backward through the location jump-list history.
+    /// Jumps backward through the location jump-list history[span_28](start_span)[span_28](end_span).
     pub fn jump_backward(&mut self) {
         if self.jump_idx > 0 && !self.jump_list.is_empty() {
             if self.jump_idx == self.jump_list.len() {
@@ -992,7 +1108,7 @@ impl Editor {
         }
     }
 
-    /// Jumps forward through the location jump-list history.
+    /// Jumps forward through the location jump-list history[span_29](start_span)[span_29](end_span).
     pub fn jump_forward(&mut self) {
         if self.jump_idx + 1 < self.jump_list.len() {
             self.jump_idx += 1;
@@ -1013,7 +1129,7 @@ impl Editor {
         }
     }
 
-    /// Loads a new file from disk into the current editor buffer, protecting against unsaved modifications.
+    /// Loads a new file from disk into the current editor buffer, protecting against unsaved modifications[span_30](start_span)[span_30](end_span).
     pub fn open_file<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
         if self.modified {
             return Err(anyhow!(
@@ -1066,6 +1182,7 @@ impl Editor {
             self.lsp_status = LspStatus::Disabled;
         }
 
+        self.request_git_diff();
         self.status_msg = format!("Opened {}", path_buf.display());
         Ok(())
     }
@@ -1100,6 +1217,8 @@ impl Editor {
                 self.ensure_lsp_for_file(&abs_path);
             }
         }
+
+        self.request_git_diff();
     }
 
     pub fn ensure_lsp_for_file(&mut self, path: &Path) {
@@ -1162,7 +1281,7 @@ impl Editor {
         }
     }
 
-    /// Dispatches a reboot request to the active LSP background process.
+    /// Dispatches a reboot request to the active LSP background process[span_31](start_span)[span_31](end_span).
     pub fn restart_lsp(&mut self) {
         if let Some(tx) = &self.lsp_tx {
             let _ = tx.send(LspInbound::Restart);
@@ -1310,7 +1429,7 @@ impl Editor {
         }
     }
 
-    /// Navigates to the next diagnostic in the document.
+    /// Navigates to the next diagnostic in the document[span_32](start_span)[span_32](end_span).
     pub fn next_diagnostic(&mut self) {
         if self.diagnostics.is_empty() {
             self.status_msg = "No diagnostics in buffer".to_string();
@@ -1333,7 +1452,7 @@ impl Editor {
         }
     }
 
-    /// Navigates to the previous diagnostic in the document.
+    /// Navigates to the previous diagnostic in the document[span_33](start_span)[span_33](end_span).
     pub fn prev_diagnostic(&mut self) {
         if self.diagnostics.is_empty() {
             self.status_msg = "No diagnostics in buffer".to_string();
@@ -1357,7 +1476,7 @@ impl Editor {
         }
     }
 
-    /// Converts an LSP position (0-based line, UTF-16 character column) into a character index.
+    /// Converts an LSP position (0-based line, UTF-16 character column) into a character index[span_34](start_span)[span_34](end_span).
     fn lsp_pos_to_char_index(rope: &Rope, line: usize, utf16_col: usize) -> usize {
         let total_lines = rope.len_lines();
         if line >= total_lines {
@@ -1372,7 +1491,7 @@ impl Editor {
         (line_start_char + char_offset).min(rope.len_chars())
     }
 
-    /// Applies a collection of text edits to an arbitrary Rope buffer in descending order.
+    /// Applies a collection of text edits to an arbitrary Rope buffer in descending order[span_35](start_span)[span_35](end_span).
     fn apply_edits_to_rope(rope: &mut Rope, edits: &[TextEditItem]) {
         let mut indexed_edits: Vec<(usize, usize, &str)> = edits
             .iter()
@@ -1383,7 +1502,6 @@ impl Editor {
             })
             .collect();
 
-        // Descending order guarantees offset invariance for earlier edits
         indexed_edits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
 
         for (start_idx, end_idx, new_text) in indexed_edits {
@@ -1399,7 +1517,7 @@ impl Editor {
         }
     }
 
-    /// Applies a collection of LSP text edits cleanly to the current editor buffer.
+    /// Applies a collection of LSP text edits cleanly to the current editor buffer[span_36](start_span)[span_36](end_span).
     pub fn apply_text_edits(&mut self, edits: &[TextEditItem]) {
         if edits.is_empty() {
             return;
@@ -1413,7 +1531,7 @@ impl Editor {
         self.on_buffer_modified();
     }
 
-    /// Dispatches a project-wide `WorkspaceEdit` map cleanly across disk and memory.
+    /// Dispatches a project-wide `WorkspaceEdit` map cleanly across disk and memory[span_37](start_span)[span_37](end_span).
     pub fn apply_workspace_edits(
         &mut self,
         changes: &HashMap<PathBuf, Vec<TextEditItem>>,
@@ -1459,7 +1577,7 @@ impl Editor {
         Ok(total_applied)
     }
 
-    /// Jumps directly to a target location (file, line, col), opening the target if external.
+    /// Jumps directly to a target location (file, line, col), opening the target if external[span_38](start_span)[span_38](end_span).
     #[allow(clippy::needless_pass_by_value)]
     pub fn jump_to_location(&mut self, loc: LocationItem) {
         let is_current = self
@@ -1493,7 +1611,7 @@ impl Editor {
         }
     }
 
-    /// Pushes current buffer state into the undo stack and clears redo history.
+    /// Pushes current buffer state into the undo stack and clears redo history[span_39](start_span)[span_39](end_span).
     pub fn snapshot(&mut self) {
         if self.undo_stack.len() >= 64 {
             self.undo_stack.remove(0);
@@ -1507,7 +1625,7 @@ impl Editor {
         self.redo_stack.clear();
     }
 
-    /// Reverts the document rope to the most recent checkpoint on `undo_stack`.
+    /// Reverts the document rope to the most recent checkpoint on `undo_stack`[span_40](start_span)[span_40](end_span).
     pub fn undo(&mut self) {
         if let Some(prev) = self.undo_stack.pop() {
             if self.redo_stack.len() >= 64 {
@@ -1532,7 +1650,7 @@ impl Editor {
         }
     }
 
-    /// Steps forward through historical edits using `redo_stack`.
+    /// Steps forward through historical edits using `redo_stack`[span_41](start_span)[span_41](end_span).
     pub fn redo(&mut self) {
         if let Some(next) = self.redo_stack.pop() {
             if self.undo_stack.len() >= 64 {
@@ -1558,7 +1676,7 @@ impl Editor {
         }
     }
 
-    /// Shifts diagnostic coordinates down when lines are added strictly below them.
+    /// Shifts diagnostic coordinates down when lines are added strictly below them[span_42](start_span)[span_42](end_span).
     fn shift_diagnostics_down(&mut self, after_line: usize, count: usize) {
         for d in &mut self.diagnostics {
             if d.line > after_line {
@@ -1568,7 +1686,7 @@ impl Editor {
         }
     }
 
-    /// Shifts diagnostic coordinates down when lines are inserted at or above them.
+    /// Shifts diagnostic coordinates down when lines are inserted at or above them[span_43](start_span)[span_43](end_span).
     fn shift_diagnostics_down_from(&mut self, from_line: usize, count: usize) {
         for d in &mut self.diagnostics {
             if d.line >= from_line {
@@ -1578,7 +1696,7 @@ impl Editor {
         }
     }
 
-    /// Shifts diagnostic coordinates up when a line above them is removed.
+    /// Shifts diagnostic coordinates up when a line above them is removed[span_44](start_span)[span_44](end_span).
     fn shift_diagnostics_up(&mut self, removed_line: usize) {
         self.diagnostics
             .retain(|d| d.line != removed_line && d.end_line != removed_line);
@@ -1608,6 +1726,8 @@ impl Editor {
             self.request_semantic_tokens();
             self.request_inlay_hints();
         }
+
+        self.request_git_diff();
     }
 
     pub fn request_completions(&mut self) {
@@ -2063,7 +2183,7 @@ impl Editor {
         self.on_buffer_modified();
     }
 
-    /// Dedents current line by up to 4 spaces or 1 tab.
+    /// Dedents current line by up to 4 spaces or 1 tab[span_45](start_span)[span_45](end_span).
     pub fn dedent_current_line(&mut self) {
         if self.cursor_y >= self.rope.len_lines() {
             return;
@@ -2178,7 +2298,6 @@ impl Editor {
         self.cursor_y = new_line;
         self.cursor_x = end_idx.saturating_sub(line_start);
 
-        // Apply any auto-import edits provided by the language server
         if !item.additional_text_edits.is_empty() {
             self.apply_text_edits(&item.additional_text_edits);
         }
@@ -2274,6 +2393,8 @@ impl Editor {
                 self.request_semantic_tokens();
                 self.request_inlay_hints();
             }
+
+            self.request_git_diff();
             Ok(())
         } else {
             self.status_msg = "No file name (use :w <name>)".to_string();
@@ -2284,6 +2405,9 @@ impl Editor {
     pub fn execute_palette_command(&mut self, id: CommandId) {
         self.palette.visible = false;
         match id {
+            CommandId::NextHunk => self.jump_next_hunk(),
+            CommandId::PrevHunk => self.jump_prev_hunk(),
+            CommandId::RevertHunk => self.revert_hunk_at_cursor(),
             CommandId::FormatDocument => self.request_formatting(),
             CommandId::ShowHover => self.request_hover(),
             CommandId::CodeActions => self.request_code_actions(),
@@ -2451,6 +2575,25 @@ impl Editor {
                 self.status_msg =
                     format!("Line Wrap: {}", if self.line_wrap { "ON" } else { "OFF" });
             }
+            "nh" | "next-hunk" => {
+                self.jump_next_hunk();
+            }
+            "ph" | "prev-hunk" => {
+                self.jump_prev_hunk();
+            }
+            "rh" | "revert-hunk" | "revert" => {
+                self.revert_hunk_at_cursor();
+            }
+            "git" => {
+                let branch_str = self.git_diff.branch.as_deref().unwrap_or("none");
+                self.status_msg = format!(
+                    "Git: {} | +{} ~{} -{}",
+                    branch_str,
+                    self.git_diff.added_lines,
+                    self.git_diff.modified_lines,
+                    self.git_diff.deleted_lines
+                );
+            }
             "fmt" | "format" => {
                 self.request_formatting();
             }
@@ -2577,7 +2720,7 @@ impl Editor {
         }
     }
 
-    /// Viewport updater that guarantees instant response on large files.
+    /// Viewport updater that guarantees instant response on large files[span_46](start_span)[span_46](end_span).
     pub fn update_scroll(&mut self, width: usize, height: usize) {
         if height == 0 || width == 0 {
             return;

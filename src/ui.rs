@@ -1,8 +1,9 @@
 //! # Terminal UI Render Pipeline & Floating Modals Subsystem
 //!
 //! Handles layout structuring, double-buffering frames via Ratatui, syntax token
-//! coloring, inlay hints styling, gutter diagnostic indicators, floating autocomplete,
-//! and modals (hover cards, quickfixes, symbol outlines, pickers, and command palette).
+//! coloring, inlay hints styling, gutter diagnostic and Git diff indicators,
+//! floating autocomplete, and modals (hover cards, quickfixes, symbol outlines,
+//! pickers, and command palette).
 
 use ratatui::{
     Frame,
@@ -13,20 +14,21 @@ use ratatui::{
 };
 
 use crate::editor::{Editor, Focus, Mode};
+use crate::git::GutterChange;
 use crate::lsp::{InlayHintType, LspStatus, utf16_to_char_col};
 use crate::syntax::{completion_kind_icon, file_icon_and_color, symbol_kind_icon};
 
 use crate::nerdfonts::{
     BOX_HORIZONTAL, BOX_VERTICAL, CHECK, CHEVRON_RIGHT, CMD_RENAME, CMD_SYMBOLS, CURSOR_BLOCK,
     DIAG_ERROR, DIAG_ERROR_PAD, DIAG_HINT, DIAG_HINT_PAD, DIAG_INFO, DIAG_INFO_PAD, DIAG_WARN,
-    DIAG_WARN_PAD, ELLIPSIS, FOLDER, FOLDER_CLOSED, FOLDER_OPEN, FOLDER_OUTLINE, GUTTER_EMPTY,
-    HELP, HINTS_OFF, HINTS_ON, INFO_DOC, KIND_FUNCTION, LIGHTBULB, LINE_WRAP, LOCATION, LSP_ERROR,
-    LSP_NOT_FOUND, LSP_READY, MODIFIED_DOT, PALETTE, POWERLINE_LEFT, POWERLINE_RIGHT,
-    PROMPT_CHEVRON, PROMPT_COLON, SELECTION_BLANK, SETTINGS_COGS, SPINNER, THEME, TILDE, TOOL_LINK,
-    WRAP_OFF, WRAP_ON,
+    DIAG_WARN_PAD, ELLIPSIS, FOLDER, FOLDER_CLOSED, FOLDER_OPEN, FOLDER_OUTLINE, GIT_BRANCH,
+    GUTTER_EMPTY, HELP, HINTS_OFF, HINTS_ON, INFO_DOC, KIND_FUNCTION, LIGHTBULB, LINE_WRAP,
+    LOCATION, LSP_ERROR, LSP_NOT_FOUND, LSP_READY, MODIFIED_DOT, PALETTE, POWERLINE_LEFT,
+    POWERLINE_RIGHT, PROMPT_CHEVRON, PROMPT_COLON, SELECTION_BLANK, SETTINGS_COGS, SPINNER, THEME,
+    TILDE, TOOL_LINK, WRAP_OFF, WRAP_ON,
 };
 
-/// Safely truncates a string by Unicode scalar count without slicing mid-codepoint.
+/// Safely truncates a string by Unicode scalar count without slicing mid-codepoint[span_7](start_span)[span_7](end_span).
 pub fn safe_truncate(s: &str, max_chars: usize) -> String {
     if s.chars().count() > max_chars {
         let mut result: String = s.chars().take(max_chars.saturating_sub(1)).collect();
@@ -37,7 +39,7 @@ pub fn safe_truncate(s: &str, max_chars: usize) -> String {
     }
 }
 
-/// Primary UI rendering entry point dispatched on every event loop redraw tick.
+/// Primary UI rendering entry point dispatched on every event loop redraw tick[span_8](start_span)[span_8](end_span).
 pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
     let size = frame.area();
     let theme = editor.theme;
@@ -69,7 +71,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         (None, main_chunks[0])
     };
 
-    // 1. Render File Explorer (Sidebar with padded 2-cell icons)
+    // 1. Render File Explorer (Sidebar with padded 2-cell icons)[span_9](start_span)[span_9](end_span)
     if let Some(exp_rect) = explorer_area {
         let is_focused = editor.focus == Focus::Explorer;
         let border_color = if is_focused {
@@ -140,7 +142,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         frame.render_widget(Paragraph::new(tree_lines), inner_exp);
     }
 
-    // 2. Render Document Editor Viewport
+    // 2. Render Document Editor Viewport[span_10](start_span)[span_10](end_span)
     let (icon, icon_color) = file_icon_and_color(editor.path.as_ref());
     let clean_icon = icon.trim();
     let file_title = editor.path.as_ref().map_or_else(
@@ -187,7 +189,8 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
     let total_lines = editor.rope.len_lines().max(1);
     let line_digits = total_lines.to_string().len().max(2);
-    let gutter_width = line_digits + 5;
+    // Gutter layout: Diag (2 cells) + Git Diff (2 cells) + Line Numbers (line_digits + 3 cells)
+    let gutter_width = line_digits + 7;
     let text_area_width = (inner_area.width as usize)
         .saturating_sub(gutter_width)
         .max(1);
@@ -209,6 +212,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
         let is_cursor_line = y == editor.cursor_y;
 
+        // Compiler Diagnostic Indicator (2 cells)[span_11](start_span)[span_11](end_span)
         let line_diag = editor.diagnostics.iter().find(|d| d.line == y);
         let (diag_marker, diag_style) = match line_diag.map(|d| d.severity) {
             Some(1) => (DIAG_ERROR_PAD, Style::default().fg(theme.diag_error)),
@@ -216,6 +220,15 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             Some(3) => (DIAG_INFO_PAD, Style::default().fg(theme.diag_info)),
             Some(_) => (DIAG_HINT_PAD, Style::default().fg(theme.diag_hint)),
             None => (GUTTER_EMPTY, Style::default()),
+        };
+
+        // Git Diff Change Indicator (2 cells)
+        let git_change = editor.git_diff.change_for_line(y);
+        let (git_marker, git_style) = match git_change {
+            Some(GutterChange::Added) => ("▎ ", Style::default().fg(theme.git_added)),
+            Some(GutterChange::Modified) => ("▎ ", Style::default().fg(theme.git_modified)),
+            Some(GutterChange::Deleted) => ("▔ ", Style::default().fg(theme.git_deleted)),
+            None => ("  ", Style::default()),
         };
 
         let gutter_style = if is_cursor_line {
@@ -252,7 +265,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             }
         }
 
-        // Weave Inlay Hints (Inferred Types & Parameters)
+        // Weave Inlay Hints (Inferred Types & Parameters)[span_12](start_span)[span_12](end_span)
         let mut char_cells: Vec<(char, Style, Option<usize>)> = Vec::new();
         let line_hints: Vec<&crate::lsp::InlayHintItem> = if editor.show_inlay_hints {
             editor.inlay_hints.iter().filter(|h| h.line == y).collect()
@@ -293,7 +306,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             char_cells.push((ch, st, Some(idx)));
         }
 
-        // Tail hints (e.g. end-of-line return types)
+        // Tail hints (e.g. end-of-line return types)[span_13](start_span)[span_13](end_span)
         if let Some(hints) = hint_map.remove(&line_str.chars().count()) {
             for h in hints {
                 let h_style = match h.kind {
@@ -334,15 +347,17 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
             while chunk_start < total_chars && (current_row as usize) < inner_area.height as usize {
                 let chunk_end = (chunk_start + text_area_width).min(total_chars);
-                let (marker, gutter_str, g_style) = if is_first_sub {
+                let (marker, git_m, gutter_str, g_style) = if is_first_sub {
                     (
                         diag_marker,
+                        git_marker,
                         format!("{:>width$} {BOX_VERTICAL} ", y + 1, width = line_digits),
                         gutter_style,
                     )
                 } else {
                     (
                         GUTTER_EMPTY,
+                        "  ",
                         format!("{:>width$} {LINE_WRAP} ", "", width = line_digits),
                         Style::default().fg(theme.line_number),
                     )
@@ -353,6 +368,14 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
                         marker,
                         if is_first_sub {
                             diag_style
+                        } else {
+                            Style::default()
+                        },
+                    ),
+                    Span::styled(
+                        git_m,
+                        if is_first_sub {
+                            git_style
                         } else {
                             Style::default()
                         },
@@ -392,13 +415,15 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
                 is_first_sub = false;
             }
         } else {
-            let (marker, gutter_str, g_style) = (
+            let (marker, git_m, gutter_str, g_style) = (
                 diag_marker,
+                git_marker,
                 format!("{:>width$} {BOX_VERTICAL} ", y + 1, width = line_digits),
                 gutter_style,
             );
             let mut row_spans = vec![
                 Span::styled(marker, diag_style),
+                Span::styled(git_m, git_style),
                 Span::styled(gutter_str, g_style),
             ];
 
@@ -446,6 +471,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
     for _ in (current_row as usize)..inner_area.height as usize {
         visible_lines.push(Line::from(vec![
             Span::raw(GUTTER_EMPTY),
+            Span::raw("  "),
             Span::styled(
                 format!("{:>width$} {BOX_VERTICAL} ", TILDE, width = line_digits),
                 Style::default().fg(theme.line_number),
@@ -455,7 +481,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
     frame.render_widget(Paragraph::new(visible_lines), inner_area);
 
-    // 3. Render Statusline
+    // 3. Render Statusline[span_14](start_span)[span_14](end_span)
     let (badge_text, badge_color) = match editor.mode {
         Mode::Normal => (" NORMAL ", theme.mode_normal),
         Mode::Insert => (" INSERT ", theme.mode_insert),
@@ -494,7 +520,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         format!(" {HINTS_OFF} Hints ")
     };
 
-    let status_left = Line::from(vec![
+    let mut status_left_spans = vec![
         Span::styled(
             badge_text,
             Style::default()
@@ -506,6 +532,31 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             POWERLINE_RIGHT,
             Style::default().bg(pill_bg).fg(badge_color),
         ),
+    ];
+
+    // Statusline Git Branch & Diff Counters
+    if let Some(branch) = &editor.git_diff.branch {
+        status_left_spans.push(Span::styled(
+            format!(" {GIT_BRANCH} {branch} "),
+            Style::default()
+                .bg(pill_bg)
+                .fg(theme.git_branch)
+                .add_modifier(Modifier::BOLD),
+        ));
+
+        let added = editor.git_diff.added_lines;
+        let modified = editor.git_diff.modified_lines;
+        let deleted = editor.git_diff.deleted_lines;
+
+        if added > 0 || modified > 0 || deleted > 0 {
+            status_left_spans.push(Span::styled(
+                format!("+{added} ~{modified} -{deleted} "),
+                Style::default().bg(pill_bg).fg(theme.line_number),
+            ));
+        }
+    }
+
+    status_left_spans.extend(vec![
         Span::styled(
             sidebar_toggle_badge,
             Style::default().bg(pill_bg).fg(if editor.explorer.visible {
@@ -611,13 +662,16 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         Block::default().style(Style::default().bg(bar_bg)),
         main_chunks[1],
     );
-    frame.render_widget(Paragraph::new(status_left), main_chunks[1]);
+    frame.render_widget(
+        Paragraph::new(Line::from(status_left_spans)),
+        main_chunks[1],
+    );
     frame.render_widget(
         Paragraph::new(Line::from(status_right_spans)).alignment(ratatui::layout::Alignment::Right),
         main_chunks[1],
     );
 
-    // 4. Command Bar & Status Messages
+    // 4. Command Bar & Status Messages[span_15](start_span)[span_15](end_span)
     let (screen_x, screen_y) =
         cursor_screen_pos.unwrap_or((inner_area.x + gutter_width as u16, inner_area.y));
 
@@ -687,7 +741,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         }
     }
 
-    // 5. Floating Autocomplete Dropdown
+    // 5. Floating Autocomplete Dropdown[span_16](start_span)[span_16](end_span)
     if editor.mode == Mode::Insert && editor.completion_visible && !editor.completions.is_empty() {
         let max_visible_items = 6usize;
         let total_items = editor.completions.len();
@@ -763,7 +817,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         frame.render_widget(Paragraph::new(list_lines).block(comp_block), popup_rect);
     }
 
-    // 6. Floating Signature Help Tooltip
+    // 6. Floating Signature Help Tooltip[span_17](start_span)[span_17](end_span)
     if editor.mode == Mode::Insert
         && let Some(help) = &editor.signature_help
     {
@@ -804,7 +858,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         frame.render_widget(Paragraph::new(line).block(block), tooltip_rect);
     }
 
-    // 7. Floating Hover Documentation Card
+    // 7. Floating Hover Documentation Card[span_18](start_span)[span_18](end_span)
     if let Some(hover) = &editor.hover_info {
         let max_content_len = hover.lines.iter().map(String::len).max().unwrap_or(30);
         let width = (max_content_len as u16 + 4)
@@ -859,7 +913,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         frame.render_widget(Paragraph::new(doc_lines), inner_card);
     }
 
-    // 8. Code Action Picker Modal
+    // 8. Code Action Picker Modal[span_19](start_span)[span_19](end_span)
     if let Some(picker) = &editor.code_action_picker {
         let width = 56u16.min(size.width.saturating_sub(2));
         let height = ((picker.actions.len() as u16) + 4).min(size.height.saturating_sub(2));
@@ -929,7 +983,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         frame.render_widget(Paragraph::new(lines).block(block), rect);
     }
 
-    // 9. Symbol Outline Picker Modal
+    // 9. Symbol Outline Picker Modal[span_20](start_span)[span_20](end_span)
     if let Some(picker) = &editor.symbol_picker {
         let width = 58u16.min(size.width.saturating_sub(2));
         let height = 14u16.min(size.height.saturating_sub(2));
@@ -1011,7 +1065,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         frame.render_widget(Paragraph::new(lines).block(block), rect);
     }
 
-    // 10. Location Picker Modal (Definitions / References)
+    // 10. Location Picker Modal (Definitions / References)[span_21](start_span)[span_21](end_span)
     if let Some(picker) = &editor.location_picker {
         let width = 64u16.min(size.width.saturating_sub(2));
         let height = ((picker.locations.len() as u16) + 4)
@@ -1090,7 +1144,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         frame.render_widget(Paragraph::new(lines).block(block), rect);
     }
 
-    // 11. Rename Symbol Prompt Modal
+    // 11. Rename Symbol Prompt Modal[span_22](start_span)[span_22](end_span)
     if let Some(name) = &editor.rename_prompt {
         let width = 46u16.min(size.width.saturating_sub(2));
         let height = 3u16;
@@ -1126,7 +1180,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         frame.render_widget(Paragraph::new(line).block(block), rect);
     }
 
-    // 12. Render Command Palette Modal
+    // 12. Render Command Palette Modal[span_23](start_span)[span_23](end_span)
     if editor.palette.visible {
         let width = 46u16.min(size.width.saturating_sub(2));
         let height = 12u16.min(size.height.saturating_sub(2));
@@ -1222,7 +1276,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         frame.render_widget(Paragraph::new(palette_lines).block(p_block), palette_rect);
     }
 
-    // 13. Render Theme Picker Modal Overlay
+    // 13. Render Theme Picker Modal Overlay[span_24](start_span)[span_24](end_span)
     if let Some(picker) = &editor.theme_picker {
         let themes = crate::theme::Theme::all();
         let width = 48u16.min(size.width.saturating_sub(2));
@@ -1288,7 +1342,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         frame.render_widget(Paragraph::new(lines).block(block), picker_rect);
     }
 
-    // 14. Render LSP Picker Modal Overlay
+    // 14. Render LSP Picker Modal Overlay[span_25](start_span)[span_25](end_span)
     if let Some(picker) = &editor.lsp_picker {
         let width = 48u16.min(size.width.saturating_sub(2));
         let height = ((picker.candidates.len() as u16) + 4).min(size.height.saturating_sub(2));
@@ -1361,7 +1415,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         frame.render_widget(Paragraph::new(lines).block(block), picker_rect);
     }
 
-    // 15. Render In-Editor Help Modal
+    // 15. Render In-Editor Help Modal[span_26](start_span)[span_26](end_span)
     if editor.show_help {
         let width = 66u16.min(size.width.saturating_sub(4));
         let height = 24u16.min(size.height.saturating_sub(2));
@@ -1398,6 +1452,24 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         let c_desc = Style::default().fg(theme.popup_text);
 
         let content = vec![
+            Line::from(Span::styled("GIT VERSION CONTROL & DIFFS", c_sec)),
+            Line::from(vec![
+                Span::styled("  ]c             ", c_key),
+                Span::styled("Jump to next Git diff hunk", c_desc),
+            ]),
+            Line::from(vec![
+                Span::styled("  [c             ", c_key),
+                Span::styled("Jump to previous Git diff hunk", c_desc),
+            ]),
+            Line::from(vec![
+                Span::styled("  :rh / :revert  ", c_key),
+                Span::styled("Revert Git diff hunk under cursor", c_desc),
+            ]),
+            Line::from(vec![
+                Span::styled("  :git           ", c_key),
+                Span::styled("Show current branch and diff summary", c_desc),
+            ]),
+            Line::from(Span::raw("")),
             Line::from(Span::styled("LSP INTELLIGENCE & CODE ACTIONS", c_sec)),
             Line::from(vec![
                 Span::styled("  K              ", c_key),

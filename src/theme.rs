@@ -2,12 +2,11 @@
 //!
 //! Provides 10 complete, curated themes with unified color schemes across the
 //! text buffer, syntax tokens, file explorer, statusline, modal popups,
-//! and full Language Server Protocol (LSP) intelligence elements (inlay hints,
-//! hover documentation cards, signature helpers, and diagnostics).
+//! Git diff indicators, and full Language Server Protocol (LSP) intelligence elements.
 
 use ratatui::style::Color;
 
-/// Complete styling specification for all UI components, syntax tokens, and LSP features.
+/// Complete styling specification for all UI components, syntax tokens, Git markers, and LSP features.
 #[derive(Clone, Copy, Debug)]
 #[allow(dead_code)]
 pub struct Theme {
@@ -63,6 +62,12 @@ pub struct Theme {
     pub syn_variable: Color,
     pub syn_parameter: Color,
     pub syn_property: Color,
+
+    // Git Gutter Indicators & Status
+    pub git_added: Color,
+    pub git_modified: Color,
+    pub git_deleted: Color,
+    pub git_branch: Color,
 
     // LSP Intelligence: Inlay Hints, Hover Documentation, Signature Help & Diagnostics
     pub inlay_hint_fg: Color,
@@ -156,6 +161,11 @@ impl Theme {
             syn_parameter: Color::Rgb(149, 169, 159),
             syn_property: Color::Rgb(158, 149, 199), // Wisteria Purple
 
+            git_added: Color::Rgb(115, 201, 54),    // Green
+            git_modified: Color::Rgb(255, 221, 51), // Amber/Yellow
+            git_deleted: Color::Rgb(244, 56, 65),   // Red
+            git_branch: Color::Rgb(255, 221, 51),
+
             inlay_hint_fg: Color::Rgb(115, 115, 115),
             inlay_hint_bg: Color::Rgb(32, 32, 32),
             inlay_hint_param_fg: Color::Rgb(149, 169, 159),
@@ -220,6 +230,11 @@ impl Theme {
             syn_variable: Color::Rgb(192, 202, 245),
             syn_parameter: Color::Rgb(224, 175, 104),
             syn_property: Color::Rgb(115, 218, 202),
+
+            git_added: Color::Rgb(158, 206, 106),
+            git_modified: Color::Rgb(224, 175, 104),
+            git_deleted: Color::Rgb(247, 118, 142),
+            git_branch: Color::Rgb(187, 154, 247),
 
             inlay_hint_fg: Color::Rgb(86, 95, 137),
             inlay_hint_bg: Color::Rgb(31, 35, 53),
@@ -286,6 +301,11 @@ impl Theme {
             syn_parameter: Color::Rgb(235, 160, 172),
             syn_property: Color::Rgb(137, 220, 235),
 
+            git_added: Color::Rgb(166, 227, 161),
+            git_modified: Color::Rgb(249, 226, 175),
+            git_deleted: Color::Rgb(243, 139, 168),
+            git_branch: Color::Rgb(203, 166, 247),
+
             inlay_hint_fg: Color::Rgb(108, 112, 134),
             inlay_hint_bg: Color::Rgb(38, 38, 56),
             inlay_hint_param_fg: Color::Rgb(148, 226, 213),
@@ -350,6 +370,11 @@ impl Theme {
             syn_variable: Color::Rgb(235, 219, 178),
             syn_parameter: Color::Rgb(131, 165, 152),
             syn_property: Color::Rgb(142, 192, 124),
+
+            git_added: Color::Rgb(184, 187, 38),
+            git_modified: Color::Rgb(250, 189, 47),
+            git_deleted: Color::Rgb(251, 73, 52),
+            git_branch: Color::Rgb(211, 134, 155),
 
             inlay_hint_fg: Color::Rgb(146, 131, 116),
             inlay_hint_bg: Color::Rgb(50, 48, 47),
@@ -416,6 +441,11 @@ impl Theme {
             syn_parameter: Color::Rgb(229, 233, 240),
             syn_property: Color::Rgb(236, 239, 244),
 
+            git_added: Color::Rgb(163, 190, 140),
+            git_modified: Color::Rgb(235, 203, 139),
+            git_deleted: Color::Rgb(191, 97, 106),
+            git_branch: Color::Rgb(136, 192, 208),
+
             inlay_hint_fg: Color::Rgb(94, 106, 130),
             inlay_hint_bg: Color::Rgb(59, 66, 82),
             inlay_hint_param_fg: Color::Rgb(143, 188, 187),
@@ -480,6 +510,11 @@ impl Theme {
             syn_variable: Color::Rgb(224, 108, 117),
             syn_parameter: Color::Rgb(171, 178, 191),
             syn_property: Color::Rgb(171, 178, 191),
+
+            git_added: Color::Rgb(152, 195, 121),
+            git_modified: Color::Rgb(229, 192, 123),
+            git_deleted: Color::Rgb(224, 108, 117),
+            git_branch: Color::Rgb(198, 120, 221),
 
             inlay_hint_fg: Color::Rgb(92, 99, 112),
             inlay_hint_bg: Color::Rgb(44, 49, 58),
@@ -546,6 +581,11 @@ impl Theme {
             syn_parameter: Color::Rgb(255, 184, 108),
             syn_property: Color::Rgb(102, 217, 239),
 
+            git_added: Color::Rgb(80, 250, 123),
+            git_modified: Color::Rgb(241, 250, 140),
+            git_deleted: Color::Rgb(255, 85, 85),
+            git_branch: Color::Rgb(189, 147, 249),
+
             inlay_hint_fg: Color::Rgb(98, 114, 164),
             inlay_hint_bg: Color::Rgb(50, 52, 66),
             inlay_hint_param_fg: Color::Rgb(139, 233, 253),
@@ -610,6 +650,11 @@ impl Theme {
             syn_variable: Color::Rgb(224, 222, 244),
             syn_parameter: Color::Rgb(196, 167, 231),
             syn_property: Color::Rgb(156, 207, 216),
+
+            git_added: Color::Rgb(156, 207, 216),
+            git_modified: Color::Rgb(246, 193, 119),
+            git_deleted: Color::Rgb(235, 111, 146),
+            git_branch: Color::Rgb(196, 167, 231),
 
             inlay_hint_fg: Color::Rgb(110, 106, 134),
             inlay_hint_bg: Color::Rgb(35, 33, 48),
@@ -676,6 +721,11 @@ impl Theme {
             syn_parameter: Color::Rgb(184, 180, 160),
             syn_property: Color::Rgb(230, 195, 134),
 
+            git_added: Color::Rgb(152, 187, 108),
+            git_modified: Color::Rgb(224, 159, 84),
+            git_deleted: Color::Rgb(228, 104, 114),
+            git_branch: Color::Rgb(149, 127, 184),
+
             inlay_hint_fg: Color::Rgb(114, 113, 105),
             inlay_hint_bg: Color::Rgb(42, 42, 55),
             inlay_hint_param_fg: Color::Rgb(126, 156, 216),
@@ -740,6 +790,11 @@ impl Theme {
             syn_variable: Color::Rgb(252, 252, 250),
             syn_parameter: Color::Rgb(255, 157, 0),
             syn_property: Color::Rgb(120, 220, 232),
+
+            git_added: Color::Rgb(169, 220, 105),
+            git_modified: Color::Rgb(255, 216, 102),
+            git_deleted: Color::Rgb(255, 97, 136),
+            git_branch: Color::Rgb(171, 157, 242),
 
             inlay_hint_fg: Color::Rgb(114, 112, 114),
             inlay_hint_bg: Color::Rgb(55, 52, 56),

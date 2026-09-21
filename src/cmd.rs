@@ -15,30 +15,30 @@ use crate::syntax::{DynamicGrammar, SupportedLanguage};
 
 use crate::nerdfonts::{
     BOX_HORIZONTAL, BOX_ROUND_BOTTOM_LEFT, BOX_ROUND_BOTTOM_RIGHT, BOX_ROUND_TOP_LEFT,
-    BOX_ROUND_TOP_RIGHT, BOX_VERTICAL, CHECK, CHEVRON_RIGHT, DOT_MIDDLE, FILE_DOCUMENT, HEALTH,
-    LIGHTBULB, MISSING,
+    BOX_ROUND_TOP_RIGHT, BOX_VERTICAL, CHECK, CHEVRON_RIGHT, DOT_MIDDLE, FILE_DOCUMENT, GIT_BRANCH,
+    HEALTH, LIGHTBULB, MISSING,
 };
 
-/// Parsed command-line arguments.
+/// Parsed command-line arguments[span_5](start_span)[span_5](end_span).
 #[derive(Debug, Default, Clone)]
 pub struct CliArgs {
-    /// Path to target file or directory.
+    /// Path to target file or directory[span_6](start_span)[span_6](end_span).
     pub path: Option<PathBuf>,
-    /// Optional target line number to jump to on launch (1-based).
+    /// Optional target line number to jump to on launch (1-based)[span_7](start_span)[span_7](end_span).
     pub jump_line: Option<usize>,
-    /// Optional target column number to jump to on launch (1-based).
+    /// Optional target column number to jump to on launch (1-based)[span_8](start_span)[span_8](end_span).
     pub jump_col: Option<usize>,
-    /// Optional override for soft line wrapping.
+    /// Optional override for soft line wrapping[span_9](start_span)[span_9](end_span).
     pub line_wrap: Option<bool>,
-    /// When true, ignore `.subject0` configuration file.
+    /// When true, ignore `.subject0` configuration file[span_10](start_span)[span_10](end_span).
     pub ignore_config: bool,
 }
 
 impl CliArgs {
-    /// Parses CLI arguments from standard environment args.
+    /// Parses CLI arguments from standard environment args[span_11](start_span)[span_11](end_span).
     ///
     /// Intercepts `--help`, `--version`, and `setup` to print directly to stdout and exit
-    /// before terminal raw mode or alternate screen buffers are initialized.
+    /// before terminal raw mode or alternate screen buffers are initialized[span_12](start_span)[span_12](end_span).
     pub fn parse() -> Self {
         let raw_args: Vec<String> = env::args().skip(1).collect();
         let mut cli = Self::default();
@@ -105,13 +105,13 @@ impl CliArgs {
                 "-nw" | "--no-wrap" => {
                     cli.line_wrap = Some(false);
                 }
-                // Handle editor line-jump syntax (e.g., +42 or +100)
+                // Handle editor line-jump syntax (e.g., +42 or +100)[span_13](start_span)[span_13](end_span)
                 s if s.starts_with('+') => {
                     if let Ok(line_num) = s[1..].parse::<usize>() {
                         cli.jump_line = Some(line_num);
                     }
                 }
-                // Positional file or directory target
+                // Positional file or directory target[span_14](start_span)[span_14](end_span)
                 s if !s.starts_with('-') => {
                     Self::assign_target_path(&mut cli, s);
                 }
@@ -123,12 +123,12 @@ impl CliArgs {
         cli
     }
 
-    /// Strips enclosing quotes from argument flags.
+    /// Strips enclosing quotes from argument flags[span_15](start_span)[span_15](end_span).
     fn clean_lang_arg(raw: &str) -> String {
         raw.trim().trim_matches('\'').trim_matches('"').to_string()
     }
 
-    /// Copies or clones the queries directory into the user configuration directory.
+    /// Copies or clones the queries directory into the user configuration directory[span_16](start_span)[span_16](end_span).
     fn run_setup(force: bool) {
         let r = "\x1b[0m";
         let b = "\x1b[1m";
@@ -155,7 +155,7 @@ impl CliArgs {
             return;
         }
 
-        // Search for existing local queries in source/dev trees
+        // Search for existing local queries in source/dev trees[span_17](start_span)[span_17](end_span)
         let local_candidates = [
             PathBuf::from("./src/queries"),
             PathBuf::from("./queries"),
@@ -190,7 +190,7 @@ impl CliArgs {
                 }
             }
         } else {
-            // If running standalone without local repository files, clone via git
+            // If running standalone without local repository files, clone via git[span_18](start_span)[span_18](end_span)
             println!(
                 "  {yellow}{LIGHTBULB}{r} No local queries found. Fetching from subject0 repository..."
             );
@@ -256,7 +256,7 @@ impl CliArgs {
         }
     }
 
-    /// Recursively copies directories and files.
+    /// Recursively copies directories and files[span_19](start_span)[span_19](end_span).
     fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<usize> {
         fs::create_dir_all(dst)?;
         let mut count = 0;
@@ -276,7 +276,7 @@ impl CliArgs {
         Ok(count)
     }
 
-    /// Counts subdirectories inside a given path.
+    /// Counts subdirectories inside a given path[span_20](start_span)[span_20](end_span).
     fn count_subdirs(p: &Path) -> usize {
         fs::read_dir(p)
             .map(|entries| {
@@ -288,7 +288,7 @@ impl CliArgs {
             .unwrap_or(0)
     }
 
-    /// Assigns file path and checks for `path:line:col` or `path:line` format across Unix and Windows.
+    /// Assigns file path and checks for `path:line:col` or `path:line` format across Unix and Windows[span_21](start_span)[span_21](end_span).
     fn assign_target_path(cli: &mut Self, arg: &str) {
         if cli.path.is_some() {
             return;
@@ -300,7 +300,6 @@ impl CliArgs {
             return;
         }
 
-        // Tokenize from the right to support Windows drive prefixes (e.g. C:\path:line:col)
         let tokens: Vec<&str> = arg.rsplit(':').collect();
 
         if tokens.len() >= 3
@@ -350,7 +349,7 @@ impl CliArgs {
                 " {blue}{FILE_DOCUMENT}{r} {b}{white}subject0{r} {gray}(s0){r}  {green}v{ver}{r}"
             ),
             format!(
-                " {gray}Modal terminal code editor with compile-time Tree-sitter & Full LSP engine{r}"
+                " {gray}Modal terminal code editor with Tree-sitter, Full LSP & pure-Rust Git engine{r}"
             ),
             String::new(),
             format!(" {yellow}Author:{r}   {white}Prathmesh S. Barot{r}"),
@@ -373,7 +372,7 @@ impl CliArgs {
         let ver = env!("CARGO_PKG_VERSION");
 
         let header = vec![format!(
-            " {blue}{FILE_DOCUMENT}{r} {b}{white}subject0{r} {gray}(s0){r} {green}v{ver}{r} {gray}— Terminal Modal Code Editor with Full LSP{r}"
+            " {blue}{FILE_DOCUMENT}{r} {b}{white}subject0{r} {gray}(s0){r} {green}v{ver}{r} {gray}— Terminal Modal Code Editor with Full LSP & Git{r}"
         )];
 
         Self::print_boxed_card(&header, 66);
@@ -398,6 +397,12 @@ impl CliArgs {
       {yellow}--clean{r}                   Bypass workspace and user {gray}.subject0{r} configs
       {yellow}--{r}                        Treat all subsequent arguments as positional paths
 
+  {b}{blue}{CHEVRON_RIGHT} GIT VERSION CONTROL & MOTIONS:{r}
+      {magenta}]c{r}                        Jump to next Git diff hunk in buffer
+      {magenta}[c{r}                        Jump to previous Git diff hunk in buffer
+      {magenta}:revert-hunk{r} / {magenta}:rh{r}       Revert Git diff hunk under cursor to HEAD
+      {magenta}:git{r}                     Display current branch and diff summary
+
   {b}{blue}{CHEVRON_RIGHT} LSP KEYBINDINGS (IN-EDITOR):{r}
       {magenta}K{r}                         Hover documentation and inferred type inspector
       {magenta}gd{r}                        Jump directly to definition under cursor
@@ -412,21 +417,18 @@ impl CliArgs {
       {magenta}:hints{r}                   Toggle inline inferred type & parameter hints
 
   {b}{blue}{CHEVRON_RIGHT} EXAMPLES:{r}
-      {gray}# Sync queries to user config directory:{r}
-      {white}s0 setup{r}
+      {gray}# Open a project directory in the sidebar explorer:{r}
+      {white}s0 .{r}
 
       {gray}# Open a file at line 50, column 10:{r}
       {white}s0 src/main.rs:50:10{r}
 
-      {gray}# Open project directory in the sidebar explorer:{r}
-      {white}s0 .{r}
-
-      {gray}# Check syntax grammars and LSP servers across your system:{r}
+      {gray}# Check system grammars, Git, and LSP servers:{r}
       {white}s0 --health{r}"
         );
     }
 
-    /// Renders a bordered card with dynamic padding, guaranteeing border alignment.
+    /// Renders a bordered card with dynamic padding, guaranteeing border alignment[span_22](start_span)[span_22](end_span).
     fn print_boxed_card(lines: &[String], min_width: usize) {
         let r = "\x1b[0m";
         let border = "\x1b[38;2;70;75;95m";
@@ -458,7 +460,7 @@ impl CliArgs {
         );
     }
 
-    /// Computes terminal display character width handling escape codes and double-width glyphs.
+    /// Computes terminal display character width handling escape codes and double-width glyphs[span_23](start_span)[span_23](end_span).
     fn visible_width(s: &str) -> usize {
         let mut width = 0;
         let mut in_escape = false;
@@ -506,7 +508,7 @@ impl CliArgs {
                 .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     }
 
-    /// Inspects status of a Tree-sitter grammar.
+    /// Inspects status of a Tree-sitter grammar[span_24](start_span)[span_24](end_span).
     fn run_grammar_installer(lang: &str, _force: bool) {
         let r = "\x1b[0m";
         let b = "\x1b[1m";
@@ -571,7 +573,7 @@ impl CliArgs {
             String::new(),
             format!(" {white}subject0 statically links grammars for top-tier languages:{r}"),
             format!(" {gray}Rust, C, C++, Zig, Python, JavaScript, TypeScript, Go, JSON,{r}"),
-            format!(" {gray}TOML, YAML, Bash, HTML, CSS, Markdown, Java.{r}"),
+            format!(" {gray}TOML, YAML, Bash, HTML, CSS, Markdown, Java, C#, Ruby, Lua.{r}"),
             String::new(),
             format!(
                 " {blue}Files for '{canon_lang}' receive full syntax and semantic intelligence via LSP.{r}"
@@ -580,7 +582,7 @@ impl CliArgs {
         Self::print_boxed_card(&lines, 66);
     }
 
-    /// Prints a comprehensive health report showing static grammars and LSP servers.
+    /// Prints a comprehensive health report showing static grammars, LSP servers, and Git integration[span_25](start_span)[span_25](end_span).
     fn run_health_check() {
         let r = "\x1b[0m";
         let b = "\x1b[1m";
@@ -597,6 +599,22 @@ impl CliArgs {
             " {blue}{HEALTH}{r} {b}{white}subject0{r} {gray}(s0){r} {green}v{ver}{r} {gray}— Language Support & Health Diagnostics{r}"
         )];
         Self::print_boxed_card(&header, 66);
+        println!();
+
+        // Check Git Subsystem status
+        let git_installed = resolve_binary_path("git").is_some();
+        let git_status_badge = if git_installed {
+            format!("{ok} Available in PATH")
+        } else {
+            format!("{missing} (In-editor engine active via gix)")
+        };
+
+        let git_card = vec![
+            format!(" {blue}{GIT_BRANCH} Git Engine Status{r}"),
+            format!(" In-Editor Engine: {green}Pure Rust (gix + imara-diff){r}"),
+            format!(" CLI Binary:       {git_status_badge}"),
+        ];
+        Self::print_boxed_card(&git_card, 66);
         println!();
 
         let langs = SupportedLanguage::all();
