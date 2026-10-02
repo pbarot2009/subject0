@@ -8,11 +8,14 @@
 mod cmd;
 mod editor;
 mod git;
+mod grammar;
 mod lsp;
 mod nerdfonts;
+mod query_loader;
 mod safe_io;
 mod syntax;
 mod theme;
+mod tree_engine;
 mod ui;
 
 use std::{
@@ -210,6 +213,36 @@ async fn main() -> Result<()> {
                             scroll: 0,
                         });
                     }
+                }
+                LspOutbound::Goto { title, req_id: _, locations } => {
+                    if locations.is_empty() {
+                        editor.status_msg = format!("No results for {title}");
+                    } else if locations.len() == 1 {
+                        let loc = locations.into_iter().next().unwrap();
+                        editor.jump_to_location(loc);
+                    } else {
+                        editor.location_picker = Some(LocationPicker {
+                            title,
+                            locations,
+                            selected_idx: 0,
+                            scroll: 0,
+                        });
+                    }
+                }
+                LspOutbound::DocumentHighlights { req_id: _, ranges } => {
+                    editor.doc_highlights = ranges;
+                    editor.status_msg = format!("{} highlight ranges", editor.doc_highlights.len());
+                }
+                LspOutbound::WorkspaceSymbols { req_id, symbols } => {
+                    if req_id != editor.lsp_req_id {
+                        continue;
+                    }
+                    editor.symbol_picker = Some(editor::SymbolPicker {
+                        symbols,
+                        query: String::new(),
+                        selected_idx: 0,
+                        scroll: 0,
+                    });
                 }
                 LspOutbound::References {
                     req_id: _,
@@ -1333,6 +1366,22 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                         editor.request_definition();
                         true
                     }
+                    ('g', KeyCode::Char('D')) => {
+                        editor.request_declaration();
+                        true
+                    }
+                    ('g', KeyCode::Char('y')) => {
+                        editor.request_type_definition();
+                        true
+                    }
+                    ('g', KeyCode::Char('i')) => {
+                        editor.request_implementation();
+                        true
+                    }
+                    ('g', KeyCode::Char('H')) => {
+                        editor.request_document_highlight();
+                        true
+                    }
                     ('g', KeyCode::Char('r')) => {
                         editor.request_references();
                         true
@@ -1357,6 +1406,26 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                         editor.jump_prev_hunk();
                         true
                     }
+                    ('z', KeyCode::Char('a')) => {
+                        editor.toggle_fold();
+                        true
+                    }
+                    ('a', KeyCode::Char('f')) => {
+                        editor.select_textobject("function", false);
+                        true
+                    }
+                    ('a', KeyCode::Char('c')) => {
+                        editor.select_textobject("class", false);
+                        true
+                    }
+                    ('i', KeyCode::Char('f')) => {
+                        editor.select_textobject("function", true);
+                        true
+                    }
+                    ('i', KeyCode::Char('c')) => {
+                        editor.select_textobject("class", true);
+                        true
+                    }
                     _ => false,
                 };
                 if handled {
@@ -1372,6 +1441,8 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                 KeyCode::Char('K') => {
                     editor.request_hover();
                 }
+                KeyCode::Char('=') => editor.reindent_line(),
+                KeyCode::Char('z') => editor.pending_key = Some('z'),
                 KeyCode::Char(' ') => {
                     editor.palette.visible = true;
                     editor.palette.query.clear();
@@ -1723,3 +1794,6 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
 
     editor.clamp_cursor();
 }
+
+#[cfg(test)]
+mod support_tests;

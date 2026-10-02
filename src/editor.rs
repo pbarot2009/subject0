@@ -874,6 +874,8 @@ pub struct Editor {
     pub symbol_picker: Option<SymbolPicker>,
     pub location_picker: Option<LocationPicker>,
     pub rename_prompt: Option<String>,
+    pub folded_lines: HashSet<usize>,
+    pub doc_highlights: Vec<(usize, usize, usize)>,
 
     // Location Navigation History (Jump List)
     pub jump_list: Vec<JumpCheckpoint>,
@@ -1003,6 +1005,8 @@ impl Editor {
             symbol_picker: None,
             location_picker: None,
             rename_prompt: None,
+            folded_lines: HashSet::new(),
+            doc_highlights: Vec::new(),
 
             jump_list: Vec::new(),
             jump_idx: 0,
@@ -1414,6 +1418,169 @@ impl Editor {
                 req_id: self.lsp_req_id,
             });
         }
+    }
+
+
+    pub fn request_declaration(&mut self) {
+        self.record_jump_checkpoint();
+        if let Some(tx) = &self.lsp_tx {
+            self.lsp_req_id += 1;
+            let col = self.cursor_utf16_col();
+            let _ = tx.send(LspInbound::Declaration {
+                line: self.cursor_y,
+                col,
+                req_id: self.lsp_req_id,
+            });
+            self.status_msg = "Finding declaration…".to_string();
+        }
+    }
+
+    pub fn request_type_definition(&mut self) {
+        self.record_jump_checkpoint();
+        if let Some(tx) = &self.lsp_tx {
+            self.lsp_req_id += 1;
+            let col = self.cursor_utf16_col();
+            let _ = tx.send(LspInbound::TypeDefinition {
+                line: self.cursor_y,
+                col,
+                req_id: self.lsp_req_id,
+            });
+            self.status_msg = "Finding type definition…".to_string();
+        }
+    }
+
+    pub fn request_implementation(&mut self) {
+        self.record_jump_checkpoint();
+        if let Some(tx) = &self.lsp_tx {
+            self.lsp_req_id += 1;
+            let col = self.cursor_utf16_col();
+            let _ = tx.send(LspInbound::Implementation {
+                line: self.cursor_y,
+                col,
+                req_id: self.lsp_req_id,
+            });
+            self.status_msg = "Finding implementation…".to_string();
+        }
+    }
+
+    pub fn request_document_highlight(&mut self) {
+        if let Some(tx) = &self.lsp_tx {
+            self.lsp_req_id += 1;
+            let col = self.cursor_utf16_col();
+            let _ = tx.send(LspInbound::DocumentHighlight {
+                line: self.cursor_y,
+                col,
+                req_id: self.lsp_req_id,
+            });
+            self.status_msg = "Highlighting symbol…".to_string();
+        }
+    }
+
+    pub fn request_workspace_symbols(&mut self) {
+        if let Some(tx) = &self.lsp_tx {
+            self.lsp_req_id += 1;
+            let _ = tx.send(LspInbound::WorkspaceSymbol {
+                query: String::new(),
+                req_id: self.lsp_req_id,
+            });
+            self.status_msg = "Searching workspace symbols…".to_string();
+        }
+    }
+
+    pub fn request_range_formatting(&mut self) {
+        if let Some(tx) = &self.lsp_tx {
+            self.lsp_req_id += 1;
+            let (start_line, start_col, end_line, end_col) = self.lsp_format_span();
+            let _ = tx.send(LspInbound::RangeFormatting {
+                start_line,
+                start_col,
+                end_line,
+                end_col,
+                req_id: self.lsp_req_id,
+            });
+            self.status_msg = "Formatting selection…".to_string();
+        }
+    }
+
+    fn lsp_format_span(&self) -> (usize, usize, usize, usize) {
+        if let Mode::Visual { anchor_x, anchor_y } = self.mode {
+            if (anchor_y, anchor_x) <= (self.cursor_y, self.cursor_x) {
+                (anchor_y, anchor_x, self.cursor_y, self.cursor_x)
+            } else {
+                (self.cursor_y, self.cursor_x, anchor_y, anchor_x)
+            }
+        } else {
+            (self.cursor_y, 0, self.cursor_y, self.current_line_len())
+        }
+    }
+
+    pub fn select_textobject(&mut self, object: &str, inside: bool) {
+        let byte = self.cursor_byte();
+        let Some((start, end)) = self.syntax.textobject_range(byte, object, inside) else {
+            self.status_msg = format!("No {object} textobject here");
+            return;
+        };
+        let (sy, sx) = byte_point(&self.rope, start);
+        let (ey, ex) = byte_point(&self.rope, end.saturating_sub(1));
+        self.set_mode(Mode::Visual { anchor_x: sx, anchor_y: sy });
+        self.cursor_y = ey;
+        self.cursor_x = ex;
+        self.status_msg = format!("Selected {object}");
+    }
+
+    pub fn toggle_fold(&mut self) {
+        let Some(fold) = self.syntax.fold_at(self.cursor_y) else {
+            self.status_msg = "No fold at cursor".to_string();
+            return;
+        };
+        let key = fold.start_line;
+        if self.folded_lines.contains(&key) {
+            self.folded_lines.remove(&key);
+            self.status_msg = "Unfolded".to_string();
+        } else {
+            self.folded_lines.insert(key);
+            self.status_msg = format!("Folded lines {}-{}", fold.start_line + 1, fold.end_line + 1);
+        }
+    }
+
+    pub fn reindent_line(&mut self) {
+        let Some(indent) = self.syntax.suggested_indent(self.cursor_y) else {
+            self.status_msg = "No indent query for this language".to_string();
+            return;
+        };
+        if self.cursor_y >= self.rope.len_lines() {
+            return;
+        }
+        let start = self.rope.line_to_char(self.cursor_y);
+        let line = self.rope.line(self.cursor_y);
+        let old: String = line.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+        if old == indent {
+            self.status_msg = "Indent already matches".to_string();
+            return;
+        }
+        self.snapshot();
+        self.rope.remove(start..start + old.chars().count());
+        self.rope.insert(start, &indent);
+        self.cursor_x = indent.chars().count();
+        self.note_edit();
+        self.on_buffer_modified();
+        self.status_msg = "Reindented line".to_string();
+    }
+
+    fn cursor_byte(&self) -> usize {
+        if self.cursor_y >= self.rope.len_lines() {
+            return self.rope.len_bytes();
+        }
+        let start = self.rope.line_to_byte(self.cursor_y);
+        let line = self.rope.line(self.cursor_y).to_string();
+        let mut bytes = 0usize;
+        for (i, ch) in line.chars().enumerate() {
+            if i >= self.cursor_x {
+                break;
+            }
+            bytes += ch.len_utf8();
+        }
+        start + bytes
     }
 
     pub fn request_definition(&mut self) {
@@ -2299,6 +2466,8 @@ impl Editor {
             self.cursor_y += 1;
             self.cursor_x = inner_indent.chars().count();
         } else {
+            let suggested = self.syntax.suggested_indent(self.cursor_y + 1);
+            let indent = suggested.unwrap_or(indent);
             let to_insert = format!("{le}{indent}");
             self.rope.insert(idx, &to_insert);
             self.shift_diagnostics_down(self.cursor_y, 1);
@@ -2759,6 +2928,28 @@ impl Editor {
             "def" | "definition" => {
                 self.request_definition();
             }
+            "decl" | "declaration" => self.request_declaration(),
+            "type" | "typedef" => self.request_type_definition(),
+            "impl" | "implementation" => self.request_implementation(),
+            "hl" | "highlight" => self.request_document_highlight(),
+            "ws" | "workspace-symbols" => self.request_workspace_symbols(),
+            "fmt-range" | "range-fmt" => self.request_range_formatting(),
+            "fold" => self.toggle_fold(),
+            "indent" | "=" => self.reindent_line(),
+            "af" => self.select_textobject("function", false),
+            "if" => self.select_textobject("function", true),
+            "ac" => self.select_textobject("class", false),
+            "ic" => self.select_textobject("class", true),
+            "ap" => self.select_textobject("parameter", false),
+            "ip" => self.select_textobject("parameter", true),
+            "tags" => {
+                if self.syntax.tags.is_empty() {
+                    self.status_msg = "No tags query matches".to_string();
+                } else {
+                    let n = self.syntax.tags.len();
+                    self.status_msg = format!("{n} tree-sitter tags (use :symbols for LSP)");
+                }
+            }
             "ref" | "references" => {
                 self.request_references();
             }
@@ -3036,4 +3227,12 @@ pub fn line_len(rope: &Rope, line_idx: usize) -> usize {
         }
     }
     len
+}
+
+fn byte_point(rope: &ropey::Rope, byte: usize) -> (usize, usize) {
+    let byte = byte.min(rope.len_bytes());
+    let line = rope.byte_to_line(byte);
+    let start = rope.line_to_byte(line);
+    let col = rope.line(line).byte_slice(..byte.saturating_sub(start)).len_chars();
+    (line, col)
 }

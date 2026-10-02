@@ -34,6 +34,18 @@ pub struct CliArgs {
     pub ignore_config: bool,
 }
 
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GrammarRequest {
+    Help,
+    List,
+    Fetch(String),
+    Build(String),
+    Install(String),
+    Remove(String),
+    Status(String),
+}
+
 impl CliArgs {
     /// Parses CLI arguments from standard environment args.
     ///
@@ -75,6 +87,43 @@ impl CliArgs {
                     Self::run_setup(force_grammar);
                     process::exit(0);
                 }
+                "grammar" | "--grammar" => {
+                    let tail = &raw_args[idx + 1..];
+                    match Self::parse_grammar_tail(tail) {
+                        Ok(req) => {
+                            if Self::dispatch_grammar(req).is_err() {
+                                process::exit(1);
+                            }
+                            process::exit(0);
+                        }
+                        Err(err) => {
+                            eprintln!("Error: {err}");
+                            eprintln!("{}", Self::grammar_usage());
+                            process::exit(1);
+                        }
+                    }
+                }
+                s if s.starts_with("--grammar=") => {
+                    let rest = s.trim_start_matches("--grammar=");
+                    let mut tail: Vec<String> = Vec::new();
+                    if !rest.is_empty() {
+                        tail.push(rest.to_string());
+                    }
+                    tail.extend(raw_args[idx + 1..].iter().cloned());
+                    match Self::parse_grammar_tail(&tail) {
+                        Ok(req) => {
+                            if Self::dispatch_grammar(req).is_err() {
+                                process::exit(1);
+                            }
+                            process::exit(0);
+                        }
+                        Err(err) => {
+                            eprintln!("Error: {err}");
+                            eprintln!("{}", Self::grammar_usage());
+                            process::exit(1);
+                        }
+                    }
+                }
                 "-g" | "--install-grammar" => {
                     if idx + 1 < raw_args.len() {
                         let lang = raw_args[idx + 1].clone();
@@ -115,7 +164,11 @@ impl CliArgs {
                 s if !s.starts_with('-') => {
                     Self::assign_target_path(&mut cli, s);
                 }
-                _ => {}
+                other => {
+                    eprintln!("Error: unknown option '{other}'");
+                    eprintln!("Run 's0 --help' for usage. Use '--' before a path that starts with '-'.");
+                    process::exit(1);
+                }
             }
             idx += 1;
         }
@@ -390,7 +443,9 @@ impl CliArgs {
       {yellow}setup, --setup{r}            Synchronize runtime queries to ~/.config/subject0/queries
       {yellow}-h, --help{r}                Show this formatted help menu and exit
       {yellow}-v, --version{r}             Print version information and metadata
-      {yellow}-g, --install-grammar <L>{r}  Inspect status of built-in Tree-sitter grammar
+      {yellow}-g, --install-grammar <L>{r}  Inspect one grammar (static or installed)
+      {yellow}grammar / --grammar <cmd>{r}  fetch, build, install, remove, status, list
+      {yellow}--grammar=install <L>{r}     Same command, equals form accepted
       {yellow}-H, --health, --doctor{r}    Show install status of every supported language & LSP
       {yellow}-w, --wrap{r}                Force soft line wrapping on
       {yellow}-nw, --no-wrap{r}            Force line wrapping off (horizontal scroll)
@@ -501,6 +556,186 @@ impl CliArgs {
         path.to_string_lossy().to_string()
     }
 
+
+
+    fn grammar_usage() -> &'static str {
+        "Usage: s0 --grammar <fetch|build|install|remove|status|list|help> [language]\n\
+         Forms: s0 --grammar install kotlin\n\
+                s0 --grammar=install kotlin\n\
+                s0 --grammar install=kotlin\n\
+                s0 grammar install kotlin\n\
+         Installs one language. Built in: rust, python, javascript, typescript, tsx, go, c, json, html, markdown, bash."
+    }
+
+    /// Normalize user language names to `languages.toml` grammar ids.
+    pub fn canonicalize_grammar_name(raw: &str) -> String {
+        let cleaned = Self::clean_lang_arg(raw).to_ascii_lowercase();
+        match cleaned.as_str() {
+            "rs" | "rust" => "rust".into(),
+            "py" | "python" => "python".into(),
+            "js" | "javascript" | "jsx" => "javascript".into(),
+            "ts" | "typescript" => "typescript".into(),
+            "tsx" => "tsx".into(),
+            "golang" | "go" => "go".into(),
+            "c" => "c".into(),
+            "c++" | "cpp" | "cplusplus" | "cxx" => "cpp".into(),
+            "json" => "json".into(),
+            "htm" | "html" => "html".into(),
+            "md" | "markdown" => "markdown".into(),
+            "sh" | "shell" | "bash" | "zsh" => "bash".into(),
+            "cs" | "csharp" | "c#" => "c-sharp".into(),
+            "rb" | "ruby" => "ruby".into(),
+            "yml" | "yaml" => "yaml".into(),
+            "toml" => "toml".into(),
+            "css" => "css".into(),
+            "zig" => "zig".into(),
+            "java" => "java".into(),
+            "lua" => "lua".into(),
+            other => other.to_string(),
+        }
+    }
+
+    fn parse_grammar_tail(tail: &[String]) -> Result<GrammarRequest, String> {
+        if tail.is_empty() {
+            return Err("missing grammar command".into());
+        }
+        let head = Self::clean_lang_arg(&tail[0]);
+        if head == "--" {
+            return Err("'--' is not a grammar command".into());
+        }
+        let (action, inline_lang) = if let Some((cmd, lang)) = head.split_once('=') {
+            (cmd.to_string(), Some(lang.to_string()))
+        } else {
+            (head, None)
+        };
+        let action = action.to_ascii_lowercase();
+        if matches!(action.as_str(), "help" | "--help" | "-h") {
+            if tail.len() > 1 || inline_lang.is_some() {
+                return Err("grammar help takes no arguments".into());
+            }
+            return Ok(GrammarRequest::Help);
+        }
+        if action == "list" {
+            if tail.len() > 1 || inline_lang.is_some() {
+                return Err("grammar list takes no language".into());
+            }
+            return Ok(GrammarRequest::List);
+        }
+        if !matches!(action.as_str(), "fetch" | "build" | "install" | "remove" | "status") {
+            return Err(format!("unknown grammar command '{action}'"));
+        }
+        let lang = if let Some(lang) = inline_lang {
+            if tail.len() > 1 {
+                return Err("unexpected extra arguments after install=<language>".into());
+            }
+            lang
+        } else if tail.len() < 2 {
+            return Err(format!("missing language for '{action}'"));
+        } else if tail.len() > 2 {
+            return Err(format!(
+                "unexpected extra argument '{}'",
+                tail[2]
+            ));
+        } else {
+            tail[1].clone()
+        };
+        if lang == "--" || lang.starts_with('-') {
+            return Err(format!("invalid language '{lang}'"));
+        }
+        let canon = Self::canonicalize_grammar_name(&lang);
+        if !Self::is_valid_grammar_name(&canon) {
+            return Err(format!(
+                "invalid grammar name '{lang}'. Use letters, numbers, '-' and '_'."
+            ));
+        }
+        Ok(match action.as_str() {
+            "fetch" => GrammarRequest::Fetch(canon),
+            "build" => GrammarRequest::Build(canon),
+            "install" => GrammarRequest::Install(canon),
+            "remove" => GrammarRequest::Remove(canon),
+            "status" => GrammarRequest::Status(canon),
+            _ => unreachable!(),
+        })
+    }
+
+    fn dispatch_grammar(req: GrammarRequest) -> Result<(), ()> {
+        match req {
+            GrammarRequest::Help => {
+                println!("{}", Self::grammar_usage());
+                Ok(())
+            }
+            GrammarRequest::List => Self::run_grammar_command("list", None),
+            GrammarRequest::Fetch(lang) => Self::run_grammar_command("fetch", Some(&lang)),
+            GrammarRequest::Build(lang) => Self::run_grammar_command("build", Some(&lang)),
+            GrammarRequest::Install(lang) => Self::run_grammar_command("install", Some(&lang)),
+            GrammarRequest::Remove(lang) => Self::run_grammar_command("remove", Some(&lang)),
+            GrammarRequest::Status(lang) => Self::run_grammar_command("status", Some(&lang)),
+        }
+    }
+
+    fn run_grammar_command(action: &str, lang: Option<&str>) -> Result<(), ()> {
+        match action {
+            "list" => match crate::grammar::list_grammar_names() {
+                Ok(names) => {
+                    println!("Available grammar sources: {}", names.len());
+                    for name in names {
+                        let state = crate::grammar::grammar_state(&name, false);
+                        println!("  {name:24} {state:?}");
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    Err(())
+                }
+            },
+            "fetch" | "build" | "install" | "remove" | "status" => {
+                let Some(lang) = lang else {
+                    eprintln!("Usage: s0 --grammar {action} <language>");
+                    return Err(());
+                };
+                if !Self::is_valid_grammar_name(lang) {
+                    eprintln!("Error: invalid grammar name '{lang}'");
+                    return Err(());
+                }
+                let result = match action {
+                    "fetch" => crate::grammar::fetch_grammar(lang).map(|p| format!("Fetched {lang} into {}", p.display())),
+                    "build" => crate::grammar::build_grammar(lang).map(|p| format!("Built {lang} -> {}", p.display())),
+                    "install" => crate::grammar::install_grammar(lang).map(|p| format!("Installed {lang} -> {}", p.display())),
+                    "remove" => crate::grammar::remove_grammar(lang).map(|()| format!("Removed {lang}")),
+                    "status" => {
+                        let builtin = matches!(
+                            lang,
+                            "rust" | "c" | "python" | "javascript" | "typescript" | "tsx" | "go" | "json" | "html" | "markdown" | "bash"
+                        );
+                        let state = crate::grammar::grammar_state(lang, builtin);
+                        if lang == "cpp" && !matches!(state, crate::grammar::GrammarState::Built(_)) {
+                            Ok("cpp: not installed; .cpp files use the built-in C grammar until `s0 --grammar install cpp`".into())
+                        } else {
+                            Ok(format!("{lang}: {state:?}"))
+                        }
+                    }
+                    _ => unreachable!(),
+                };
+                match result {
+                    Ok(msg) => {
+                        println!("{msg}");
+                        Ok(())
+                    }
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        Err(())
+                    }
+                }
+            }
+            _ => {
+                eprintln!("Usage: s0 --grammar <fetch|build|install|remove|status|list> [language]");
+                eprintln!("Installs one language at a time. Example: s0 --grammar install python");
+                Err(())
+            }
+        }
+    }
+
     fn is_valid_grammar_name(name: &str) -> bool {
         !name.is_empty()
             && name
@@ -572,8 +807,9 @@ impl CliArgs {
             format!(" Status:    {gray}No built-in Tree-sitter grammar{r}"),
             String::new(),
             format!(" {white}subject0 statically links grammars for top-tier languages:{r}"),
-            format!(" {gray}Rust, C, C++, Zig, Python, JavaScript, TypeScript, Go, JSON,{r}"),
-            format!(" {gray}TOML, YAML, Bash, HTML, CSS, Markdown, Java, C#, Ruby, Lua.{r}"),
+            format!(" {gray}Built in: Rust, C, Python, JavaScript, TypeScript, TSX,{r}"),
+            format!(" {gray}Go, JSON, HTML, Markdown, Bash. Install others with{r}"),
+            format!(" {gray}s0 --grammar install <lang>{r}"),
             String::new(),
             format!(
                 " {blue}Files for '{canon_lang}' receive full syntax and semantic intelligence via LSP.{r}"
@@ -728,5 +964,69 @@ impl CliArgs {
             ),
         ];
         Self::print_boxed_card(&summary, 64);
+    }
+}
+
+
+#[cfg(test)]
+mod cli_tests {
+    use super::CliArgs;
+
+    fn tail(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn grammar_install_separate_tokens() {
+        let req = CliArgs::parse_grammar_tail(&tail(&["install", "kotlin"])).unwrap();
+        assert_eq!(req, super::GrammarRequest::Install("kotlin".into()));
+    }
+
+    #[test]
+    fn grammar_install_equals_form() {
+        let req = CliArgs::parse_grammar_tail(&tail(&["install=kotlin"])).unwrap();
+        assert_eq!(req, super::GrammarRequest::Install("kotlin".into()));
+    }
+
+    #[test]
+    fn grammar_alias_cpp() {
+        let req = CliArgs::parse_grammar_tail(&tail(&["install", "c++"])).unwrap();
+        assert_eq!(req, super::GrammarRequest::Install("cpp".into()));
+    }
+
+    #[test]
+    fn grammar_alias_ts_and_csharp() {
+        let req = CliArgs::parse_grammar_tail(&tail(&["status", "ts"])).unwrap();
+        assert_eq!(req, super::GrammarRequest::Status("typescript".into()));
+        let req = CliArgs::parse_grammar_tail(&tail(&["fetch", "c#"])).unwrap();
+        assert_eq!(req, super::GrammarRequest::Fetch("c-sharp".into()));
+    }
+
+    #[test]
+    fn grammar_list_and_help_reject_extras() {
+        assert!(CliArgs::parse_grammar_tail(&tail(&["list"])).is_ok());
+        assert!(CliArgs::parse_grammar_tail(&tail(&["list", "rust"])).is_err());
+        assert!(CliArgs::parse_grammar_tail(&tail(&["help"])).is_ok());
+        assert!(CliArgs::parse_grammar_tail(&tail(&["--help", "x"])).is_err());
+    }
+
+    #[test]
+    fn grammar_missing_language_and_unknown_action() {
+        assert!(CliArgs::parse_grammar_tail(&tail(&["install"])).is_err());
+        assert!(CliArgs::parse_grammar_tail(&tail(&["explode", "rust"])).is_err());
+        assert!(CliArgs::parse_grammar_tail(&tail(&[])).is_err());
+    }
+
+    #[test]
+    fn grammar_rejects_extra_junk_and_dashes() {
+        assert!(CliArgs::parse_grammar_tail(&tail(&["install", "kotlin", "extra"])).is_err());
+        assert!(CliArgs::parse_grammar_tail(&tail(&["install", "--"])).is_err());
+        assert!(CliArgs::parse_grammar_tail(&tail(&["--"])).is_err());
+    }
+
+    #[test]
+    fn grammar_quotes_are_stripped() {
+        let req = CliArgs::parse_grammar_tail(&tail(&["build", "\"python\""])).unwrap();
+        assert_eq!(req, super::GrammarRequest::Build("python".into()));
     }
 }

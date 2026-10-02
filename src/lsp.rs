@@ -349,6 +349,40 @@ pub enum LspInbound {
     DocumentSymbol {
         req_id: i64,
     },
+    Declaration {
+        line: usize,
+        col: usize,
+        req_id: i64,
+    },
+    TypeDefinition {
+        line: usize,
+        col: usize,
+        req_id: i64,
+    },
+    Implementation {
+        line: usize,
+        col: usize,
+        req_id: i64,
+    },
+    DocumentHighlight {
+        line: usize,
+        col: usize,
+        req_id: i64,
+    },
+    RangeFormatting {
+        start_line: usize,
+        start_col: usize,
+        end_line: usize,
+        end_col: usize,
+        req_id: i64,
+    },
+    WorkspaceSymbol {
+        query: String,
+        req_id: i64,
+    },
+    PullDiagnostics {
+        req_id: i64,
+    },
     OpenFile {
         path: PathBuf,
         text: String,
@@ -415,6 +449,19 @@ pub enum LspOutbound {
         changes: HashMap<PathBuf, Vec<TextEditItem>>,
     },
     DocumentSymbols {
+        req_id: i64,
+        symbols: Vec<SymbolItem>,
+    },
+    Goto {
+        title: &'static str,
+        req_id: i64,
+        locations: Vec<LocationItem>,
+    },
+    DocumentHighlights {
+        req_id: i64,
+        ranges: Vec<(usize, usize, usize)>,
+    },
+    WorkspaceSymbols {
         req_id: i64,
         symbols: Vec<SymbolItem>,
     },
@@ -757,6 +804,60 @@ pub fn server_cmd_and_args(cmd: &str) -> (String, Vec<&'static str>) {
 }
 
 // === Type Adapters & Decoders using lsp-types ===
+
+
+async fn send_position_request(
+    stdin: &mut tokio::process::ChildStdin,
+    current_file: &std::path::Path,
+    req_id: i64,
+    method: &str,
+    line: usize,
+    col: usize,
+) {
+    let uri_str = file_to_uri(current_file);
+    if let Ok(uri) = uri_str.parse::<Uri>() {
+        let req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "method": method,
+            "params": {
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": col }
+            }
+        });
+        let _ = send_lsp_message(stdin, &req).await;
+    }
+}
+
+fn parse_document_highlights(val: Value) -> Vec<(usize, usize, usize)> {
+    let arr = val.as_array().cloned().unwrap_or_default();
+    arr.into_iter().filter_map(|item| {
+        let range = item.get("range")?;
+        let start = range.get("start")?;
+        let end = range.get("end")?;
+        let line = start.get("line")?.as_u64()? as usize;
+        let start_col = start.get("character")?.as_u64()? as usize;
+        let end_col = end.get("character")?.as_u64()? as usize;
+        Some((line, start_col, end_col.saturating_sub(start_col).max(1)))
+    }).collect()
+}
+
+fn parse_diagnostic_list(val: Value) -> Vec<DiagnosticItem> {
+    let arr = val.as_array().cloned().unwrap_or_default();
+    arr.into_iter().filter_map(|item| {
+        let diag: lsp_types::Diagnostic = serde_json::from_value(item).ok()?;
+        Some(DiagnosticItem {
+            line: diag.range.start.line as usize,
+            col: diag.range.start.character as usize,
+            end_line: diag.range.end.line as usize,
+            end_col: diag.range.end.character as usize,
+            message: diag.message,
+            severity: diag.severity.and_then(|s| serde_json::to_value(s).ok()).and_then(|v| v.as_u64()).unwrap_or(1) as u8,
+            is_unnecessary: false,
+            is_deprecated: false,
+        })
+    }).collect()
+}
 
 fn text_edit_to_item(edit: TextEdit) -> TextEditItem {
     TextEditItem {
@@ -1976,6 +2077,65 @@ pub async fn run_lsp_actor(
                                 let _ = send_lsp_message(&mut stdin, &rn_req).await;
                             }
                         }
+                        Some(LspInbound::Declaration { line, col, req_id }) => {
+                            pending_requests.insert(req_id, "declaration");
+                            send_position_request(&mut stdin, &current_file, req_id, "textDocument/declaration", line, col).await;
+                        }
+                        Some(LspInbound::TypeDefinition { line, col, req_id }) => {
+                            pending_requests.insert(req_id, "typeDefinition");
+                            send_position_request(&mut stdin, &current_file, req_id, "textDocument/typeDefinition", line, col).await;
+                        }
+                        Some(LspInbound::Implementation { line, col, req_id }) => {
+                            pending_requests.insert(req_id, "implementation");
+                            send_position_request(&mut stdin, &current_file, req_id, "textDocument/implementation", line, col).await;
+                        }
+                        Some(LspInbound::DocumentHighlight { line, col, req_id }) => {
+                            pending_requests.insert(req_id, "documentHighlight");
+                            send_position_request(&mut stdin, &current_file, req_id, "textDocument/documentHighlight", line, col).await;
+                        }
+                        Some(LspInbound::RangeFormatting { start_line, start_col, end_line, end_col, req_id }) => {
+                            pending_requests.insert(req_id, "rangeFormatting");
+                            let uri_str = file_to_uri(&current_file);
+                            if let Ok(uri) = uri_str.parse::<Uri>() {
+                                let req = serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": req_id,
+                                    "method": "textDocument/rangeFormatting",
+                                    "params": {
+                                        "textDocument": { "uri": uri },
+                                        "range": {
+                                            "start": { "line": start_line, "character": start_col },
+                                            "end": { "line": end_line, "character": end_col }
+                                        },
+                                        "options": { "tabSize": 4, "insertSpaces": true }
+                                    }
+                                });
+                                let _ = send_lsp_message(&mut stdin, &req).await;
+                            }
+                        }
+                        Some(LspInbound::WorkspaceSymbol { query, req_id }) => {
+                            pending_requests.insert(req_id, "workspaceSymbol");
+                            let req = serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": req_id,
+                                "method": "workspace/symbol",
+                                "params": { "query": query }
+                            });
+                            let _ = send_lsp_message(&mut stdin, &req).await;
+                        }
+                        Some(LspInbound::PullDiagnostics { req_id }) => {
+                            pending_requests.insert(req_id, "pullDiagnostics");
+                            let uri_str = file_to_uri(&current_file);
+                            if let Ok(uri) = uri_str.parse::<Uri>() {
+                                let req = serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": req_id,
+                                    "method": "textDocument/diagnostic",
+                                    "params": { "textDocument": { "uri": uri } }
+                                });
+                                let _ = send_lsp_message(&mut stdin, &req).await;
+                            }
+                        }
                         Some(LspInbound::DocumentSymbol { req_id }) => {
                             pending_requests.insert(req_id, "documentSymbol");
                             let uri_str = file_to_uri(&current_file);
@@ -2079,6 +2239,35 @@ pub async fn run_lsp_actor(
                                     "definition" => {
                                         let locations = parse_lsp_locations(result_val);
                                         emit(&tx, session_id, LspOutbound::Definition { req_id: resp_id, locations });
+                                    }
+                                    "declaration" => {
+                                        let locations = parse_lsp_locations(result_val);
+                                        emit(&tx, session_id, LspOutbound::Goto { title: "Go to Declaration", req_id: resp_id, locations });
+                                    }
+                                    "typeDefinition" => {
+                                        let locations = parse_lsp_locations(result_val);
+                                        emit(&tx, session_id, LspOutbound::Goto { title: "Go to Type Definition", req_id: resp_id, locations });
+                                    }
+                                    "implementation" => {
+                                        let locations = parse_lsp_locations(result_val);
+                                        emit(&tx, session_id, LspOutbound::Goto { title: "Go to Implementation", req_id: resp_id, locations });
+                                    }
+                                    "documentHighlight" => {
+                                        let ranges = parse_document_highlights(result_val);
+                                        emit(&tx, session_id, LspOutbound::DocumentHighlights { req_id: resp_id, ranges });
+                                    }
+                                    "rangeFormatting" => {
+                                        let edits = parse_lsp_formatting(result_val);
+                                        emit(&tx, session_id, LspOutbound::Formatting { req_id: resp_id, edits });
+                                    }
+                                    "workspaceSymbol" => {
+                                        let symbols = parse_lsp_document_symbols(result_val);
+                                        emit(&tx, session_id, LspOutbound::WorkspaceSymbols { req_id: resp_id, symbols });
+                                    }
+                                    "pullDiagnostics" => {
+                                        let items = result_val.get("items").cloned().unwrap_or(result_val);
+                                        let diags = parse_diagnostic_list(items);
+                                        emit(&tx, session_id, LspOutbound::Diagnostics(diags));
                                     }
                                     "references" => {
                                         let locations = parse_lsp_locations(result_val);

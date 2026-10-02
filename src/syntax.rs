@@ -21,7 +21,9 @@ use crate::lsp::{
     subject0_data_dir,
 };
 use crate::nerdfonts::*;
+use crate::query_loader::{self, QueryPack};
 use crate::theme::Theme;
+use crate::tree_engine::{self, FoldRange, RainbowSpan, TagSymbol};
 
 // === Dynamic Runtime Query Resolver with Inheritance ===
 
@@ -397,12 +399,13 @@ impl SupportedLanguage {
     }
 
     /// Resolves compiled, statically linked grammar for supported languages.
+    /// Grammars linked into the binary. The other languages use
+    /// `s0 --grammar install <name>`. C++ falls back to the C grammar until
+    /// `cpp` is installed.
     pub fn static_language(self) -> Option<tree_sitter::Language> {
         match self {
             SupportedLanguage::Rust => Some(tree_sitter_rust::LANGUAGE.into()),
-            SupportedLanguage::C => Some(tree_sitter_c::LANGUAGE.into()),
-            SupportedLanguage::Cpp => Some(tree_sitter_cpp::LANGUAGE.into()),
-            SupportedLanguage::Zig => Some(tree_sitter_zig::LANGUAGE.into()),
+            SupportedLanguage::C | SupportedLanguage::Cpp => Some(tree_sitter_c::LANGUAGE.into()),
             SupportedLanguage::Python => Some(tree_sitter_python::LANGUAGE.into()),
             SupportedLanguage::JavaScript => Some(tree_sitter_javascript::LANGUAGE.into()),
             SupportedLanguage::TypeScript => {
@@ -411,18 +414,11 @@ impl SupportedLanguage {
             SupportedLanguage::Tsx => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
             SupportedLanguage::Go => Some(tree_sitter_go::LANGUAGE.into()),
             SupportedLanguage::Json => Some(tree_sitter_json::LANGUAGE.into()),
-            SupportedLanguage::Toml => Some(tree_sitter_toml_ng::LANGUAGE.into()),
-            SupportedLanguage::Yaml => Some(tree_sitter_yaml::LANGUAGE.into()),
             SupportedLanguage::Bash | SupportedLanguage::Zsh => {
                 Some(tree_sitter_bash::LANGUAGE.into())
             }
             SupportedLanguage::Html => Some(tree_sitter_html::LANGUAGE.into()),
-            SupportedLanguage::Css => Some(tree_sitter_css::LANGUAGE.into()),
             SupportedLanguage::Markdown => Some(tree_sitter_md::LANGUAGE.into()),
-            SupportedLanguage::Java => Some(tree_sitter_java::LANGUAGE.into()),
-            SupportedLanguage::CSharp => Some(tree_sitter_c_sharp::LANGUAGE.into()),
-            SupportedLanguage::Ruby => Some(tree_sitter_ruby::LANGUAGE.into()),
-            SupportedLanguage::Lua => Some(tree_sitter_lua::LANGUAGE.into()),
             _ => None,
         }
     }
@@ -1064,6 +1060,61 @@ fn highlight_idx_to_token_type(idx: usize) -> CanonicalTokenType {
     }
 }
 
+
+fn compile_highlight(
+    language: &tree_sitter::Language,
+    name: &str,
+    pack: &QueryPack,
+) -> Option<(HighlightConfiguration, Vec<String>)> {
+    let names = query_loader::capture_names(&pack.highlights);
+    let configured: Vec<&str> = if names.is_empty() {
+        HIGHLIGHT_NAMES.to_vec()
+    } else {
+        names.iter().map(String::as_str).collect()
+    };
+    let attempts = [
+        (pack.injections.as_str(), pack.locals.as_str()),
+        ("", pack.locals.as_str()),
+        (pack.injections.as_str(), ""),
+        ("", ""),
+    ];
+    for (injections, locals) in attempts {
+        if let Ok(mut config) = HighlightConfiguration::new(
+            language.clone(),
+            name,
+            &pack.highlights,
+            injections,
+            locals,
+        ) {
+            config.configure(&configured);
+            let owned = configured.iter().map(|s| (*s).to_string()).collect();
+            return Some((config, owned));
+        }
+    }
+    None
+}
+
+fn preload_injection_configs(current: &str) -> HashMap<String, HighlightConfiguration> {
+    let mut map = HashMap::new();
+    for lang in SupportedLanguage::all() {
+        let name = lang.grammar_name();
+        if name.is_empty() || name == current {
+            continue;
+        }
+        let Some(ts_lang) = lang.static_language() else {
+            continue;
+        };
+        let pack = query_loader::load_query_pack(name);
+        if pack.highlights.trim().is_empty() {
+            continue;
+        }
+        if let Some((config, _)) = compile_highlight(&ts_lang, name, &pack) {
+            map.insert(name.to_string(), config);
+        }
+    }
+    map
+}
+
 pub struct SyntaxEngine {
     pub language: SupportedLanguage,
     #[allow(dead_code)]
@@ -1073,6 +1124,16 @@ pub struct SyntaxEngine {
     pub ts_tokens: HashMap<usize, Vec<SemanticTokenSpan>>,
     pub semantic_tokens: HashMap<usize, Vec<SemanticTokenSpan>>,
     pub has_grammar: bool,
+    pub query_pack: QueryPack,
+    pub capture_names: Vec<String>,
+    pub ts_language: Option<tree_sitter::Language>,
+    pub injection_configs: HashMap<String, HighlightConfiguration>,
+    pub tree: Option<tree_sitter::Tree>,
+    pub folds: Vec<FoldRange>,
+    pub tags: Vec<TagSymbol>,
+    pub rainbow: Vec<RainbowSpan>,
+    /// Last source passed to `reparse`, used by textobject and indent queries.
+    pub source: String,
 }
 
 impl SyntaxEngine {
@@ -1081,50 +1142,49 @@ impl SyntaxEngine {
         let mut parser = tree_sitter::Parser::new();
         let mut highlight_config = None;
         let mut has_grammar = false;
+        let mut query_pack = QueryPack::default();
+        let mut capture_names: Vec<String> = HIGHLIGHT_NAMES.iter().map(|s| (*s).to_string()).collect();
+        let mut ts_language = None;
+        let mut injection_configs = HashMap::new();
 
-        if let Some(static_lang) = language.static_language() {
-            let _ = parser.set_language(&static_lang);
-
-            // 1. Attempt runtime loading with recursive inheritance resolution
-            // 2. Fall back to compile-time embedded strings
-            let query_src = load_runtime_query(language.grammar_name())
-                .unwrap_or_else(|| language.builtin_highlight_query().to_string());
-
-            if !query_src.is_empty() {
-                match HighlightConfiguration::new(
-                    static_lang.clone(),
-                    language.grammar_name(),
-                    &query_src,
-                    "",
-                    "",
-                ) {
-                    Ok(mut config) => {
-                        config.configure(HIGHLIGHT_NAMES);
-                        highlight_config = Some(config);
-                        has_grammar = true;
-                    }
-                    Err(err) => {
-                        eprintln!(
-                            "[subject0] Runtime query error for {:?}: {err}. Trying builtin fallback...",
-                            language
-                        );
-                        let builtin = language.builtin_highlight_query();
-                        if !builtin.is_empty() && builtin != query_src {
-                            if let Ok(mut config) = HighlightConfiguration::new(
-                                static_lang,
-                                language.grammar_name(),
-                                builtin,
-                                "",
-                                "",
-                            ) {
-                                config.configure(HIGHLIGHT_NAMES);
-                                highlight_config = Some(config);
-                                has_grammar = true;
-                            }
-                        }
-                    }
+        let installed = crate::grammar::load_dynamic_language(language.grammar_name()).ok();
+        let (resolved, query_name): (Option<tree_sitter::Language>, &str) = if installed.is_some() {
+            (installed, language.grammar_name())
+        } else if language.static_language().is_some() {
+            let name = if language == SupportedLanguage::Cpp {
+                "c"
+            } else {
+                language.grammar_name()
+            };
+            (language.static_language(), name)
+        } else {
+            (None, language.grammar_name())
+        };
+        if let Some(ts_lang) = resolved {
+            let _ = parser.set_language(&ts_lang);
+            query_pack = query_loader::load_query_pack(query_name);
+            if query_pack.highlights.trim().is_empty() {
+                query_pack.highlights = if query_name == "c" {
+                    SupportedLanguage::C.builtin_highlight_query().to_string()
+                } else {
+                    language.builtin_highlight_query().to_string()
+                };
+            }
+            match compile_highlight(&ts_lang, query_name, &query_pack) {
+                Some((config, names)) => {
+                    capture_names = names;
+                    highlight_config = Some(config);
+                    has_grammar = true;
+                }
+                None => {
+                    eprintln!(
+                        "[subject0] highlight query failed for {}",
+                        language.grammar_name()
+                    );
                 }
             }
+            injection_configs = preload_injection_configs(language.grammar_name());
+            ts_language = Some(ts_lang);
         }
 
         Self {
@@ -1135,6 +1195,15 @@ impl SyntaxEngine {
             ts_tokens: HashMap::new(),
             semantic_tokens: HashMap::new(),
             has_grammar,
+            query_pack,
+            capture_names,
+            ts_language,
+            injection_configs,
+            tree: None,
+            folds: Vec::new(),
+            tags: Vec::new(),
+            rainbow: Vec::new(),
+            source: String::new(),
         }
     }
 
@@ -1148,11 +1217,13 @@ impl SyntaxEngine {
             return;
         }
 
+        self.ts_tokens.clear();
+        self.source = text.to_string();
+        self.refresh_tree_queries(text);
+
         let Some(config) = &self.highlight_config else {
             return;
         };
-
-        self.ts_tokens.clear();
         let bytes = text.as_bytes();
 
         let mut line_starts = vec![0usize];
@@ -1171,7 +1242,9 @@ impl SyntaxEngine {
             clean[..boundary].chars().count()
         };
 
-        let Ok(events) = self.highlighter.highlight(config, bytes, None, |_| None) else {
+        let names = self.capture_names.clone();
+        let injections = &self.injection_configs;
+        let Ok(events) = self.highlighter.highlight(config, bytes, None, |lang| injections.get(lang)) else {
             return;
         };
 
@@ -1182,7 +1255,10 @@ impl SyntaxEngine {
         for event in events {
             match event {
                 Ok(HighlightEvent::HighlightStart(Highlight(idx))) => {
-                    let token_type = highlight_idx_to_token_type(idx);
+                    let token_type = names
+                        .get(idx)
+                        .map(|n| CanonicalTokenType::from_query_capture(n))
+                        .unwrap_or(CanonicalTokenType::Other);
                     highlight_stack.push(token_type);
                     current_token = Some(token_type);
                 }
@@ -1252,7 +1328,56 @@ impl SyntaxEngine {
     }
 
     /// Renders styled terminal spans for a single line using the active [`Theme`].
-    pub fn highlight_line(
+    fn refresh_tree_queries(&mut self, text: &str) {
+        self.tree = None;
+        self.folds.clear();
+        self.tags.clear();
+        self.rainbow.clear();
+        let Some(lang) = self.ts_language.clone() else {
+            return;
+        };
+        let tree = self.parser.parse(text, None);
+        let Some(tree) = tree else {
+            return;
+        };
+        self.folds = tree_engine::collect_folds(&lang, text, &tree, &self.query_pack.folds);
+        self.tags = tree_engine::collect_tags(&lang, text, &tree, &self.query_pack.tags);
+        self.rainbow = tree_engine::rainbow_spans(&lang, text, &tree, &self.query_pack.rainbows);
+        self.tree = Some(tree);
+    }
+
+    /// Indent whitespace for a new line, from `indents.scm` when a tree exists.
+    pub fn suggested_indent(&self, line: usize) -> Option<String> {
+        let lang = self.ts_language.as_ref()?;
+        let tree = self.tree.as_ref()?;
+        tree_engine::suggest_indent(lang, &self.source, tree, &self.query_pack.indents, line, 4)
+    }
+
+    /// Byte range of a textobject (`function`, `class`, `comment`, ...) at a byte offset.
+    pub fn textobject_range(&self, byte_pos: usize, object: &str, inside: bool) -> Option<(usize, usize)> {
+        let lang = self.ts_language.as_ref()?;
+        let tree = self.tree.as_ref()?;
+        tree_engine::textobject_at(
+            lang,
+            &self.source,
+            tree,
+            &self.query_pack.textobjects,
+            byte_pos,
+            object,
+            inside,
+        )
+        .map(|r| (r.start, r.end))
+    }
+
+    pub fn fold_at(&self, line: usize) -> Option<FoldRange> {
+        self.folds.iter().copied().find(|f| line >= f.start_line && line <= f.end_line)
+    }
+
+    pub fn rainbow_depth_at(&self, byte: usize) -> Option<u8> {
+        self.rainbow.iter().find(|s| byte >= s.start && byte < s.end).map(|s| s.depth)
+    }
+
+        pub fn highlight_line(
         &self,
         line_text: &str,
         line_idx: usize,
@@ -1605,8 +1730,19 @@ mod tests {
             };
 
             // Test runtime query first (with inheritance), falling back to embedded
-            let query_src = load_runtime_query(lang.grammar_name())
-                .unwrap_or_else(|| lang.builtin_highlight_query().to_string());
+            let query_name = if lang == SupportedLanguage::Cpp {
+                "c"
+            } else {
+                lang.grammar_name()
+            };
+            let query_src = load_runtime_query(query_name)
+                .unwrap_or_else(|| {
+                    if lang == SupportedLanguage::Cpp {
+                        SupportedLanguage::C.builtin_highlight_query().to_string()
+                    } else {
+                        lang.builtin_highlight_query().to_string()
+                    }
+                });
 
             if query_src.is_empty() {
                 continue;

@@ -1,3 +1,11 @@
+## Unreleased
+
+- CLI grammar commands accept `s0 grammar`, `--grammar=install`, and `install=lang`, reject unknown flags and extra arguments, and alias `c++`, `ts`, `c#`.
+- Static grammars reduced to Rust, C, Python, JavaScript, TypeScript, TSX, Go, JSON, HTML, Markdown, and Bash. C++ uses C until `s0 --grammar install cpp`.
+- Execute all Tree-sitter query files (highlights, locals, injections, indents, textobjects, rainbows, tags, folds) with `;; inherits:` resolution.
+- Per-language grammar install (`s0 --grammar install <lang>`), not a fetch-all. Static grammars stay built in.
+- LSP: declaration, type definition, implementation, document highlight, range formatting, workspace symbols, pull diagnostics.
+
 # Changelog
 
 All notable changes to `subject0` will be documented in this file.

@@ -224,6 +224,9 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
     let mut current_row = 0u16;
 
     for y in start_line..end_line {
+        if editor.folded_lines.iter().any(|start| y > *start && editor.syntax.fold_at(*start).is_some_and(|f| y <= f.end_line && y != f.start_line)) {
+            continue;
+        }
         if (current_row as usize) >= inner_area.height as usize {
             break;
         }

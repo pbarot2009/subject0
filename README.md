@@ -111,6 +111,44 @@ If no path is provided, an empty scratch buffer opens.
 | `:e`, `:explore` | Toggle File Explorer sidebar |
 | `:p`, `:menu`, `:pal` | Open Command Palette |
 
+
+## Tree-sitter queries and grammars
+
+Every language folder under `queries/` is executed, not only `highlights.scm`:
+
+- `highlights.scm` and `locals.scm` and `injections.scm` drive highlighting, including injected languages
+- `indents.scm` drives Enter and `=`
+- `textobjects.scm` drives `:af`, `:if`, `:ac`, `:ic`
+- `rainbows.scm` records bracket depth
+- `tags.scm` is the fallback symbol index (`:tags`)
+- `folds.scm` drives `za` and `:fold`
+
+Ten grammars are compiled into the binary: Rust, C, Python, JavaScript, TypeScript, TSX, Go, JSON, HTML, Markdown, and Bash. C++ uses the C grammar until you install `cpp`. Everything else is one language at a time:
+
+```bash
+s0 --grammar list
+s0 --grammar install kotlin
+s0 --grammar fetch nix
+s0 --grammar build nix
+s0 --grammar remove kotlin
+```
+
+Built libraries live in the subject0 data directory under `runtime/grammars`. `git` and a C compiler (`cc`) are required to install a grammar. Static grammars always win over a built copy.
+
+## Extra LSP commands
+
+| Command | Action |
+| --- | --- |
+| `gd` / `:def` | Go to definition |
+| `gD` / `:decl` | Go to declaration |
+| `gy` / `:type` | Go to type definition |
+| `gi` / `:impl` | Go to implementation |
+| `gH` / `:hl` | Document highlight |
+| `:ws` | Workspace symbols |
+| `:fmt-range` | Format the selection |
+| `=` / `:indent` | Reindent the current line from `indents.scm` |
+| `za` / `:fold` | Toggle the fold under the cursor |
+
 ## Configuration
 
 `subject0` reads workspace settings from `.subject0` in the project root. If that file is missing, it falls back to the config directory (`~/.config/subject0/.subject0` on Linux) and then `~/.subject0`.
