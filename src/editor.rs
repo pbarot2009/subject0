@@ -189,6 +189,13 @@ pub enum HitAction {
     ClickAction(usize),
     ClickSymbol(usize),
     ClickLocation(usize),
+    ClickFile(usize),
+    ClickProblem(usize),
+    ClickOutline(usize),
+    ClickEditorLine(usize),
+    ToggleProblems,
+    ToggleOutline,
+    CloseSheet,
     ConfirmYes,
     ConfirmNo,
     ClosePopup,
@@ -897,6 +904,11 @@ pub struct Editor {
     pub show_help: bool,
     pub help_scroll: usize,
     pub should_quit: bool,
+    /// Bottom problems panel, or the problems sheet on a narrow screen.
+    pub problems_open: bool,
+    /// Right-hand outline drawer. Hidden automatically on narrow terminals.
+    pub outline_open: bool,
+    pub term_cols: u16,
 
     pub config: AppConfig,
     pub theme: Theme,
@@ -1027,6 +1039,9 @@ impl Editor {
             show_help: false,
             help_scroll: 0,
             should_quit: false,
+            problems_open: false,
+            outline_open: false,
+            term_cols: 80,
         })
     }
 
@@ -3297,6 +3312,11 @@ impl Editor {
         }
         self.cursor_y = y.max(0) as usize;
         self.clamp_cursor();
+    }
+
+    /// True when the terminal is too narrow for a docked sidebar.
+    pub fn shell_narrow(&self) -> bool {
+        self.term_cols < 72
     }
 
     pub fn clamp_cursor(&mut self) {

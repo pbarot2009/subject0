@@ -602,6 +602,86 @@ fn apply_hit(editor: &mut Editor, action: HitAction) {
                 editor.jump_to_location(loc);
             }
         }
+        HitAction::ClickFile(idx) => {
+            if idx < editor.explorer.entries.len() {
+                editor.explorer.selected_idx = idx;
+                if editor.explorer.entries[idx].is_dir {
+                    editor.explorer.toggle_expand(idx);
+                } else {
+                    let path = editor.explorer.entries[idx].path.clone();
+                    match editor.open_file(path) {
+                        Ok(()) => {
+                            editor.focus = Focus::Editor;
+                            if editor.shell_narrow() {
+                                editor.explorer.visible = false;
+                            }
+                        }
+                        Err(e) => editor.status_msg = e.to_string(),
+                    }
+                }
+            }
+        }
+        HitAction::ClickProblem(idx) => {
+            if let Some(d) = editor.diagnostics.get(idx).cloned() {
+                editor.cursor_y = d.line.min(editor.rope.len_lines().saturating_sub(1));
+                let line_str = editor.rope.line(editor.cursor_y).to_string();
+                editor.cursor_x = utf16_to_char_col(&line_str, d.col);
+                editor.clamp_cursor();
+                editor.focus = Focus::Editor;
+                if editor.shell_narrow() {
+                    editor.problems_open = false;
+                }
+                editor.status_msg = format!("Diagnostic: {}", d.message);
+            }
+        }
+        HitAction::ClickOutline(idx) => {
+            if let Some((line, col, name)) = editor
+                .syntax
+                .tags
+                .get(idx)
+                .map(|tag| (tag.start_line, tag.start_col, tag.name.clone()))
+            {
+                editor.cursor_y = line.min(editor.rope.len_lines().saturating_sub(1));
+                editor.cursor_x = col;
+                editor.clamp_cursor();
+                editor.focus = Focus::Editor;
+                editor.status_msg = format!("Jumped to {name}");
+            }
+        }
+        HitAction::ClickEditorLine(line) => {
+            editor.cursor_y = line.min(editor.rope.len_lines().saturating_sub(1));
+            editor.focus = Focus::Editor;
+            editor.clamp_cursor();
+        }
+        HitAction::ToggleProblems => {
+            editor.problems_open = !editor.problems_open;
+            if editor.problems_open && editor.shell_narrow() {
+                editor.explorer.visible = false;
+                editor.outline_open = false;
+            }
+            editor.status_msg = if editor.problems_open {
+                "Problems open".to_string()
+            } else {
+                "Problems closed".to_string()
+            };
+        }
+        HitAction::ToggleOutline => {
+            editor.outline_open = !editor.outline_open;
+            if editor.outline_open && editor.syntax.tags.is_empty() {
+                editor.request_document_symbols();
+            }
+            editor.status_msg = if editor.outline_open {
+                "Outline open".to_string()
+            } else {
+                "Outline closed".to_string()
+            };
+        }
+        HitAction::CloseSheet => {
+            editor.explorer.visible = false;
+            editor.problems_open = false;
+            editor.outline_open = false;
+            editor.focus = Focus::Editor;
+        }
         HitAction::ConfirmYes => editor.answer_confirm(true),
         HitAction::ConfirmNo | HitAction::ClosePopup => {
             editor.answer_confirm(false);
@@ -618,7 +698,7 @@ fn apply_hit(editor: &mut Editor, action: HitAction) {
 
 fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
     if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-        let hit = editor.hit_regions.iter().find(|region| {
+        let hit = editor.hit_regions.iter().rev().find(|region| {
             mouse.column >= region.x
                 && mouse.column < region.x.saturating_add(region.w)
                 && mouse.row >= region.y
