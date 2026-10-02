@@ -128,6 +128,7 @@ Ten grammars are compiled into the binary: Rust, C, Python, JavaScript, TypeScri
 ```bash
 s0 --grammar list
 s0 --grammar install kotlin
+# --grammer is accepted. Fetch and build print a live progress card.
 s0 --grammar fetch nix
 s0 --grammar build nix
 s0 --grammar remove kotlin

@@ -120,16 +120,23 @@ pub fn load_query_file(lang_name: &str, filename: &str) -> String {
 
 /// Load every query kind for a language.
 pub fn load_query_pack(lang_name: &str) -> QueryPack {
-    QueryPack {
-        highlights: load_query_file(lang_name, "highlights.scm"),
-        locals: load_query_file(lang_name, "locals.scm"),
-        injections: load_query_file(lang_name, "injections.scm"),
-        indents: load_query_file(lang_name, "indents.scm"),
-        textobjects: load_query_file(lang_name, "textobjects.scm"),
-        rainbows: load_query_file(lang_name, "rainbows.scm"),
-        tags: load_query_file(lang_name, "tags.scm"),
-        folds: load_query_file(lang_name, "folds.scm"),
+    let mut pack = QueryPack::default();
+    for file in QUERY_FILES {
+        let text = load_query_file(lang_name, file);
+        match *file {
+            "highlights.scm" => pack.highlights = text,
+            "locals.scm" => pack.locals = text,
+            "injections.scm" => pack.injections = text,
+            "indents.scm" => pack.indents = text,
+            "textobjects.scm" => pack.textobjects = text,
+            "rainbows.scm" => pack.rainbows = text,
+            "tags.scm" => pack.tags = text,
+            "folds.scm" => pack.folds = text,
+            _ => {}
+        }
     }
+    let _ = pack.get("highlights.scm");
+    pack
 }
 
 fn load_recursive(
@@ -252,12 +259,18 @@ mod tests {
             (call function: (identifier) @function.method)
         "#;
         let names = capture_names(src);
-        assert_eq!(names, vec!["string".to_string(), "function.method".to_string()]);
+        assert_eq!(
+            names,
+            vec!["string".to_string(), "function.method".to_string()]
+        );
     }
 
     #[test]
     fn capture_names_are_unique() {
         let src = "(a) @keyword\n(b) @keyword\n(c) @type\n";
-        assert_eq!(capture_names(src), vec!["keyword".to_string(), "type".to_string()]);
+        assert_eq!(
+            capture_names(src),
+            vec!["keyword".to_string(), "type".to_string()]
+        );
     }
 }

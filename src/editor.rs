@@ -29,7 +29,6 @@ use std::{
     collections::{HashMap, HashSet},
     env,
     fs::{self, File},
-    io::{self, Write},
     path::{Path, PathBuf},
     time::{Instant, SystemTime},
 };
@@ -37,8 +36,8 @@ use std::{
 use crate::git::{GitDiffSummary, GitInbound};
 use crate::lsp::{
     CodeActionItem, DiagnosticItem, HoverInfo, InlayHintItem, LocationItem, LspEvent, LspInbound,
-    LspStatus, SignatureHelpInfo, SuggestionItem, SymbolItem, TextEditItem,
-    char_to_utf16_col, run_lsp_actor, subject0_config_dir, utf16_to_char_col,
+    LspStatus, SignatureHelpInfo, SuggestionItem, SymbolItem, TextEditItem, char_to_utf16_col,
+    run_lsp_actor, subject0_config_dir, utf16_to_char_col,
 };
 use crate::safe_io::{atomic_write_with, file_stamp, find_project_root};
 use crate::syntax::SyntaxEngine;
@@ -48,8 +47,8 @@ use crate::nerdfonts::{
     CMD_INSERT_ABOVE, CMD_INSERT_BELOW, CMD_JOIN, CMD_JUMP_BOTTOM, CMD_JUMP_TOP, CMD_PASTE,
     CMD_QUIT, CMD_REDO, CMD_REFERENCES, CMD_RENAME, CMD_RESTART, CMD_SAVE, CMD_SAVE_QUIT,
     CMD_SYMBOLS, CMD_TOGGLE_CASE, CMD_UNDO, CMD_VISUAL, CMD_YANK, DIAG_ERROR, DIAG_WARN,
-    FILE_DOCUMENT, FOLDER, GEAR_CONFIG, GIT_DIFF_ADDED, GIT_DIFF_MODIFIED,
-    GIT_DIFF_REMOVED, HELP, HINTS_ON, LIGHTBULB, SETTINGS_COGS, THEME, WRAP_ON,
+    FILE_DOCUMENT, FOLDER, GEAR_CONFIG, GIT_DIFF_ADDED, GIT_DIFF_MODIFIED, GIT_DIFF_REMOVED, HELP,
+    HINTS_ON, LIGHTBULB, SETTINGS_COGS, THEME, WRAP_ON,
 };
 use crate::theme::Theme;
 
@@ -644,7 +643,8 @@ impl FileExplorer {
             .map(|e| e.path.clone())
             .collect();
 
-        self.entries = Self::read_directory_recursive(&self.root, 0, &expanded_paths, &mut HashSet::new());
+        self.entries =
+            Self::read_directory_recursive(&self.root, 0, &expanded_paths, &mut HashSet::new());
 
         if self.selected_idx >= self.entries.len() && !self.entries.is_empty() {
             self.selected_idx = self.entries.len() - 1;
@@ -744,7 +744,8 @@ impl FileExplorer {
                 });
 
                 if is_expanded {
-                    let mut children = Self::read_directory_recursive(&p, depth + 1, expanded, visited);
+                    let mut children =
+                        Self::read_directory_recursive(&p, depth + 1, expanded, visited);
                     entries.append(&mut children);
                 }
             }
@@ -1420,7 +1421,6 @@ impl Editor {
         }
     }
 
-
     pub fn request_declaration(&mut self) {
         self.record_jump_checkpoint();
         if let Some(tx) = &self.lsp_tx {
@@ -1522,7 +1522,10 @@ impl Editor {
         };
         let (sy, sx) = byte_point(&self.rope, start);
         let (ey, ex) = byte_point(&self.rope, end.saturating_sub(1));
-        self.set_mode(Mode::Visual { anchor_x: sx, anchor_y: sy });
+        self.set_mode(Mode::Visual {
+            anchor_x: sx,
+            anchor_y: sy,
+        });
         self.cursor_y = ey;
         self.cursor_x = ex;
         self.status_msg = format!("Selected {object}");
@@ -1553,7 +1556,10 @@ impl Editor {
         }
         let start = self.rope.line_to_char(self.cursor_y);
         let line = self.rope.line(self.cursor_y);
-        let old: String = line.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+        let old: String = line
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .collect();
         if old == indent {
             self.status_msg = "Indent already matches".to_string();
             return;
@@ -1848,7 +1854,8 @@ impl Editor {
                             ),
                             kind: ConfirmKind::DiscardJump(loc),
                         });
-                        self.status_msg = "Unsaved changes. Confirm discard to jump (y/n).".to_string();
+                        self.status_msg =
+                            "Unsaved changes. Confirm discard to jump (y/n).".to_string();
                     } else {
                         self.status_msg = format!("Failed to jump to {}: {e}", loc.path.display());
                     }
@@ -3229,10 +3236,6 @@ pub fn line_len(rope: &Rope, line_idx: usize) -> usize {
     len
 }
 
-fn byte_point(rope: &ropey::Rope, byte: usize) -> (usize, usize) {
-    let byte = byte.min(rope.len_bytes());
-    let line = rope.byte_to_line(byte);
-    let start = rope.line_to_byte(line);
-    let col = rope.line(line).byte_slice(..byte.saturating_sub(start)).len_chars();
-    (line, col)
+fn byte_point(rope: &Rope, byte: usize) -> (usize, usize) {
+    crate::tree_engine::byte_to_point(&rope.to_string(), byte)
 }

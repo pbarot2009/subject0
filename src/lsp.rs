@@ -18,10 +18,6 @@
 //!      references, workspace edits, document symbols, code actions, diagnostics, and
 //!      inlay hints) into buffer-aligned editor types.
 
-pub use crate::syntax::{
-    DynamicGrammar, SupportedLanguage, completion_kind_icon, file_icon_and_color, symbol_kind_icon,
-};
-
 use anyhow::{Result, anyhow};
 use lsp_types::{
     ClientCapabilities, CodeActionClientCapabilities, CodeActionKind, CodeActionKindLiteralSupport,
@@ -805,10 +801,9 @@ pub fn server_cmd_and_args(cmd: &str) -> (String, Vec<&'static str>) {
 
 // === Type Adapters & Decoders using lsp-types ===
 
-
 async fn send_position_request(
-    stdin: &mut tokio::process::ChildStdin,
-    current_file: &std::path::Path,
+    stdin: &mut ChildStdin,
+    current_file: &Path,
     req_id: i64,
     method: &str,
     line: usize,
@@ -831,32 +826,40 @@ async fn send_position_request(
 
 fn parse_document_highlights(val: Value) -> Vec<(usize, usize, usize)> {
     let arr = val.as_array().cloned().unwrap_or_default();
-    arr.into_iter().filter_map(|item| {
-        let range = item.get("range")?;
-        let start = range.get("start")?;
-        let end = range.get("end")?;
-        let line = start.get("line")?.as_u64()? as usize;
-        let start_col = start.get("character")?.as_u64()? as usize;
-        let end_col = end.get("character")?.as_u64()? as usize;
-        Some((line, start_col, end_col.saturating_sub(start_col).max(1)))
-    }).collect()
+    arr.into_iter()
+        .filter_map(|item| {
+            let range = item.get("range")?;
+            let start = range.get("start")?;
+            let end = range.get("end")?;
+            let line = start.get("line")?.as_u64()? as usize;
+            let start_col = start.get("character")?.as_u64()? as usize;
+            let end_col = end.get("character")?.as_u64()? as usize;
+            Some((line, start_col, end_col.saturating_sub(start_col).max(1)))
+        })
+        .collect()
 }
 
 fn parse_diagnostic_list(val: Value) -> Vec<DiagnosticItem> {
     let arr = val.as_array().cloned().unwrap_or_default();
-    arr.into_iter().filter_map(|item| {
-        let diag: lsp_types::Diagnostic = serde_json::from_value(item).ok()?;
-        Some(DiagnosticItem {
-            line: diag.range.start.line as usize,
-            col: diag.range.start.character as usize,
-            end_line: diag.range.end.line as usize,
-            end_col: diag.range.end.character as usize,
-            message: diag.message,
-            severity: diag.severity.and_then(|s| serde_json::to_value(s).ok()).and_then(|v| v.as_u64()).unwrap_or(1) as u8,
-            is_unnecessary: false,
-            is_deprecated: false,
+    arr.into_iter()
+        .filter_map(|item| {
+            let diag: Diagnostic = serde_json::from_value(item).ok()?;
+            Some(DiagnosticItem {
+                line: diag.range.start.line as usize,
+                col: diag.range.start.character as usize,
+                end_line: diag.range.end.line as usize,
+                end_col: diag.range.end.character as usize,
+                message: diag.message,
+                severity: diag
+                    .severity
+                    .and_then(|s| serde_json::to_value(s).ok())
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1) as u8,
+                is_unnecessary: false,
+                is_deprecated: false,
+            })
         })
-    }).collect()
+        .collect()
 }
 
 fn text_edit_to_item(edit: TextEdit) -> TextEditItem {
@@ -1069,7 +1072,11 @@ fn parse_lsp_signature_help(val: Value) -> Option<SignatureHelpInfo> {
         match &p_info.label {
             ParameterLabel::Simple(s) => parameter_label = Some(s.clone()),
             ParameterLabel::LabelOffsets([start, end]) => {
-                parameter_label = Some(slice_utf16(&signature_label, *start as usize, *end as usize));
+                parameter_label = Some(slice_utf16(
+                    &signature_label,
+                    *start as usize,
+                    *end as usize,
+                ));
             }
         }
     }
@@ -1672,7 +1679,11 @@ pub async fn run_lsp_actor(
 
     let (resolved_cmd, args) = server_cmd_and_args(&server_cmd);
     let Some(bin_path) = resolve_binary_path(&resolved_cmd) else {
-        emit(&tx, session_id, LspOutbound::Status(LspStatus::NotFound(server_cmd)));
+        emit(
+            &tx,
+            session_id,
+            LspOutbound::Status(LspStatus::NotFound(server_cmd)),
+        );
         return;
     };
 
@@ -1693,7 +1704,11 @@ pub async fn run_lsp_actor(
     let mut restart_attempts = 0usize;
 
     'supervisor: loop {
-        emit(&tx, session_id, LspOutbound::Status(LspStatus::Starting(server_cmd.clone())));
+        emit(
+            &tx,
+            session_id,
+            LspOutbound::Status(LspStatus::Starting(server_cmd.clone())),
+        );
 
         let (mut child, mut stdin, mut stdout) = match spawn_lsp_child(&bin_path, &args) {
             Ok(triplet) => triplet,
@@ -1756,7 +1771,11 @@ pub async fn run_lsp_actor(
             let _ = send_lsp_message(&mut stdin, &did_open).await;
         }
 
-        emit(&tx, session_id, LspOutbound::Status(LspStatus::Ready(server_cmd.clone())));
+        emit(
+            &tx,
+            session_id,
+            LspOutbound::Status(LspStatus::Ready(server_cmd.clone())),
+        );
         if restart_attempts > 0 {
             restart_attempts = 0;
         }
@@ -2363,9 +2382,13 @@ pub async fn run_lsp_actor(
         if child_crashed {
             restart_attempts += 1;
             if restart_attempts > 5 {
-                emit(&tx, session_id, LspOutbound::Status(LspStatus::Error(format!(
-                    "Server '{server_cmd}' crashed repeatedly. Reboot halted."
-                ))));
+                emit(
+                    &tx,
+                    session_id,
+                    LspOutbound::Status(LspStatus::Error(format!(
+                        "Server '{server_cmd}' crashed repeatedly. Reboot halted."
+                    ))),
+                );
                 while let Some(inbound) = rx.recv().await {
                     if matches!(inbound, LspInbound::Restart) {
                         break;
@@ -2376,9 +2399,13 @@ pub async fn run_lsp_actor(
             }
 
             let backoff = Duration::from_millis(400 * (1 << (restart_attempts - 1)));
-            emit(&tx, session_id, LspOutbound::Status(LspStatus::Starting(format!(
-                "{server_cmd} (restarting in {backoff:?}...)"
-            ))));
+            emit(
+                &tx,
+                session_id,
+                LspOutbound::Status(LspStatus::Starting(format!(
+                    "{server_cmd} (restarting in {backoff:?}...)"
+                ))),
+            );
             sleep(backoff).await;
         }
     }

@@ -62,7 +62,10 @@ pub fn find_project_root(path: &Path) -> PathBuf {
 }
 
 /// Writes `write` to `path` atomically and keeps the existing permission bits.
-pub fn atomic_write_with(path: &Path, write: impl FnOnce(&mut dyn Write) -> Result<()>) -> Result<()> {
+pub fn atomic_write_with(
+    path: &Path,
+    write: impl FnOnce(&mut dyn Write) -> Result<()>,
+) -> Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {

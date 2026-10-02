@@ -1060,6 +1060,32 @@ fn highlight_idx_to_token_type(idx: usize) -> CanonicalTokenType {
     }
 }
 
+fn line_start_byte(source: &str, line: usize) -> Option<usize> {
+    if line == 0 {
+        return Some(0);
+    }
+    let mut seen = 0usize;
+    for (i, b) in source.bytes().enumerate() {
+        if b == b'\n' {
+            seen += 1;
+            if seen == line {
+                return Some(i + 1);
+            }
+        }
+    }
+    None
+}
+
+fn rainbow_color(depth: u8) -> Color {
+    match depth % 6 {
+        1 => Color::Rgb(240, 120, 80),
+        2 => Color::Rgb(240, 200, 80),
+        3 => Color::Rgb(120, 200, 120),
+        4 => Color::Rgb(80, 180, 230),
+        5 => Color::Rgb(180, 140, 240),
+        _ => Color::Rgb(230, 140, 190),
+    }
+}
 
 fn compile_highlight(
     language: &tree_sitter::Language,
@@ -1094,25 +1120,35 @@ fn compile_highlight(
     None
 }
 
-fn preload_injection_configs(current: &str) -> HashMap<String, HighlightConfiguration> {
-    let mut map = HashMap::new();
-    for lang in SupportedLanguage::all() {
-        let name = lang.grammar_name();
-        if name.is_empty() || name == current {
-            continue;
-        }
-        let Some(ts_lang) = lang.static_language() else {
-            continue;
-        };
-        let pack = query_loader::load_query_pack(name);
-        if pack.highlights.trim().is_empty() {
-            continue;
-        }
-        if let Some((config, _)) = compile_highlight(&ts_lang, name, &pack) {
-            map.insert(name.to_string(), config);
-        }
+/// Compile one injection language the first time a buffer actually needs it.
+/// The config is leaked so the highlighter can borrow it for the rest of the process.
+fn injection_config(name: &str) -> Option<&'static HighlightConfiguration> {
+    use std::sync::Mutex;
+    static CACHE: Mutex<Option<HashMap<String, &'static HighlightConfiguration>>> =
+        Mutex::new(None);
+    let mut guard = CACHE.lock().ok()?;
+    if guard.is_none() {
+        *guard = Some(HashMap::new());
     }
-    map
+    let cache = guard.as_mut()?;
+    if let Some(config) = cache.get(name) {
+        return Some(*config);
+    }
+    let lang = SupportedLanguage::all()
+        .iter()
+        .copied()
+        .find(|l| l.grammar_name() == name)?;
+    let ts_lang = lang
+        .static_language()
+        .or_else(|| crate::grammar::load_dynamic_language(name).ok())?;
+    let pack = query_loader::load_query_pack(name);
+    if pack.highlights.trim().is_empty() {
+        return None;
+    }
+    let (config, _) = compile_highlight(&ts_lang, name, &pack)?;
+    let leaked: &'static HighlightConfiguration = Box::leak(Box::new(config));
+    cache.insert(name.to_string(), leaked);
+    Some(leaked)
 }
 
 pub struct SyntaxEngine {
@@ -1127,7 +1163,6 @@ pub struct SyntaxEngine {
     pub query_pack: QueryPack,
     pub capture_names: Vec<String>,
     pub ts_language: Option<tree_sitter::Language>,
-    pub injection_configs: HashMap<String, HighlightConfiguration>,
     pub tree: Option<tree_sitter::Tree>,
     pub folds: Vec<FoldRange>,
     pub tags: Vec<TagSymbol>,
@@ -1143,11 +1178,16 @@ impl SyntaxEngine {
         let mut highlight_config = None;
         let mut has_grammar = false;
         let mut query_pack = QueryPack::default();
-        let mut capture_names: Vec<String> = HIGHLIGHT_NAMES.iter().map(|s| (*s).to_string()).collect();
+        let mut capture_names: Vec<String> =
+            HIGHLIGHT_NAMES.iter().map(|s| (*s).to_string()).collect();
         let mut ts_language = None;
-        let mut injection_configs = HashMap::new();
 
-        let installed = crate::grammar::load_dynamic_language(language.grammar_name()).ok();
+        let installed =
+            if language.static_language().is_none() || language == SupportedLanguage::Cpp {
+                crate::grammar::load_dynamic_language(language.grammar_name()).ok()
+            } else {
+                None
+            };
         let (resolved, query_name): (Option<tree_sitter::Language>, &str) = if installed.is_some() {
             (installed, language.grammar_name())
         } else if language.static_language().is_some() {
@@ -1163,12 +1203,14 @@ impl SyntaxEngine {
         if let Some(ts_lang) = resolved {
             let _ = parser.set_language(&ts_lang);
             query_pack = query_loader::load_query_pack(query_name);
-            if query_pack.highlights.trim().is_empty() {
-                query_pack.highlights = if query_name == "c" {
-                    SupportedLanguage::C.builtin_highlight_query().to_string()
-                } else {
-                    language.builtin_highlight_query().to_string()
-                };
+            if query_pack.is_empty() || query_pack.highlights.trim().is_empty() {
+                query_pack.highlights = load_runtime_query(query_name).unwrap_or_else(|| {
+                    if query_name == "c" {
+                        SupportedLanguage::C.builtin_highlight_query().to_string()
+                    } else {
+                        language.builtin_highlight_query().to_string()
+                    }
+                });
             }
             match compile_highlight(&ts_lang, query_name, &query_pack) {
                 Some((config, names)) => {
@@ -1183,7 +1225,6 @@ impl SyntaxEngine {
                     );
                 }
             }
-            injection_configs = preload_injection_configs(language.grammar_name());
             ts_language = Some(ts_lang);
         }
 
@@ -1198,7 +1239,6 @@ impl SyntaxEngine {
             query_pack,
             capture_names,
             ts_language,
-            injection_configs,
             tree: None,
             folds: Vec::new(),
             tags: Vec::new(),
@@ -1243,8 +1283,10 @@ impl SyntaxEngine {
         };
 
         let names = self.capture_names.clone();
-        let injections = &self.injection_configs;
-        let Ok(events) = self.highlighter.highlight(config, bytes, None, |lang| injections.get(lang)) else {
+        let Ok(events) = self
+            .highlighter
+            .highlight(config, bytes, None, |lang| injection_config(lang))
+        else {
             return;
         };
 
@@ -1258,7 +1300,8 @@ impl SyntaxEngine {
                     let token_type = names
                         .get(idx)
                         .map(|n| CanonicalTokenType::from_query_capture(n))
-                        .unwrap_or(CanonicalTokenType::Other);
+                        .filter(|t| *t != CanonicalTokenType::Other)
+                        .unwrap_or_else(|| highlight_idx_to_token_type(idx));
                     highlight_stack.push(token_type);
                     current_token = Some(token_type);
                 }
@@ -1354,7 +1397,12 @@ impl SyntaxEngine {
     }
 
     /// Byte range of a textobject (`function`, `class`, `comment`, ...) at a byte offset.
-    pub fn textobject_range(&self, byte_pos: usize, object: &str, inside: bool) -> Option<(usize, usize)> {
+    pub fn textobject_range(
+        &self,
+        byte_pos: usize,
+        object: &str,
+        inside: bool,
+    ) -> Option<(usize, usize)> {
         let lang = self.ts_language.as_ref()?;
         let tree = self.tree.as_ref()?;
         tree_engine::textobject_at(
@@ -1370,14 +1418,20 @@ impl SyntaxEngine {
     }
 
     pub fn fold_at(&self, line: usize) -> Option<FoldRange> {
-        self.folds.iter().copied().find(|f| line >= f.start_line && line <= f.end_line)
+        self.folds
+            .iter()
+            .copied()
+            .find(|f| line >= f.start_line && line <= f.end_line)
     }
 
     pub fn rainbow_depth_at(&self, byte: usize) -> Option<u8> {
-        self.rainbow.iter().find(|s| byte >= s.start && byte < s.end).map(|s| s.depth)
+        self.rainbow
+            .iter()
+            .find(|s| byte >= s.start && byte < s.end)
+            .map(|s| s.depth)
     }
 
-        pub fn highlight_line(
+    pub fn highlight_line(
         &self,
         line_text: &str,
         line_idx: usize,
@@ -1455,6 +1509,18 @@ impl SyntaxEngine {
                         *cell = style;
                     }
                 }
+            }
+        }
+
+        if let Some(line_byte) = line_start_byte(&self.source, line_idx) {
+            let mut byte = line_byte;
+            for (i, ch) in chars.iter().enumerate() {
+                if matches!(ch, '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>') {
+                    if let Some(depth) = self.rainbow_depth_at(byte) {
+                        styles[i] = styles[i].fg(rainbow_color(depth));
+                    }
+                }
+                byte += ch.len_utf8();
             }
         }
 
@@ -1735,14 +1801,13 @@ mod tests {
             } else {
                 lang.grammar_name()
             };
-            let query_src = load_runtime_query(query_name)
-                .unwrap_or_else(|| {
-                    if lang == SupportedLanguage::Cpp {
-                        SupportedLanguage::C.builtin_highlight_query().to_string()
-                    } else {
-                        lang.builtin_highlight_query().to_string()
-                    }
-                });
+            let query_src = load_runtime_query(query_name).unwrap_or_else(|| {
+                if lang == SupportedLanguage::Cpp {
+                    SupportedLanguage::C.builtin_highlight_query().to_string()
+                } else {
+                    lang.builtin_highlight_query().to_string()
+                }
+            });
 
             if query_src.is_empty() {
                 continue;

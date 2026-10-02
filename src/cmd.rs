@@ -34,7 +34,6 @@ pub struct CliArgs {
     pub ignore_config: bool,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum GrammarRequest {
     Help,
@@ -87,11 +86,11 @@ impl CliArgs {
                     Self::run_setup(force_grammar);
                     process::exit(0);
                 }
-                "grammar" | "--grammar" => {
+                "grammar" | "--grammar" | "grammer" | "--grammer" => {
                     let tail = &raw_args[idx + 1..];
                     match Self::parse_grammar_tail(tail) {
                         Ok(req) => {
-                            if Self::dispatch_grammar(req).is_err() {
+                            if Self::dispatch_grammar(req, force_grammar).is_err() {
                                 process::exit(1);
                             }
                             process::exit(0);
@@ -103,8 +102,8 @@ impl CliArgs {
                         }
                     }
                 }
-                s if s.starts_with("--grammar=") => {
-                    let rest = s.trim_start_matches("--grammar=");
+                s if s.starts_with("--grammar=") || s.starts_with("--grammer=") => {
+                    let rest = s.split_once('=').map(|(_, v)| v).unwrap_or("");
                     let mut tail: Vec<String> = Vec::new();
                     if !rest.is_empty() {
                         tail.push(rest.to_string());
@@ -112,7 +111,7 @@ impl CliArgs {
                     tail.extend(raw_args[idx + 1..].iter().cloned());
                     match Self::parse_grammar_tail(&tail) {
                         Ok(req) => {
-                            if Self::dispatch_grammar(req).is_err() {
+                            if Self::dispatch_grammar(req, force_grammar).is_err() {
                                 process::exit(1);
                             }
                             process::exit(0);
@@ -165,8 +164,11 @@ impl CliArgs {
                     Self::assign_target_path(&mut cli, s);
                 }
                 other => {
-                    eprintln!("Error: unknown option '{other}'");
-                    eprintln!("Run 's0 --help' for usage. Use '--' before a path that starts with '-'.");
+                    let hint = Self::suggest_flag(other);
+                    eprintln!("Error: unknown option '{other}'{hint}");
+                    eprintln!(
+                        "Run 's0 --help' for usage. Use '--' before a path that starts with '-'."
+                    );
                     process::exit(1);
                 }
             }
@@ -556,10 +558,39 @@ impl CliArgs {
         path.to_string_lossy().to_string()
     }
 
-
+    fn suggest_flag(given: &str) -> String {
+        let known = [
+            "--grammar",
+            "--help",
+            "--version",
+            "--wrap",
+            "--no-wrap",
+            "--clean",
+            "--install-grammar",
+            "--health",
+            "--doctor",
+            "--setup",
+            "grammar",
+            "setup",
+        ];
+        let mut best = None;
+        let mut best_dist = 3;
+        for flag in known {
+            let dist = edit_distance(given, flag);
+            if dist < best_dist {
+                best = Some(flag);
+                best_dist = dist;
+            }
+        }
+        match best {
+            Some(flag) if best_dist > 0 => format!(". Did you mean '{flag}'?"),
+            _ => String::new(),
+        }
+    }
 
     fn grammar_usage() -> &'static str {
         "Usage: s0 --grammar <fetch|build|install|remove|status|list|help> [language]\n\
+         --grammer is accepted as a spelling of --grammar.\n\
          Forms: s0 --grammar install kotlin\n\
                 s0 --grammar=install kotlin\n\
                 s0 --grammar install=kotlin\n\
@@ -596,6 +627,11 @@ impl CliArgs {
     }
 
     fn parse_grammar_tail(tail: &[String]) -> Result<GrammarRequest, String> {
+        let tail: Vec<String> = tail
+            .iter()
+            .filter(|s| !matches!(s.as_str(), "--force" | "--reinstall" | "-f"))
+            .cloned()
+            .collect();
         if tail.is_empty() {
             return Err("missing grammar command".into());
         }
@@ -621,7 +657,10 @@ impl CliArgs {
             }
             return Ok(GrammarRequest::List);
         }
-        if !matches!(action.as_str(), "fetch" | "build" | "install" | "remove" | "status") {
+        if !matches!(
+            action.as_str(),
+            "fetch" | "build" | "install" | "remove" | "status"
+        ) {
             return Err(format!("unknown grammar command '{action}'"));
         }
         let lang = if let Some(lang) = inline_lang {
@@ -632,10 +671,7 @@ impl CliArgs {
         } else if tail.len() < 2 {
             return Err(format!("missing language for '{action}'"));
         } else if tail.len() > 2 {
-            return Err(format!(
-                "unexpected extra argument '{}'",
-                tail[2]
-            ));
+            return Err(format!("unexpected extra argument '{}'", tail[2]));
         } else {
             tail[1].clone()
         };
@@ -658,18 +694,165 @@ impl CliArgs {
         })
     }
 
-    fn dispatch_grammar(req: GrammarRequest) -> Result<(), ()> {
+    fn dispatch_grammar(req: GrammarRequest, force: bool) -> Result<(), ()> {
         match req {
             GrammarRequest::Help => {
                 println!("{}", Self::grammar_usage());
                 Ok(())
             }
             GrammarRequest::List => Self::run_grammar_command("list", None),
-            GrammarRequest::Fetch(lang) => Self::run_grammar_command("fetch", Some(&lang)),
-            GrammarRequest::Build(lang) => Self::run_grammar_command("build", Some(&lang)),
-            GrammarRequest::Install(lang) => Self::run_grammar_command("install", Some(&lang)),
-            GrammarRequest::Remove(lang) => Self::run_grammar_command("remove", Some(&lang)),
+            GrammarRequest::Fetch(lang) => Self::run_grammar_progress("fetch", &lang, force),
+            GrammarRequest::Build(lang) => Self::run_grammar_progress("build", &lang, force),
+            GrammarRequest::Install(lang) => Self::run_grammar_progress("install", &lang, force),
+            GrammarRequest::Remove(lang) => Self::run_grammar_progress("remove", &lang, force),
             GrammarRequest::Status(lang) => Self::run_grammar_command("status", Some(&lang)),
+        }
+    }
+
+    fn builtin_grammar(lang: &str) -> bool {
+        matches!(
+            lang,
+            "rust"
+                | "c"
+                | "python"
+                | "javascript"
+                | "typescript"
+                | "tsx"
+                | "go"
+                | "json"
+                | "html"
+                | "markdown"
+                | "bash"
+        )
+    }
+
+    fn finish_card(title: &str, kind: &str, result: &str, note: &str) {
+        let r = "\x1b[0m";
+        let b = "\x1b[1m";
+        let green = "\x1b[38;2;100;200;140m";
+        let yellow = "\x1b[38;2;240;200;90m";
+        let blue = "\x1b[38;2;100;180;255m";
+        let gray = "\x1b[38;2;140;145;160m";
+        let white = "\x1b[38;2;225;230;240m";
+        let lines = vec![
+            format!(" {green}{CHECK}{r} {b}{white}{title}{r}"),
+            format!(" {yellow}Type:{r}    {white}{kind}{r}"),
+            format!(" {yellow}Result:{r}  {blue}{result}{r}"),
+            format!(" {gray}{note}{r}"),
+        ];
+        Self::print_boxed_card(&lines, 64);
+    }
+
+    fn step_line(label: &str) {
+        let yellow = "\x1b[38;2;240;200;90m";
+        let white = "\x1b[38;2;225;230;240m";
+        let r = "\x1b[0m";
+        println!("  {yellow}{CHEVRON_RIGHT}{r} {white}{label}{r}");
+    }
+
+    fn detail_line(label: &str) {
+        let gray = "\x1b[38;2;140;145;160m";
+        let r = "\x1b[0m";
+        println!("    {gray}{label}{r}");
+    }
+
+    fn run_grammar_progress(action: &str, lang: &str, force: bool) -> Result<(), ()> {
+        let red = "\x1b[38;2;240;90;90m";
+        let r = "\x1b[0m";
+        let state = crate::grammar::grammar_state(lang, Self::builtin_grammar(lang));
+        if !force {
+            match (action, &state) {
+                ("install" | "build", crate::grammar::GrammarState::Static) => {
+                    Self::finish_card(
+                        &format!("{lang} already built in"),
+                        "built-in grammar",
+                        "skipped",
+                        "Pass --force to clone and build a library anyway.",
+                    );
+                    return Ok(());
+                }
+                ("install" | "build", crate::grammar::GrammarState::Built(path)) => {
+                    Self::finish_card(
+                        &format!("{lang} already installed"),
+                        "installed library",
+                        &path.display().to_string(),
+                        "Pass --force to reinstall.",
+                    );
+                    return Ok(());
+                }
+                (
+                    "fetch",
+                    crate::grammar::GrammarState::Fetched(_)
+                    | crate::grammar::GrammarState::Built(_),
+                ) => {
+                    let where_at = match &state {
+                        crate::grammar::GrammarState::Fetched(p)
+                        | crate::grammar::GrammarState::Built(p) => p.display().to_string(),
+                        _ => String::new(),
+                    };
+                    Self::finish_card(
+                        &format!("{lang} already fetched"),
+                        "cached sources",
+                        &where_at,
+                        "Pass --force to clone again.",
+                    );
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+
+        let mut report = |ev: crate::grammar::GrammarEvent| match ev {
+            crate::grammar::GrammarEvent::Step(name) => Self::step_line(&name),
+            crate::grammar::GrammarEvent::Detail(line) => {
+                let clean = line.replace('\r', " ").trim().to_string();
+                if clean.is_empty()
+                    || clean.contains('%')
+                    || clean.starts_with("remote:")
+                    || clean.starts_with("hint:")
+                {
+                    return;
+                }
+                Self::detail_line(&clean);
+            }
+            crate::grammar::GrammarEvent::Info(line) => Self::detail_line(&line),
+            crate::grammar::GrammarEvent::Ok => {}
+        };
+        let result = match action {
+            "fetch" => crate::grammar::fetch_grammar_with(lang, &mut report)
+                .map(|p| p.display().to_string()),
+            "build" => crate::grammar::build_grammar_with(lang, &mut report)
+                .map(|p| p.display().to_string()),
+            "install" => crate::grammar::install_grammar_with(lang, &mut report)
+                .map(|p| p.display().to_string()),
+            "remove" => {
+                Self::step_line("Removing sources and library");
+                crate::grammar::remove_grammar(lang).map(|()| "removed".into())
+            }
+            _ => unreachable!(),
+        };
+        match result {
+            Ok(path) => {
+                let kind = if Self::builtin_grammar(lang) {
+                    "built-in + library"
+                } else if action == "remove" {
+                    "removed"
+                } else {
+                    "installed library"
+                };
+                println!();
+                Self::finish_card(
+                    &format!("{action} {lang}"),
+                    kind,
+                    &path,
+                    "Open a file of this language to use the grammar.",
+                );
+                Ok(())
+            }
+            Err(err) => {
+                eprintln!("{red}Error:{r} {err}");
+                Err(())
+            }
         }
     }
 
@@ -699,17 +882,33 @@ impl CliArgs {
                     return Err(());
                 }
                 let result = match action {
-                    "fetch" => crate::grammar::fetch_grammar(lang).map(|p| format!("Fetched {lang} into {}", p.display())),
-                    "build" => crate::grammar::build_grammar(lang).map(|p| format!("Built {lang} -> {}", p.display())),
-                    "install" => crate::grammar::install_grammar(lang).map(|p| format!("Installed {lang} -> {}", p.display())),
-                    "remove" => crate::grammar::remove_grammar(lang).map(|()| format!("Removed {lang}")),
+                    "fetch" => crate::grammar::fetch_grammar(lang)
+                        .map(|p| format!("Fetched {lang} into {}", p.display())),
+                    "build" => crate::grammar::build_grammar(lang)
+                        .map(|p| format!("Built {lang} -> {}", p.display())),
+                    "install" => crate::grammar::install_grammar(lang)
+                        .map(|p| format!("Installed {lang} -> {}", p.display())),
+                    "remove" => {
+                        crate::grammar::remove_grammar(lang).map(|()| format!("Removed {lang}"))
+                    }
                     "status" => {
                         let builtin = matches!(
                             lang,
-                            "rust" | "c" | "python" | "javascript" | "typescript" | "tsx" | "go" | "json" | "html" | "markdown" | "bash"
+                            "rust"
+                                | "c"
+                                | "python"
+                                | "javascript"
+                                | "typescript"
+                                | "tsx"
+                                | "go"
+                                | "json"
+                                | "html"
+                                | "markdown"
+                                | "bash"
                         );
                         let state = crate::grammar::grammar_state(lang, builtin);
-                        if lang == "cpp" && !matches!(state, crate::grammar::GrammarState::Built(_)) {
+                        if lang == "cpp" && !matches!(state, crate::grammar::GrammarState::Built(_))
+                        {
                             Ok("cpp: not installed; .cpp files use the built-in C grammar until `s0 --grammar install cpp`".into())
                         } else {
                             Ok(format!("{lang}: {state:?}"))
@@ -729,7 +928,9 @@ impl CliArgs {
                 }
             }
             _ => {
-                eprintln!("Usage: s0 --grammar <fetch|build|install|remove|status|list> [language]");
+                eprintln!(
+                    "Usage: s0 --grammar <fetch|build|install|remove|status|list> [language]"
+                );
                 eprintln!("Installs one language at a time. Example: s0 --grammar install python");
                 Err(())
             }
@@ -967,7 +1168,6 @@ impl CliArgs {
     }
 }
 
-
 #[cfg(test)]
 mod cli_tests {
     use super::CliArgs;
@@ -1025,8 +1225,40 @@ mod cli_tests {
     }
 
     #[test]
+    fn grammar_force_flag_is_not_an_extra_argument() {
+        let req = CliArgs::parse_grammar_tail(&tail(&["install", "kotlin", "--force"])).unwrap();
+        assert_eq!(req, super::GrammarRequest::Install("kotlin".into()));
+    }
+
+    #[test]
     fn grammar_quotes_are_stripped() {
         let req = CliArgs::parse_grammar_tail(&tail(&["build", "\"python\""])).unwrap();
         assert_eq!(req, super::GrammarRequest::Build("python".into()));
+    }
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+#[cfg(test)]
+mod flag_tests {
+    use super::edit_distance;
+
+    #[test]
+    fn grammer_is_one_edit_from_grammar() {
+        assert_eq!(edit_distance("--grammer", "--grammar"), 1);
     }
 }

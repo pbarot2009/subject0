@@ -214,7 +214,11 @@ async fn main() -> Result<()> {
                         });
                     }
                 }
-                LspOutbound::Goto { title, req_id: _, locations } => {
+                LspOutbound::Goto {
+                    title,
+                    req_id: _,
+                    locations,
+                } => {
                     if locations.is_empty() {
                         editor.status_msg = format!("No results for {title}");
                     } else if locations.len() == 1 {
@@ -237,7 +241,7 @@ async fn main() -> Result<()> {
                     if req_id != editor.lsp_req_id {
                         continue;
                     }
-                    editor.symbol_picker = Some(editor::SymbolPicker {
+                    editor.symbol_picker = Some(SymbolPicker {
                         symbols,
                         query: String::new(),
                         selected_idx: 0,
@@ -463,10 +467,8 @@ fn apply_hit(editor: &mut Editor, action: HitAction) {
             editor.line_wrap = !editor.line_wrap;
             editor.config.line_wrap = editor.line_wrap;
             let _ = editor.config.save();
-            editor.status_msg = format!(
-                "Line Wrap: {}",
-                if editor.line_wrap { "ON" } else { "OFF" }
-            );
+            editor.status_msg =
+                format!("Line Wrap: {}", if editor.line_wrap { "ON" } else { "OFF" });
         }
         HitAction::ToggleHints => {
             editor.show_inlay_hints = !editor.show_inlay_hints;
@@ -484,7 +486,7 @@ fn apply_hit(editor: &mut Editor, action: HitAction) {
             editor.palette.scroll = 0;
         }
         HitAction::OpenTheme => {
-            let cur_idx = theme::Theme::all()
+            let cur_idx = Theme::all()
                 .iter()
                 .position(|t| t.name == editor.theme.name)
                 .unwrap_or(0);
@@ -506,7 +508,7 @@ fn apply_hit(editor: &mut Editor, action: HitAction) {
         }
         HitAction::NextDiagnostic => editor.next_diagnostic(),
         HitAction::ClickTheme(idx) => {
-            if let Some(theme) = theme::Theme::all().get(idx) {
+            if let Some(theme) = Theme::all().get(idx) {
                 editor.set_theme(theme.name);
                 editor.theme_picker = None;
             }
@@ -515,7 +517,10 @@ fn apply_hit(editor: &mut Editor, action: HitAction) {
             if let Some(picker) = editor.lsp_picker.clone()
                 && let Some(cmd) = picker.candidates.get(idx)
             {
-                editor.config.preferred_lsps.insert(picker.language_id.clone(), cmd.clone());
+                editor
+                    .config
+                    .preferred_lsps
+                    .insert(picker.language_id.clone(), cmd.clone());
                 let _ = editor.config.save();
                 if let Some(path) = editor.path.clone() {
                     editor.start_lsp_server(&path, &picker.language_id, cmd);
@@ -1486,7 +1491,9 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                     editor.set_mode(Mode::Insert);
                 }
                 KeyCode::Char('u') => editor.undo(),
-                KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => editor.redo(),
+                KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    editor.redo()
+                }
                 KeyCode::Char('d') => editor.pending_key = Some('d'),
                 KeyCode::Char('g') => editor.pending_key = Some('g'),
                 KeyCode::Char(']') => editor.pending_key = Some(']'),

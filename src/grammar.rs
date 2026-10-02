@@ -9,8 +9,10 @@
 
 use std::{
     fs,
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
+    thread,
 };
 
 use anyhow::{Result, anyhow};
@@ -56,7 +58,11 @@ pub fn grammar_src_dir(name: &str) -> PathBuf {
 }
 
 pub fn grammar_lib_path(name: &str) -> PathBuf {
-    let file = format!("{}{name}{}", std::env::consts::DLL_PREFIX, std::env::consts::DLL_SUFFIX);
+    let file = format!(
+        "{}{name}{}",
+        std::env::consts::DLL_PREFIX,
+        std::env::consts::DLL_SUFFIX
+    );
     runtime_dir().join("grammars").join(file)
 }
 
@@ -133,8 +139,16 @@ pub fn grammar_state(name: &str, has_static: bool) -> GrammarState {
 
 /// Clone one grammar repository at the pinned revision. Does not build.
 pub fn fetch_grammar(name: &str) -> Result<PathBuf> {
+    fetch_grammar_with(name, &mut |_| {})
+}
+
+/// Same as [`fetch_grammar`], reporting each step and git stderr line.
+pub fn fetch_grammar_with(name: &str, report: &mut dyn FnMut(GrammarEvent)) -> Result<PathBuf> {
     let entry = find_grammar(name)?;
+    report(GrammarEvent::Info(format!("source  {}", entry.source.git)));
+    report(GrammarEvent::Info(format!("rev     {}", entry.source.rev)));
     let dir = grammar_src_dir(&entry.name);
+    report(GrammarEvent::Step("Prepare directory".into()));
     if dir.exists() {
         fs::remove_dir_all(&dir)?;
     }
@@ -142,21 +156,52 @@ pub fn fetch_grammar(name: &str) -> Result<PathBuf> {
         fs::create_dir_all(parent)?;
     }
     fs::create_dir_all(&dir)?;
-    git(&dir, &["init"])?;
-    git(&dir, &["remote", "add", "origin", &entry.source.git])?;
+    report(GrammarEvent::Ok);
+
+    report(GrammarEvent::Step("Initialize repository".into()));
+    git(&dir, &["init"], report)?;
+    git(
+        &dir,
+        &["remote", "add", "origin", &entry.source.git],
+        report,
+    )?;
+    report(GrammarEvent::Ok);
+
+    report(GrammarEvent::Step("Clone pinned revision".into()));
     let fetch = git(
         &dir,
-        &["fetch", "--depth", "1", "origin", &entry.source.rev],
+        &[
+            "fetch",
+            "--depth",
+            "1",
+            "--progress",
+            "origin",
+            &entry.source.rev,
+        ],
+        report,
     );
     if fetch.is_err() {
-        git(&dir, &["fetch", "origin", &entry.source.rev])?;
+        git(
+            &dir,
+            &["fetch", "--progress", "origin", &entry.source.rev],
+            report,
+        )?;
     }
-    git(&dir, &["checkout", &entry.source.rev])?;
+    report(GrammarEvent::Ok);
+
+    report(GrammarEvent::Step("Checkout revision".into()));
+    git(&dir, &["checkout", &entry.source.rev], report)?;
+    report(GrammarEvent::Ok);
     Ok(dir)
 }
 
 /// Compile a previously fetched grammar into a shared library.
 pub fn build_grammar(name: &str) -> Result<PathBuf> {
+    build_grammar_with(name, &mut |_| {})
+}
+
+/// Same as [`build_grammar`], reporting compile steps.
+pub fn build_grammar_with(name: &str, report: &mut dyn FnMut(GrammarEvent)) -> Result<PathBuf> {
     let entry = find_grammar(name)?;
     let src_root = grammar_src_dir(&entry.name);
     if !src_root.exists() {
@@ -170,22 +215,41 @@ pub fn build_grammar(name: &str) -> Result<PathBuf> {
         Some(sub) => src_root.join(sub),
         None => src_root.clone(),
     };
+    report(GrammarEvent::Step("Locate parser.c".into()));
     let parser = src_dir.join("src").join("parser.c");
     if !parser.is_file() {
         return Err(anyhow!("missing parser.c in {}", src_dir.display()));
     }
+    report(GrammarEvent::Ok);
     let out = grammar_lib_path(&entry.name);
     if let Some(parent) = out.parent() {
         fs::create_dir_all(parent)?;
     }
-    compile_parser(&src_dir, &parser, &out)?;
+    report(GrammarEvent::Step("Compile shared library".into()));
+    compile_parser(&src_dir, &parser, &out, report)?;
+    report(GrammarEvent::Ok);
+    report(GrammarEvent::Info(format!("library {}", out.display())));
     Ok(out)
 }
 
 /// Fetch then build a single language.
 pub fn install_grammar(name: &str) -> Result<PathBuf> {
-    fetch_grammar(name)?;
-    build_grammar(name)
+    install_grammar_with(name, &mut |_| {})
+}
+
+/// Fetch then build, reporting both phases.
+pub fn install_grammar_with(name: &str, report: &mut dyn FnMut(GrammarEvent)) -> Result<PathBuf> {
+    fetch_grammar_with(name, report)?;
+    build_grammar_with(name, report)
+}
+
+/// Progress events for the themed CLI card.
+#[derive(Debug, Clone)]
+pub enum GrammarEvent {
+    Info(String),
+    Step(String),
+    Detail(String),
+    Ok,
 }
 
 pub fn remove_grammar(name: &str) -> Result<()> {
@@ -218,7 +282,8 @@ pub fn load_dynamic_language(name: &str) -> Result<tree_sitter::Language> {
     unsafe {
         let lib = Library::new(&path)?;
         let symbol = grammar_symbol(name);
-        let func: libloading::Symbol<unsafe extern "C" fn() -> *const ()> = lib.get(symbol.as_bytes())?;
+        let func: libloading::Symbol<unsafe extern "C" fn() -> *const ()> =
+            lib.get(symbol.as_bytes())?;
         let raw = func();
         if raw.is_null() {
             return Err(anyhow!("grammar '{name}' exported a null language"));
@@ -237,7 +302,12 @@ pub fn grammar_symbol(name: &str) -> String {
     sym
 }
 
-fn compile_parser(src_dir: &Path, parser: &Path, out: &Path) -> Result<()> {
+fn compile_parser(
+    src_dir: &Path,
+    parser: &Path,
+    out: &Path,
+    report: &mut dyn FnMut(GrammarEvent),
+) -> Result<()> {
     let compiler = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
     let header = src_dir.join("src");
     let mut cmd = Command::new(&compiler);
@@ -264,12 +334,32 @@ fn compile_parser(src_dir: &Path, parser: &Path, out: &Path) -> Result<()> {
         }
         cmd.arg("-o").arg(out);
     }
-    let output = cmd.output().map_err(|e| anyhow!("failed to run {compiler}: {e}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
+    report(GrammarEvent::Detail(format!("compiler {compiler}")));
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| anyhow!("failed to run {compiler}: {e}"))?;
+    let stderr = child.stderr.take();
+    let handle = thread::spawn(move || {
+        let mut lines = Vec::new();
+        if let Some(stderr) = stderr {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                lines.push(line);
+            }
+        }
+        lines
+    });
+    let status = child
+        .wait()
+        .map_err(|e| anyhow!("compiler wait failed: {e}"))?;
+    let lines = handle.join().unwrap_or_default();
+    for line in &lines {
+        report(GrammarEvent::Detail(line.clone()));
+    }
+    if !status.success() {
         return Err(anyhow!(
-            "grammar compile failed ({compiler}): {stderr}{stdout}"
+            "grammar compile failed ({compiler}): {}",
+            lines.join(" ")
         ));
     }
     Ok(())
@@ -285,18 +375,38 @@ fn scanner_path(src_dir: &Path) -> Option<PathBuf> {
     None
 }
 
-fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
+fn git(dir: &Path, args: &[&str], report: &mut dyn FnMut(GrammarEvent)) -> Result<String> {
+    let mut child = Command::new("git")
         .arg("-C")
         .arg(dir)
         .args(args)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| anyhow!("git is not available: {e}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("git {} failed: {stderr}", args.join(" ")));
+    let stderr = child.stderr.take();
+    let handle = thread::spawn(move || {
+        let mut lines = Vec::new();
+        if let Some(stderr) = stderr {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                lines.push(line);
+            }
+        }
+        lines
+    });
+    let status = child.wait().map_err(|e| anyhow!("git wait failed: {e}"))?;
+    let lines = handle.join().unwrap_or_default();
+    for line in &lines {
+        report(GrammarEvent::Detail(line.clone()));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    if !status.success() {
+        return Err(anyhow!(
+            "git {} failed: {}",
+            args.join(" "),
+            lines.join(" ")
+        ));
+    }
+    Ok(String::new())
 }
 
 #[cfg(test)]

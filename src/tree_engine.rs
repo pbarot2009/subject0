@@ -122,7 +122,12 @@ pub fn textobject_at(
     best
 }
 
-pub fn rainbow_spans(language: &Language, source: &str, tree: &Tree, query_src: &str) -> Vec<RainbowSpan> {
+pub fn rainbow_spans(
+    language: &Language,
+    source: &str,
+    tree: &Tree,
+    query_src: &str,
+) -> Vec<RainbowSpan> {
     if query_src.trim().is_empty() {
         return Vec::new();
     }
@@ -161,7 +166,12 @@ pub fn rainbow_spans(language: &Language, source: &str, tree: &Tree, query_src: 
     spans
 }
 
-pub fn collect_tags(language: &Language, source: &str, tree: &Tree, query_src: &str) -> Vec<TagSymbol> {
+pub fn collect_tags(
+    language: &Language,
+    source: &str,
+    tree: &Tree,
+    query_src: &str,
+) -> Vec<TagSymbol> {
     if query_src.trim().is_empty() {
         return Vec::new();
     }
@@ -178,7 +188,9 @@ pub fn collect_tags(language: &Language, source: &str, tree: &Tree, query_src: &
         for cap in m.captures {
             let cap_name = query.capture_names()[cap.index as usize];
             if cap_name == "name" {
-                name = source.get(cap.node.start_byte()..cap.node.end_byte()).map(str::to_string);
+                name = source
+                    .get(cap.node.start_byte()..cap.node.end_byte())
+                    .map(str::to_string);
             } else if cap_name.starts_with("definition.") {
                 kind = cap_name.trim_start_matches("definition.").to_string();
                 def_node = Some(cap.node);
@@ -199,7 +211,12 @@ pub fn collect_tags(language: &Language, source: &str, tree: &Tree, query_src: &
     tags
 }
 
-pub fn collect_folds(language: &Language, source: &str, tree: &Tree, query_src: &str) -> Vec<FoldRange> {
+pub fn collect_folds(
+    language: &Language,
+    source: &str,
+    tree: &Tree,
+    query_src: &str,
+) -> Vec<FoldRange> {
     if query_src.trim().is_empty() {
         return Vec::new();
     }
