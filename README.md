@@ -113,7 +113,7 @@ If no path is provided, an empty scratch buffer opens.
 
 ## Configuration
 
-`subject0` automatically reads and writes workspace settings to `.subject0` in the current project root, falling back to `~/.subject0`.
+`subject0` reads workspace settings from `.subject0` in the project root. If that file is missing, it falls back to the config directory (`~/.config/subject0/.subject0` on Linux) and then `~/.subject0`.
 
 ```json
 {

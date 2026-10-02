@@ -13,7 +13,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
 };
 
-use crate::editor::{Editor, Focus, Mode};
+use crate::editor::{Editor, Focus, HitAction, HitRegion, Mode};
 use crate::git::GutterChange;
 use crate::lsp::{InlayHintType, LspStatus, utf16_to_char_col};
 use crate::syntax::{completion_kind_icon, file_icon_and_color, symbol_kind_icon};
@@ -28,7 +28,7 @@ use crate::nerdfonts::{
     TILDE, TOOL_LINK, WRAP_OFF, WRAP_ON,
 };
 
-/// Safely truncates a string by Unicode scalar count without slicing mid-codepoint[span_7](start_span)[span_7](end_span).
+/// Safely truncates a string by Unicode scalar count without slicing mid-codepoint.
 pub fn safe_truncate(s: &str, max_chars: usize) -> String {
     if s.chars().count() > max_chars {
         let mut result: String = s.chars().take(max_chars.saturating_sub(1)).collect();
@@ -39,10 +39,28 @@ pub fn safe_truncate(s: &str, max_chars: usize) -> String {
     }
 }
 
-/// Primary UI rendering entry point dispatched on every event loop redraw tick[span_8](start_span)[span_8](end_span).
+/// Primary UI rendering entry point dispatched on every event loop redraw tick.
 pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
     let size = frame.area();
     let theme = editor.theme;
+    editor.hit_regions.clear();
+    if let Some(prompt) = &editor.confirm {
+        let _ = prompt.message.as_str();
+        editor.hit_regions.push(HitRegion {
+            x: 1,
+            y: size.height.saturating_sub(1),
+            w: 8,
+            h: 1,
+            action: HitAction::ConfirmYes,
+        });
+        editor.hit_regions.push(HitRegion {
+            x: 10,
+            y: size.height.saturating_sub(1),
+            w: 8,
+            h: 1,
+            action: HitAction::ConfirmNo,
+        });
+    }
 
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -71,7 +89,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         (None, main_chunks[0])
     };
 
-    // 1. Render File Explorer (Sidebar with padded 2-cell icons)[span_9](start_span)[span_9](end_span)
+    // 1. Render File Explorer (Sidebar with padded 2-cell icons)
     if let Some(exp_rect) = explorer_area {
         let is_focused = editor.focus == Focus::Explorer;
         let border_color = if is_focused {
@@ -142,7 +160,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         frame.render_widget(Paragraph::new(tree_lines), inner_exp);
     }
 
-    // 2. Render Document Editor Viewport[span_10](start_span)[span_10](end_span)
+    // 2. Render Document Editor Viewport
     let (icon, icon_color) = file_icon_and_color(editor.path.as_ref());
     let clean_icon = icon.trim();
     let file_title = editor.path.as_ref().map_or_else(
@@ -212,7 +230,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
         let is_cursor_line = y == editor.cursor_y;
 
-        // Compiler Diagnostic Indicator (2 cells)[span_11](start_span)[span_11](end_span)
+        // Compiler Diagnostic Indicator (2 cells)
         let line_diag = editor.diagnostics.iter().find(|d| d.line == y);
         let (diag_marker, diag_style) = match line_diag.map(|d| d.severity) {
             Some(1) => (DIAG_ERROR_PAD, Style::default().fg(theme.diag_error)),
@@ -265,7 +283,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             }
         }
 
-        // Weave Inlay Hints (Inferred Types & Parameters)[span_12](start_span)[span_12](end_span)
+        // Weave Inlay Hints (Inferred Types & Parameters)
         let mut char_cells: Vec<(char, Style, Option<usize>)> = Vec::new();
         let line_hints: Vec<&crate::lsp::InlayHintItem> = if editor.show_inlay_hints {
             editor.inlay_hints.iter().filter(|h| h.line == y).collect()
@@ -306,7 +324,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             char_cells.push((ch, st, Some(idx)));
         }
 
-        // Tail hints (e.g. end-of-line return types)[span_13](start_span)[span_13](end_span)
+        // Tail hints (e.g. end-of-line return types)
         if let Some(hints) = hint_map.remove(&line_str.chars().count()) {
             for h in hints {
                 let h_style = match h.kind {
@@ -481,7 +499,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
     frame.render_widget(Paragraph::new(visible_lines), inner_area);
 
-    // 3. Render Statusline[span_14](start_span)[span_14](end_span)
+    // 3. Render Statusline
     let (badge_text, badge_color) = match editor.mode {
         Mode::Normal => (" NORMAL ", theme.mode_normal),
         Mode::Insert => (" INSERT ", theme.mode_insert),
@@ -658,12 +676,62 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         ),
     ]);
 
+    let mut hit_x = main_chunks[1].x;
+    for span in &status_left_spans {
+        let width = span.content.chars().count() as u16;
+        let text = span.content.to_string();
+        let action = if text.contains("Files") {
+            Some(HitAction::ToggleExplorer)
+        } else if text.contains("Wrap") {
+            Some(HitAction::ToggleWrap)
+        } else if text.contains("Hints") {
+            Some(HitAction::ToggleHints)
+        } else if text.contains("Cmd") {
+            Some(HitAction::OpenPalette)
+        } else {
+            None
+        };
+        if let Some(action) = action {
+            editor.hit_regions.push(HitRegion {
+                x: hit_x,
+                y: main_chunks[1].y,
+                w: width.max(1),
+                h: 1,
+                action,
+            });
+        }
+        hit_x = hit_x.saturating_add(width);
+    }
+    editor.hit_regions.push(HitRegion {
+        x: main_chunks[1].right().saturating_sub(18),
+        y: main_chunks[1].y,
+        w: 12,
+        h: 1,
+        action: HitAction::OpenTheme,
+    });
+    editor.hit_regions.push(HitRegion {
+        x: main_chunks[1].right().saturating_sub(36),
+        y: main_chunks[1].y,
+        w: 16,
+        h: 1,
+        action: HitAction::OpenLsp,
+    });
+    if error_count + warn_count > 0 {
+        editor.hit_regions.push(HitRegion {
+            x: main_chunks[1].right().saturating_sub(52),
+            y: main_chunks[1].y,
+            w: 14,
+            h: 1,
+            action: HitAction::NextDiagnostic,
+        });
+    }
+
     frame.render_widget(
         Block::default().style(Style::default().bg(bar_bg)),
         main_chunks[1],
     );
     frame.render_widget(
-        Paragraph::new(Line::from(status_left_spans)),
+        Paragraph::new(Line::from(status_left_spans.clone())),
         main_chunks[1],
     );
     frame.render_widget(
@@ -671,7 +739,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         main_chunks[1],
     );
 
-    // 4. Command Bar & Status Messages[span_15](start_span)[span_15](end_span)
+    // 4. Command Bar & Status Messages
     let (screen_x, screen_y) =
         cursor_screen_pos.unwrap_or((inner_area.x + gutter_width as u16, inner_area.y));
 
@@ -741,7 +809,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         }
     }
 
-    // 5. Floating Autocomplete Dropdown[span_16](start_span)[span_16](end_span)
+    // 5. Floating Autocomplete Dropdown
     if editor.mode == Mode::Insert && editor.completion_visible && !editor.completions.is_empty() {
         let max_visible_items = 6usize;
         let total_items = editor.completions.len();
@@ -817,7 +885,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         frame.render_widget(Paragraph::new(list_lines).block(comp_block), popup_rect);
     }
 
-    // 6. Floating Signature Help Tooltip[span_17](start_span)[span_17](end_span)
+    // 6. Floating Signature Help Tooltip
     if editor.mode == Mode::Insert
         && let Some(help) = &editor.signature_help
     {
@@ -858,7 +926,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         frame.render_widget(Paragraph::new(line).block(block), tooltip_rect);
     }
 
-    // 7. Floating Hover Documentation Card[span_18](start_span)[span_18](end_span)
+    // 7. Floating Hover Documentation Card
     if let Some(hover) = &editor.hover_info {
         let max_content_len = hover.lines.iter().map(String::len).max().unwrap_or(30);
         let width = (max_content_len as u16 + 4)
@@ -913,7 +981,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         frame.render_widget(Paragraph::new(doc_lines), inner_card);
     }
 
-    // 8. Code Action Picker Modal[span_19](start_span)[span_19](end_span)
+    // 8. Code Action Picker Modal
     if let Some(picker) = &editor.code_action_picker {
         let width = 56u16.min(size.width.saturating_sub(2));
         let height = ((picker.actions.len() as u16) + 4).min(size.height.saturating_sub(2));
@@ -981,9 +1049,16 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             )));
 
         frame.render_widget(Paragraph::new(lines).block(block), rect);
+        for idx in 0..picker.actions.len() {
+            editor.hit_regions.push(HitRegion {
+                x: rect.x + 1,
+                y: rect.y + 3 + idx as u16,
+                w: rect.width.saturating_sub(2),
+                h: 1,
+                action: HitAction::ClickAction(idx),
+            });
+        }
     }
-
-    // 9. Symbol Outline Picker Modal[span_20](start_span)[span_20](end_span)
     if let Some(picker) = &editor.symbol_picker {
         let width = 58u16.min(size.width.saturating_sub(2));
         let height = 14u16.min(size.height.saturating_sub(2));
@@ -1063,9 +1138,16 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             )));
 
         frame.render_widget(Paragraph::new(lines).block(block), rect);
+        for i in scroll_start..scroll_end {
+            editor.hit_regions.push(HitRegion {
+                x: rect.x + 1,
+                y: rect.y + 3 + (i - scroll_start) as u16,
+                w: rect.width.saturating_sub(2),
+                h: 1,
+                action: HitAction::ClickSymbol(i),
+            });
+        }
     }
-
-    // 10. Location Picker Modal (Definitions / References)[span_21](start_span)[span_21](end_span)
     if let Some(picker) = &editor.location_picker {
         let width = 64u16.min(size.width.saturating_sub(2));
         let height = ((picker.locations.len() as u16) + 4)
@@ -1142,9 +1224,16 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             )));
 
         frame.render_widget(Paragraph::new(lines).block(block), rect);
+        for i in start..end {
+            editor.hit_regions.push(HitRegion {
+                x: rect.x + 1,
+                y: rect.y + 3 + (i - start) as u16,
+                w: rect.width.saturating_sub(2),
+                h: 1,
+                action: HitAction::ClickLocation(i),
+            });
+        }
     }
-
-    // 11. Rename Symbol Prompt Modal[span_22](start_span)[span_22](end_span)
     if let Some(name) = &editor.rename_prompt {
         let width = 46u16.min(size.width.saturating_sub(2));
         let height = 3u16;
@@ -1180,7 +1269,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         frame.render_widget(Paragraph::new(line).block(block), rect);
     }
 
-    // 12. Render Command Palette Modal[span_23](start_span)[span_23](end_span)
+    // 12. Render Command Palette Modal
     if editor.palette.visible {
         let width = 46u16.min(size.width.saturating_sub(2));
         let height = 12u16.min(size.height.saturating_sub(2));
@@ -1276,7 +1365,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         frame.render_widget(Paragraph::new(palette_lines).block(p_block), palette_rect);
     }
 
-    // 13. Render Theme Picker Modal Overlay[span_24](start_span)[span_24](end_span)
+    // 13. Render Theme Picker Modal Overlay
     if let Some(picker) = &editor.theme_picker {
         let themes = crate::theme::Theme::all();
         let width = 48u16.min(size.width.saturating_sub(2));
@@ -1340,9 +1429,18 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             )));
 
         frame.render_widget(Paragraph::new(lines).block(block), picker_rect);
+        for idx in 0..themes.len() {
+            editor.hit_regions.push(HitRegion {
+                x: picker_rect.x + 1,
+                y: picker_rect.y + 3 + idx as u16,
+                w: picker_rect.width.saturating_sub(2),
+                h: 1,
+                action: HitAction::ClickTheme(idx),
+            });
+        }
     }
 
-    // 14. Render LSP Picker Modal Overlay[span_25](start_span)[span_25](end_span)
+    // 14. Render LSP Picker Modal Overlay
     if let Some(picker) = &editor.lsp_picker {
         let width = 48u16.min(size.width.saturating_sub(2));
         let height = ((picker.candidates.len() as u16) + 4).min(size.height.saturating_sub(2));
@@ -1413,9 +1511,18 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             )));
 
         frame.render_widget(Paragraph::new(lines).block(block), picker_rect);
+        for idx in 0..picker.candidates.len() {
+            editor.hit_regions.push(HitRegion {
+                x: picker_rect.x + 1,
+                y: picker_rect.y + 3 + idx as u16,
+                w: picker_rect.width.saturating_sub(2),
+                h: 1,
+                action: HitAction::ClickLsp(idx),
+            });
+        }
     }
 
-    // 15. Render In-Editor Help Modal[span_26](start_span)[span_26](end_span)
+    // 15. Render In-Editor Help Modal
     if editor.show_help {
         let width = 66u16.min(size.width.saturating_sub(4));
         let height = 24u16.min(size.height.saturating_sub(2));
@@ -1424,6 +1531,13 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
         let help_rect = Rect::new(x, y, width, height);
         frame.render_widget(Clear, help_rect);
+        editor.hit_regions.push(HitRegion {
+            x: help_rect.x,
+            y: help_rect.y,
+            w: help_rect.width,
+            h: 1,
+            action: HitAction::ClosePopup,
+        });
 
         let help_block = Block::default()
             .borders(Borders::ALL)

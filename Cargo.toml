@@ -81,7 +81,7 @@ thiserror = "2.0"
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+panic = "unwind"
 strip = true
 
 [lints.rust]

@@ -4,17 +4,17 @@
 //!
 //! 1. **Text Storage & Mutability ([`ropey::Rope`])**:
 //!    Buffer contents are stored as a chunked, reference-counted B-tree rope with $O(\log N)$
-//!    mutations and $O(1)$ copy-on-write structural sharing for undo/redo snapshots[span_7](start_span)[span_7](end_span).
+//!    mutations and $O(1)$ copy-on-write structural sharing for undo/redo snapshots.
 //!
 //! 2. **Modal Editing State Machine ([`Mode`])**:
-//!    Implements modal key semantics across `Normal`, `Insert`, `Command`, and `Visual` states[span_8](start_span)[span_8](end_span).
+//!    Implements modal key semantics across `Normal`, `Insert`, `Command`, and `Visual` states.
 //!
 //! 3. **Top-Tier Language Server Protocol (LSP) State Integration**:
-//!    - Multi-file workspace edit dispatcher applying atomic updates across disk and memory[span_9](start_span)[span_9](end_span).
-//!    - Additional text edits on completion acceptance (auto-imports)[span_10](start_span)[span_10](end_span).
-//!    - Jump history tracking across document definition/reference navigations[span_11](start_span)[span_11](end_span).
-//!    - Bidirectional diagnostic traversal (`next_diagnostic`, `prev_diagnostic`)[span_12](start_span)[span_12](end_span).
-//!    - Request cancellation and server reboot triggers (`:lsp-restart`)[span_13](start_span)[span_13](end_span).
+//!    - Multi-file workspace edit dispatcher applying atomic updates across disk and memory.
+//!    - Additional text edits on completion acceptance (auto-imports).
+//!    - Jump history tracking across document definition/reference navigations.
+//!    - Bidirectional diagnostic traversal (`next_diagnostic`, `prev_diagnostic`).
+//!    - Request cancellation and server reboot triggers (`:lsp-restart`).
 //!
 //! 4. **Git Version Control & Real-Time Diff Integration**:
 //!    - Asynchronous line-level diff tracking against the repository `HEAD` blob.
@@ -23,22 +23,24 @@
 //!
 //! 5. **Theming, Diagnostics Sync & Data Protection**:
 //!    Maintains AST highlighting trees, shifts diagnostic positions on row mutations,
-//!    tracks a bidirectional undo/redo ring, and protects unsaved buffers[span_14](start_span)[span_14](end_span).
+//!    tracks a bidirectional undo/redo ring, and protects unsaved buffers.
 
 use std::{
     collections::{HashMap, HashSet},
     env,
     fs::{self, File},
-    io::{BufWriter, Write},
+    io::{self, Write},
     path::{Path, PathBuf},
+    time::{Instant, SystemTime},
 };
 
-use crate::git::{GitDiffSummary, GitHunk, GitInbound, GutterChange};
+use crate::git::{GitDiffSummary, GitInbound};
 use crate::lsp::{
-    CodeActionItem, DiagnosticItem, HoverInfo, InlayHintItem, LocationItem, LspInbound,
-    LspOutbound, LspStatus, SignatureHelpInfo, SuggestionItem, SymbolItem, TextEditItem,
+    CodeActionItem, DiagnosticItem, HoverInfo, InlayHintItem, LocationItem, LspEvent, LspInbound,
+    LspStatus, SignatureHelpInfo, SuggestionItem, SymbolItem, TextEditItem,
     char_to_utf16_col, run_lsp_actor, subject0_config_dir, utf16_to_char_col,
 };
+use crate::safe_io::{atomic_write_with, file_stamp, find_project_root};
 use crate::syntax::SyntaxEngine;
 
 use crate::nerdfonts::{
@@ -46,7 +48,7 @@ use crate::nerdfonts::{
     CMD_INSERT_ABOVE, CMD_INSERT_BELOW, CMD_JOIN, CMD_JUMP_BOTTOM, CMD_JUMP_TOP, CMD_PASTE,
     CMD_QUIT, CMD_REDO, CMD_REFERENCES, CMD_RENAME, CMD_RESTART, CMD_SAVE, CMD_SAVE_QUIT,
     CMD_SYMBOLS, CMD_TOGGLE_CASE, CMD_UNDO, CMD_VISUAL, CMD_YANK, DIAG_ERROR, DIAG_WARN,
-    FILE_DOCUMENT, FOLDER, GEAR_CONFIG, GIT_BRANCH, GIT_DIFF_ADDED, GIT_DIFF_MODIFIED,
+    FILE_DOCUMENT, FOLDER, GEAR_CONFIG, GIT_DIFF_ADDED, GIT_DIFF_MODIFIED,
     GIT_DIFF_REMOVED, HELP, HINTS_ON, LIGHTBULB, SETTINGS_COGS, THEME, WRAP_ON,
 };
 use crate::theme::Theme;
@@ -56,14 +58,14 @@ use ropey::Rope;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-/// Persistent editor configuration stored in `.subject0`[span_15](start_span)[span_15](end_span).
+/// Persistent editor configuration stored in `.subject0`.
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     pub preferred_lsps: HashMap<String, String>,
     pub line_wrap: bool,
     pub theme: String,
     pub show_inlay_hints: bool,
-    /// Resolved absolute path to the `.subject0` configuration file[span_16](start_span)[span_16](end_span).
+    /// Resolved absolute path to the `.subject0` configuration file.
     pub source_path: PathBuf,
 }
 
@@ -159,25 +161,69 @@ impl AppConfig {
     }
 }
 
-/// Interactive modal state when choosing from available color themes[span_17](start_span)[span_17](end_span).
+/// Clickable screen region recorded while drawing a frame.
+#[derive(Clone, Debug)]
+pub struct HitRegion {
+    pub x: u16,
+    pub y: u16,
+    pub w: u16,
+    pub h: u16,
+    pub action: HitAction,
+}
+
+/// Action bound to a touch or click target.
+#[derive(Clone, Debug)]
+pub enum HitAction {
+    ToggleExplorer,
+    ToggleWrap,
+    ToggleHints,
+    OpenPalette,
+    OpenTheme,
+    OpenLsp,
+    NextDiagnostic,
+    ClickTheme(usize),
+    ClickLsp(usize),
+    ClickAction(usize),
+    ClickSymbol(usize),
+    ClickLocation(usize),
+    ConfirmYes,
+    ConfirmNo,
+    ClosePopup,
+}
+
+/// Yes/no prompt for destructive actions.
+#[derive(Clone, Debug)]
+pub enum ConfirmKind {
+    Overwrite(PathBuf),
+    DiscardJump(LocationItem),
+}
+
+#[derive(Clone, Debug)]
+pub struct ConfirmPrompt {
+    pub kind: ConfirmKind,
+    pub message: String,
+}
 pub struct ThemePicker {
     pub selected_idx: usize,
 }
 
-/// Interactive modal state when multiple language servers are detected for a language[span_18](start_span)[span_18](end_span).
+/// Interactive modal state when multiple language servers are detected for a language.
+#[derive(Clone, Debug)]
 pub struct LspPicker {
     pub language_id: String,
     pub candidates: Vec<String>,
     pub selected_idx: usize,
 }
 
-/// Interactive modal state when choosing a Code Action / Quickfix[span_19](start_span)[span_19](end_span).
+/// Interactive modal state when choosing a Code Action / Quickfix.
+#[derive(Clone, Debug)]
 pub struct CodeActionPicker {
     pub actions: Vec<CodeActionItem>,
     pub selected_idx: usize,
 }
 
-/// Interactive modal state for fuzzy symbol search across document outlines[span_20](start_span)[span_20](end_span).
+/// Interactive modal state for fuzzy symbol search across document outlines.
+#[derive(Clone, Debug)]
 pub struct SymbolPicker {
     pub symbols: Vec<SymbolItem>,
     pub query: String,
@@ -201,7 +247,8 @@ impl SymbolPicker {
     }
 }
 
-/// Interactive modal state when choosing from multiple definition or reference locations[span_21](start_span)[span_21](end_span).
+/// Interactive modal state when choosing from multiple definition or reference locations.
+#[derive(Clone, Debug)]
 pub struct LocationPicker {
     pub title: &'static str,
     pub locations: Vec<LocationItem>,
@@ -209,7 +256,7 @@ pub struct LocationPicker {
     pub scroll: usize,
 }
 
-/// Active modal editing state[span_22](start_span)[span_22](end_span).
+/// Active modal editing state.
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum Mode {
     Normal,
@@ -218,14 +265,14 @@ pub enum Mode {
     Visual { anchor_x: usize, anchor_y: usize },
 }
 
-/// Identifies which viewport element currently holds keyboard input focus[span_23](start_span)[span_23](end_span).
+/// Identifies which viewport element currently holds keyboard input focus.
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum Focus {
     Editor,
     Explorer,
 }
 
-/// Navigation jump checkpoint for jump-list history[span_24](start_span)[span_24](end_span).
+/// Navigation jump checkpoint for jump-list history.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JumpCheckpoint {
     pub path: PathBuf,
@@ -588,7 +635,7 @@ impl FileExplorer {
         explorer
     }
 
-    /// Refreshes the explorer tree while preserving expanded folders across refreshes[span_25](start_span)[span_25](end_span).
+    /// Refreshes the explorer tree while preserving expanded folders across refreshes.
     pub fn refresh(&mut self) {
         let expanded_paths: HashSet<PathBuf> = self
             .entries
@@ -597,7 +644,7 @@ impl FileExplorer {
             .map(|e| e.path.clone())
             .collect();
 
-        self.entries = Self::read_directory_recursive(&self.root, 0, &expanded_paths);
+        self.entries = Self::read_directory_recursive(&self.root, 0, &expanded_paths, &mut HashSet::new());
 
         if self.selected_idx >= self.entries.len() && !self.entries.is_empty() {
             self.selected_idx = self.entries.len() - 1;
@@ -611,7 +658,7 @@ impl FileExplorer {
                 .filter_map(|res| res.ok().map(|e| e.path()))
                 .filter(|p| {
                     let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    !name.starts_with('.') && name != "target" && name != "node_modules"
+                    name != ".git" && name != "target" && name != "node_modules"
                 })
                 .collect();
 
@@ -651,14 +698,19 @@ impl FileExplorer {
         dir: &Path,
         depth: usize,
         expanded: &HashSet<PathBuf>,
+        visited: &mut HashSet<PathBuf>,
     ) -> Vec<FileEntry> {
+        let canonical = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        if !visited.insert(canonical) {
+            return Vec::new();
+        }
         let mut entries = Vec::new();
         if let Ok(read_dir) = fs::read_dir(dir) {
             let mut paths: Vec<PathBuf> = read_dir
                 .filter_map(|res| res.ok().map(|e| e.path()))
                 .filter(|p| {
                     let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    !name.starts_with('.') && name != "target" && name != "node_modules"
+                    name != ".git" && name != "target" && name != "node_modules"
                 })
                 .collect();
 
@@ -692,7 +744,7 @@ impl FileExplorer {
                 });
 
                 if is_expanded {
-                    let mut children = Self::read_directory_recursive(&p, depth + 1, expanded);
+                    let mut children = Self::read_directory_recursive(&p, depth + 1, expanded, visited);
                     entries.append(&mut children);
                 }
             }
@@ -757,6 +809,7 @@ pub struct UndoSnapshot {
     pub rope: Rope,
     pub cursor_x: usize,
     pub cursor_y: usize,
+    pub generation: u64,
 }
 
 // === Editor Buffer Model ===
@@ -774,6 +827,15 @@ pub struct Editor {
     pub line_wrap: bool,
     pub clipboard: String,
     pub modified: bool,
+    pub edit_generation: u64,
+    pub saved_generation: u64,
+    pub disk_stamp: Option<(SystemTime, u64)>,
+    pub project_root: PathBuf,
+    pub pending_bg: bool,
+    pub bg_deadline: Option<Instant>,
+    pub confirm: Option<ConfirmPrompt>,
+    pub hit_regions: Vec<HitRegion>,
+    pub lsp_session: u64,
     pub saved_undo_len: usize,
     pub status_msg: String,
     pub command_buffer: String,
@@ -785,7 +847,7 @@ pub struct Editor {
     pub diagnostics: Vec<DiagnosticItem>,
     pub lsp_status: LspStatus,
     pub lsp_tx: Option<mpsc::UnboundedSender<LspInbound>>,
-    pub lsp_out_tx: Option<mpsc::UnboundedSender<LspOutbound>>,
+    pub lsp_out_tx: Option<mpsc::UnboundedSender<LspEvent>>,
     pub spinner_tick: usize,
     pub lsp_req_id: i64,
     pub doc_version: i32,
@@ -857,10 +919,14 @@ impl Editor {
         syntax.reparse(&text);
 
         let root_dir = if is_dir_target {
-            path.cloned().unwrap()
+            path.cloned().unwrap_or_else(|| PathBuf::from("."))
+        } else if let Some(p) = path {
+            find_project_root(p)
         } else {
-            env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+            find_project_root(&env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
         };
+
+        let disk_stamp = buffer_path.as_ref().and_then(|p| file_stamp(p));
 
         let mut explorer = FileExplorer::new(root_dir.clone());
         if is_dir_target {
@@ -896,6 +962,15 @@ impl Editor {
 
             clipboard: String::new(),
             modified: false,
+            edit_generation: 0,
+            saved_generation: 0,
+            disk_stamp,
+            project_root: root_dir.clone(),
+            pending_bg: false,
+            bg_deadline: None,
+            confirm: None,
+            hit_regions: Vec::new(),
+            lsp_session: 0,
             saved_undo_len: 0,
             status_msg,
             command_buffer: String::new(),
@@ -1012,7 +1087,7 @@ impl Editor {
             self.rope.insert(start_char, &head_text);
         }
 
-        self.modified = true;
+        self.note_edit();
         self.cursor_y = after_start.min(self.rope.len_lines().saturating_sub(1));
         self.cursor_x = 0;
         self.clamp_cursor();
@@ -1020,7 +1095,7 @@ impl Editor {
         self.status_msg = format!("Reverted Git hunk at line {}", after_start + 1);
     }
 
-    /// Switches the active color theme and writes it to `.subject0`[span_26](start_span)[span_26](end_span).
+    /// Switches the active color theme and writes it to `.subject0`.
     pub fn set_theme(&mut self, theme_name: &str) {
         self.theme = Theme::from_name(theme_name);
         self.config.theme = self.theme.name.to_string();
@@ -1065,7 +1140,7 @@ impl Editor {
         char_to_utf16_col(&line, self.cursor_x)
     }
 
-    /// Records current file position in the jump history[span_27](start_span)[span_27](end_span).
+    /// Records current file position in the jump history.
     pub fn record_jump_checkpoint(&mut self) {
         if let Some(p) = &self.path {
             let cp = JumpCheckpoint {
@@ -1083,7 +1158,7 @@ impl Editor {
         }
     }
 
-    /// Jumps backward through the location jump-list history[span_28](start_span)[span_28](end_span).
+    /// Jumps backward through the location jump-list history.
     pub fn jump_backward(&mut self) {
         if self.jump_idx > 0 && !self.jump_list.is_empty() {
             if self.jump_idx == self.jump_list.len() {
@@ -1092,11 +1167,7 @@ impl Editor {
             }
             self.jump_idx = self.jump_idx.saturating_sub(1);
             if let Some(cp) = self.jump_list.get(self.jump_idx).cloned() {
-                self.jump_to_location(LocationItem {
-                    path: cp.path,
-                    line: cp.line,
-                    col: cp.col,
-                });
+                self.jump_to_char_pos(cp.path, cp.line, cp.col);
                 self.status_msg = format!(
                     "Jumped back ({}/{})",
                     self.jump_idx + 1,
@@ -1108,16 +1179,12 @@ impl Editor {
         }
     }
 
-    /// Jumps forward through the location jump-list history[span_29](start_span)[span_29](end_span).
+    /// Jumps forward through the location jump-list history.
     pub fn jump_forward(&mut self) {
         if self.jump_idx + 1 < self.jump_list.len() {
             self.jump_idx += 1;
             if let Some(cp) = self.jump_list.get(self.jump_idx).cloned() {
-                self.jump_to_location(LocationItem {
-                    path: cp.path,
-                    line: cp.line,
-                    col: cp.col,
-                });
+                self.jump_to_char_pos(cp.path, cp.line, cp.col);
                 self.status_msg = format!(
                     "Jumped forward ({}/{})",
                     self.jump_idx + 1,
@@ -1129,7 +1196,7 @@ impl Editor {
         }
     }
 
-    /// Loads a new file from disk into the current editor buffer, protecting against unsaved modifications[span_30](start_span)[span_30](end_span).
+    /// Loads a new file from disk into the current editor buffer, protecting against unsaved modifications.
     pub fn open_file<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
         if self.modified {
             return Err(anyhow!(
@@ -1146,6 +1213,9 @@ impl Editor {
         self.scroll_x = 0;
         self.scroll_y = 0;
         self.modified = false;
+        self.edit_generation = 0;
+        self.saved_generation = 0;
+        self.disk_stamp = file_stamp(&path_buf);
         self.saved_undo_len = 0;
         self.undo_stack.clear();
         self.redo_stack.clear();
@@ -1268,8 +1338,11 @@ impl Editor {
             let (in_tx, in_rx) = mpsc::unbounded_channel::<LspInbound>();
             self.lsp_tx = Some(in_tx);
             self.active_lsp_lang = Some(lang_id.to_string());
+            self.lsp_session = self.lsp_session.wrapping_add(1);
             let p = path.to_path_buf();
             let initial_text = self.rope.to_string();
+            let root = self.project_root.clone();
+            let session = self.lsp_session;
             tokio::spawn(run_lsp_actor(
                 p,
                 lang_id.to_string(),
@@ -1277,11 +1350,13 @@ impl Editor {
                 in_rx,
                 out_tx.clone(),
                 initial_text,
+                root,
+                session,
             ));
         }
     }
 
-    /// Dispatches a reboot request to the active LSP background process[span_31](start_span)[span_31](end_span).
+    /// Dispatches a reboot request to the active LSP background process.
     pub fn restart_lsp(&mut self) {
         if let Some(tx) = &self.lsp_tx {
             let _ = tx.send(LspInbound::Restart);
@@ -1429,7 +1504,7 @@ impl Editor {
         }
     }
 
-    /// Navigates to the next diagnostic in the document[span_32](start_span)[span_32](end_span).
+    /// Navigates to the next diagnostic in the document.
     pub fn next_diagnostic(&mut self) {
         if self.diagnostics.is_empty() {
             self.status_msg = "No diagnostics in buffer".to_string();
@@ -1452,7 +1527,7 @@ impl Editor {
         }
     }
 
-    /// Navigates to the previous diagnostic in the document[span_33](start_span)[span_33](end_span).
+    /// Navigates to the previous diagnostic in the document.
     pub fn prev_diagnostic(&mut self) {
         if self.diagnostics.is_empty() {
             self.status_msg = "No diagnostics in buffer".to_string();
@@ -1476,7 +1551,7 @@ impl Editor {
         }
     }
 
-    /// Converts an LSP position (0-based line, UTF-16 character column) into a character index[span_34](start_span)[span_34](end_span).
+    /// Converts an LSP position (0-based line, UTF-16 character column) into a character index.
     fn lsp_pos_to_char_index(rope: &Rope, line: usize, utf16_col: usize) -> usize {
         let total_lines = rope.len_lines();
         if line >= total_lines {
@@ -1491,7 +1566,7 @@ impl Editor {
         (line_start_char + char_offset).min(rope.len_chars())
     }
 
-    /// Applies a collection of text edits to an arbitrary Rope buffer in descending order[span_35](start_span)[span_35](end_span).
+    /// Applies a collection of text edits to an arbitrary Rope buffer in descending order.
     fn apply_edits_to_rope(rope: &mut Rope, edits: &[TextEditItem]) {
         let mut indexed_edits: Vec<(usize, usize, &str)> = edits
             .iter()
@@ -1517,7 +1592,7 @@ impl Editor {
         }
     }
 
-    /// Applies a collection of LSP text edits cleanly to the current editor buffer[span_36](start_span)[span_36](end_span).
+    /// Applies a collection of LSP text edits cleanly to the current editor buffer.
     pub fn apply_text_edits(&mut self, edits: &[TextEditItem]) {
         if edits.is_empty() {
             return;
@@ -1526,12 +1601,12 @@ impl Editor {
         self.snapshot();
         Self::apply_edits_to_rope(&mut self.rope, edits);
 
-        self.modified = true;
+        self.note_edit();
         self.clamp_cursor();
         self.on_buffer_modified();
     }
 
-    /// Dispatches a project-wide `WorkspaceEdit` map cleanly across disk and memory[span_37](start_span)[span_37](end_span).
+    /// Dispatches a project-wide `WorkspaceEdit` map cleanly across disk and memory.
     pub fn apply_workspace_edits(
         &mut self,
         changes: &HashMap<PathBuf, Vec<TextEditItem>>,
@@ -1556,20 +1631,13 @@ impl Editor {
                 let file = File::open(path)?;
                 let mut ext_rope = Rope::from_reader(file)?;
                 Self::apply_edits_to_rope(&mut ext_rope, edits);
-
-                let tmp_path = path.with_extension("s0_wedit_tmp");
-                {
-                    let out_file = File::create(&tmp_path)?;
-                    let mut writer = BufWriter::new(out_file);
-                    for chunk in ext_rope.chunks() {
+                let rope = ext_rope;
+                atomic_write_with(path, |writer| {
+                    for chunk in rope.chunks() {
                         writer.write_all(chunk.as_bytes())?;
                     }
-                    writer.flush()?;
-                }
-                if fs::rename(&tmp_path, path).is_err() {
-                    fs::copy(&tmp_path, path)?;
-                    let _ = fs::remove_file(&tmp_path);
-                }
+                    Ok(())
+                })?;
                 total_applied += edits.len();
             }
         }
@@ -1577,7 +1645,7 @@ impl Editor {
         Ok(total_applied)
     }
 
-    /// Jumps directly to a target location (file, line, col), opening the target if external[span_38](start_span)[span_38](end_span).
+    /// Jumps directly to a target location (file, line, col), opening the target if external.
     #[allow(clippy::needless_pass_by_value)]
     pub fn jump_to_location(&mut self, loc: LocationItem) {
         let is_current = self
@@ -1605,27 +1673,65 @@ impl Editor {
                     );
                 }
                 Err(e) => {
-                    self.status_msg = format!("Failed to jump to {}: {e}", loc.path.display());
+                    if self.modified {
+                        self.confirm = Some(ConfirmPrompt {
+                            message: format!(
+                                "Unsaved changes. Discard and open {}?",
+                                loc.path.display()
+                            ),
+                            kind: ConfirmKind::DiscardJump(loc),
+                        });
+                        self.status_msg = "Unsaved changes. Confirm discard to jump (y/n).".to_string();
+                    } else {
+                        self.status_msg = format!("Failed to jump to {}: {e}", loc.path.display());
+                    }
                 }
             }
         }
     }
 
-    /// Pushes current buffer state into the undo stack and clears redo history[span_39](start_span)[span_39](end_span).
+    /// Jumps using a character column. Jump-list entries are chars, not UTF-16.
+    pub fn jump_to_char_pos(&mut self, path: PathBuf, line: usize, col: usize) {
+        let is_current = self.path.as_ref().is_some_and(|p| p == &path);
+        if is_current {
+            self.cursor_y = line.min(self.rope.len_lines().saturating_sub(1));
+            self.cursor_x = col;
+            self.clamp_cursor();
+            return;
+        }
+        if self.modified {
+            self.confirm = Some(ConfirmPrompt {
+                message: format!("Unsaved changes. Discard and open {}?", path.display()),
+                kind: ConfirmKind::DiscardJump(LocationItem { path, line, col }),
+            });
+            self.status_msg = "Unsaved changes. Confirm discard to jump (y/n).".to_string();
+            return;
+        }
+        if self.open_file(&path).is_ok() {
+            self.cursor_y = line.min(self.rope.len_lines().saturating_sub(1));
+            self.cursor_x = col;
+            self.clamp_cursor();
+        }
+    }
+
     pub fn snapshot(&mut self) {
         if self.undo_stack.len() >= 64 {
             self.undo_stack.remove(0);
-            self.saved_undo_len = self.saved_undo_len.saturating_sub(1);
         }
         self.undo_stack.push(UndoSnapshot {
             rope: self.rope.clone(),
             cursor_x: self.cursor_x,
             cursor_y: self.cursor_y,
+            generation: self.edit_generation,
         });
         self.redo_stack.clear();
     }
 
-    /// Reverts the document rope to the most recent checkpoint on `undo_stack`[span_40](start_span)[span_40](end_span).
+    fn note_edit(&mut self) {
+        self.edit_generation = self.edit_generation.wrapping_add(1);
+        self.modified = self.edit_generation != self.saved_generation;
+    }
+
     pub fn undo(&mut self) {
         if let Some(prev) = self.undo_stack.pop() {
             if self.redo_stack.len() >= 64 {
@@ -1635,12 +1741,14 @@ impl Editor {
                 rope: self.rope.clone(),
                 cursor_x: self.cursor_x,
                 cursor_y: self.cursor_y,
+                generation: self.edit_generation,
             });
 
             self.rope = prev.rope;
             self.cursor_x = prev.cursor_x;
             self.cursor_y = prev.cursor_y;
-            self.modified = self.undo_stack.len() != self.saved_undo_len;
+            self.edit_generation = prev.generation;
+            self.modified = self.edit_generation != self.saved_generation;
             self.status_msg = "Reverted change".to_string();
             self.insert_snapshot_taken = false;
             self.clamp_cursor();
@@ -1650,23 +1758,23 @@ impl Editor {
         }
     }
 
-    /// Steps forward through historical edits using `redo_stack`[span_41](start_span)[span_41](end_span).
     pub fn redo(&mut self) {
         if let Some(next) = self.redo_stack.pop() {
             if self.undo_stack.len() >= 64 {
                 self.undo_stack.remove(0);
-                self.saved_undo_len = self.saved_undo_len.saturating_sub(1);
             }
             self.undo_stack.push(UndoSnapshot {
                 rope: self.rope.clone(),
                 cursor_x: self.cursor_x,
                 cursor_y: self.cursor_y,
+                generation: self.edit_generation,
             });
 
             self.rope = next.rope;
             self.cursor_x = next.cursor_x;
             self.cursor_y = next.cursor_y;
-            self.modified = self.undo_stack.len() != self.saved_undo_len;
+            self.edit_generation = next.generation;
+            self.modified = self.edit_generation != self.saved_generation;
             self.status_msg = "Redone change".to_string();
             self.insert_snapshot_taken = false;
             self.clamp_cursor();
@@ -1676,7 +1784,7 @@ impl Editor {
         }
     }
 
-    /// Shifts diagnostic coordinates down when lines are added strictly below them[span_42](start_span)[span_42](end_span).
+    /// Shifts diagnostic coordinates down when lines are added strictly below them.
     fn shift_diagnostics_down(&mut self, after_line: usize, count: usize) {
         for d in &mut self.diagnostics {
             if d.line > after_line {
@@ -1686,7 +1794,7 @@ impl Editor {
         }
     }
 
-    /// Shifts diagnostic coordinates down when lines are inserted at or above them[span_43](start_span)[span_43](end_span).
+    /// Shifts diagnostic coordinates down when lines are inserted at or above them.
     fn shift_diagnostics_down_from(&mut self, from_line: usize, count: usize) {
         for d in &mut self.diagnostics {
             if d.line >= from_line {
@@ -1696,7 +1804,7 @@ impl Editor {
         }
     }
 
-    /// Shifts diagnostic coordinates up when a line above them is removed[span_44](start_span)[span_44](end_span).
+    /// Shifts diagnostic coordinates up when a line above them is removed.
     fn shift_diagnostics_up(&mut self, removed_line: usize) {
         self.diagnostics
             .retain(|d| d.line != removed_line && d.end_line != removed_line);
@@ -1718,6 +1826,18 @@ impl Editor {
         let max_lines = self.rope.len_lines().max(1);
         self.diagnostics.retain(|d| d.line < max_lines);
 
+        self.pending_bg = true;
+        self.bg_deadline = Some(Instant::now() + std::time::Duration::from_millis(45));
+    }
+
+    /// Sends the debounced LSP change and Git diff. Called from the event loop.
+    pub fn flush_background(&mut self) {
+        if !self.pending_bg {
+            return;
+        }
+        self.pending_bg = false;
+        self.bg_deadline = None;
+        let text = self.rope.to_string();
         if let Some(tx) = &self.lsp_tx {
             let _ = tx.send(LspInbound::Change {
                 text,
@@ -1726,7 +1846,6 @@ impl Editor {
             self.request_semantic_tokens();
             self.request_inlay_hints();
         }
-
         self.request_git_diff();
     }
 
@@ -1869,7 +1988,7 @@ impl Editor {
             let slice = self.rope.slice(start..end);
             self.clipboard = slice.to_string();
             self.rope.remove(start..end);
-            self.modified = true;
+            self.note_edit();
             self.status_msg = format!("Deleted {} chars", self.clipboard.chars().count());
 
             let new_cursor_line = self.rope.char_to_line(start);
@@ -1901,7 +2020,7 @@ impl Editor {
             self.cursor_y = new_line;
             self.cursor_x = end_idx.saturating_sub(line_start);
             self.set_mode(Mode::Normal);
-            self.modified = true;
+            self.note_edit();
             self.clamp_cursor();
             self.on_buffer_modified();
             self.status_msg = "Pasted from clipboard".to_string();
@@ -1941,7 +2060,7 @@ impl Editor {
             self.cursor_x = end_idx.saturating_sub(line_start);
         }
 
-        self.modified = true;
+        self.note_edit();
         self.clamp_cursor();
         self.on_buffer_modified();
         self.status_msg = "Pasted from clipboard".to_string();
@@ -1965,7 +2084,7 @@ impl Editor {
 
                 self.rope.remove(start..end);
                 self.rope.insert(start, &toggled);
-                self.modified = true;
+                self.note_edit();
                 self.set_mode(Mode::Normal);
                 self.on_buffer_modified();
             }
@@ -1984,7 +2103,7 @@ impl Editor {
                     self.rope.remove(idx..=idx);
                     self.rope.insert_char(idx, toggled);
                     self.cursor_x += 1;
-                    self.modified = true;
+                    self.note_edit();
                     self.clamp_cursor();
                     self.on_buffer_modified();
                 }
@@ -2032,7 +2151,7 @@ impl Editor {
         let line_start = self.rope.line_to_char(self.cursor_y);
         self.cursor_x = insert_pos.saturating_sub(line_start);
 
-        self.modified = true;
+        self.note_edit();
         self.clamp_cursor();
         self.on_buffer_modified();
         self.status_msg = "Joined lines".to_string();
@@ -2081,7 +2200,7 @@ impl Editor {
         self.shift_diagnostics_down(self.cursor_y, 1);
         self.cursor_y += 1;
         self.cursor_x = indent.chars().count();
-        self.modified = true;
+        self.note_edit();
         self.set_mode(Mode::Insert);
         self.insert_snapshot_taken = true;
         self.completion_visible = false;
@@ -2111,7 +2230,7 @@ impl Editor {
         self.rope.insert(idx, &to_insert);
         self.shift_diagnostics_down_from(self.cursor_y, 1);
         self.cursor_x = indent.chars().count();
-        self.modified = true;
+        self.note_edit();
         self.set_mode(Mode::Insert);
         self.insert_snapshot_taken = true;
         self.completion_visible = false;
@@ -2123,17 +2242,26 @@ impl Editor {
         let idx = self.char_index();
         self.rope.insert_char(idx, c);
         self.cursor_x += 1;
-        self.modified = true;
+        self.note_edit();
         self.on_buffer_modified();
     }
 
     pub fn insert_pair(&mut self, open: char, close: char) {
         self.check_insert_snapshot();
         let idx = self.char_index();
-        self.rope.insert_char(idx, open);
-        self.rope.insert_char(idx + 1, close);
+        let next = if idx < self.rope.len_chars() {
+            self.rope.char(idx)
+        } else {
+            '\0'
+        };
+        if next == close || next.is_ascii_alphanumeric() {
+            self.rope.insert_char(idx, open);
+        } else {
+            self.rope.insert_char(idx, open);
+            self.rope.insert_char(idx + 1, close);
+        }
         self.cursor_x += 1;
-        self.modified = true;
+        self.note_edit();
         self.on_buffer_modified();
     }
 
@@ -2178,12 +2306,12 @@ impl Editor {
             self.cursor_x = inner_indent_len(&indent);
         }
 
-        self.modified = true;
+        self.note_edit();
         self.completion_visible = false;
         self.on_buffer_modified();
     }
 
-    /// Dedents current line by up to 4 spaces or 1 tab[span_45](start_span)[span_45](end_span).
+    /// Dedents current line by up to 4 spaces or 1 tab.
     pub fn dedent_current_line(&mut self) {
         if self.cursor_y >= self.rope.len_lines() {
             return;
@@ -2208,7 +2336,7 @@ impl Editor {
         if spaces_to_remove > 0 {
             self.rope.remove(line_start..line_start + spaces_to_remove);
             self.cursor_x = self.cursor_x.saturating_sub(spaces_to_remove);
-            self.modified = true;
+            self.note_edit();
             self.on_buffer_modified();
         }
     }
@@ -2241,7 +2369,7 @@ impl Editor {
             }
 
             self.cursor_x -= 1;
-            self.modified = true;
+            self.note_edit();
             self.on_buffer_modified();
         } else if self.cursor_y > 0 {
             let prev_len = line_len(&self.rope, self.cursor_y - 1);
@@ -2260,7 +2388,7 @@ impl Editor {
 
             self.cursor_y -= 1;
             self.cursor_x = prev_len;
-            self.modified = true;
+            self.note_edit();
             self.on_buffer_modified();
         }
 
@@ -2282,27 +2410,38 @@ impl Editor {
 
         self.snapshot();
         let item = self.completions[self.completion_idx].clone();
-        let replacement = item.insert_text;
-        let prefix = self.current_word_prefix();
-        let prefix_len = prefix.chars().count();
+        let replacement = item.insert_text.clone();
 
-        let idx = self.char_index();
-        let start = idx.saturating_sub(prefix_len);
-
-        self.rope.remove(start..idx);
-        self.rope.insert(start, &replacement);
-
-        let end_idx = start + replacement.chars().count();
-        let new_line = self.rope.char_to_line(end_idx);
-        let line_start = self.rope.line_to_char(new_line);
-        self.cursor_y = new_line;
-        self.cursor_x = end_idx.saturating_sub(line_start);
-
-        if !item.additional_text_edits.is_empty() {
-            self.apply_text_edits(&item.additional_text_edits);
+        if let Some(edit) = &item.primary_edit {
+            let mut edits = item.additional_text_edits.clone();
+            edits.push(TextEditItem {
+                new_text: replacement,
+                ..edit.clone()
+            });
+            Self::apply_edits_to_rope(&mut self.rope, &edits);
+            let end_idx = Self::lsp_pos_to_char_index(&self.rope, edit.end_line, edit.end_col);
+            let new_line = self.rope.char_to_line(end_idx.min(self.rope.len_chars()));
+            let line_start = self.rope.line_to_char(new_line);
+            self.cursor_y = new_line;
+            self.cursor_x = end_idx.saturating_sub(line_start);
+        } else {
+            let prefix = self.current_word_prefix();
+            let prefix_len = prefix.chars().count();
+            let idx = self.char_index();
+            let start = idx.saturating_sub(prefix_len);
+            self.rope.remove(start..idx);
+            self.rope.insert(start, &replacement);
+            if !item.additional_text_edits.is_empty() {
+                Self::apply_edits_to_rope(&mut self.rope, &item.additional_text_edits);
+            }
+            let end_idx = start + replacement.chars().count();
+            let new_line = self.rope.char_to_line(end_idx.min(self.rope.len_chars()));
+            let line_start = self.rope.line_to_char(new_line);
+            self.cursor_y = new_line;
+            self.cursor_x = end_idx.saturating_sub(line_start);
         }
 
-        self.modified = true;
+        self.note_edit();
         self.completion_visible = false;
         self.clamp_cursor();
         self.on_buffer_modified();
@@ -2315,7 +2454,7 @@ impl Editor {
             let idx = self.char_index();
             self.clipboard = self.rope.char(idx).to_string();
             self.rope.remove(idx..=idx);
-            self.modified = true;
+            self.note_edit();
             self.clamp_cursor();
             self.on_buffer_modified();
         }
@@ -2348,7 +2487,7 @@ impl Editor {
         }
 
         self.shift_diagnostics_up(current_y);
-        self.modified = true;
+        self.note_edit();
         self.status_msg = "Cut line".to_string();
         self.on_buffer_modified();
 
@@ -2358,33 +2497,27 @@ impl Editor {
         self.clamp_cursor();
     }
 
-    pub fn save(&mut self) -> Result<()> {
-        if let Some(path) = &self.path {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
+    pub fn save_with(&mut self, force: bool) -> Result<()> {
+        if let Some(path) = &self.path.clone() {
+            if !force
+                && let Some(stamp) = file_stamp(path)
+                && self.disk_stamp.is_some()
+                && self.disk_stamp != Some(stamp)
+            {
+                self.status_msg = "File changed on disk. Use :w! to overwrite.".to_string();
+                return Err(anyhow!("file changed on disk"));
             }
 
-            let file_name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("s0_buffer");
-            let tmp_path = path.with_file_name(format!(".{file_name}.s0_tmp"));
-
-            {
-                let file = File::create(&tmp_path)?;
-                let mut writer = BufWriter::new(file);
+            atomic_write_with(path, |writer| {
                 for chunk in self.rope.chunks() {
                     writer.write_all(chunk.as_bytes())?;
                 }
-                writer.flush()?;
-            }
-
-            if let Err(_e) = fs::rename(&tmp_path, path) {
-                fs::copy(&tmp_path, path)?;
-                let _ = fs::remove_file(&tmp_path);
-            }
+                Ok(())
+            })?;
 
             self.modified = false;
+            self.saved_generation = self.edit_generation;
+            self.disk_stamp = file_stamp(path);
             self.saved_undo_len = self.undo_stack.len();
             self.status_msg = format!("Saved {}", path.display());
 
@@ -2400,6 +2533,10 @@ impl Editor {
             self.status_msg = "No file name (use :w <name>)".to_string();
             Err(anyhow!("No file name specified"))
         }
+    }
+
+    pub fn save(&mut self) -> Result<()> {
+        self.save_with(false)
     }
 
     pub fn execute_palette_command(&mut self, id: CommandId) {
@@ -2553,11 +2690,22 @@ impl Editor {
             "q!" => {
                 self.should_quit = true;
             }
-            "w" => {
+            "w" | "w!" => {
+                let force = action == "w!";
                 if let Some(filename) = arg.filter(|s| !s.is_empty()) {
-                    self.switch_file_target(PathBuf::from(filename));
+                    let target = PathBuf::from(filename);
+                    if !force && target.exists() && self.path.as_ref() != Some(&target) {
+                        self.confirm = Some(ConfirmPrompt {
+                            message: format!("Overwrite {}?", target.display()),
+                            kind: ConfirmKind::Overwrite(target),
+                        });
+                        self.status_msg = "File exists. Overwrite? (y/n)".to_string();
+                        self.set_mode(Mode::Normal);
+                        return;
+                    }
+                    self.switch_file_target(target);
                 }
-                if let Err(e) = self.save() {
+                if let Err(e) = self.save_with(force) {
                     self.status_msg = format!("Error saving: {e}");
                 }
             }
@@ -2572,6 +2720,8 @@ impl Editor {
             }
             "wrap" => {
                 self.line_wrap = !self.line_wrap;
+                self.config.line_wrap = self.line_wrap;
+                let _ = self.config.save();
                 self.status_msg =
                     format!("Line Wrap: {}", if self.line_wrap { "ON" } else { "OFF" });
             }
@@ -2703,6 +2853,83 @@ impl Editor {
         }
     }
 
+    pub fn answer_confirm(&mut self, yes: bool) {
+        let Some(prompt) = self.confirm.take() else {
+            return;
+        };
+        if !yes {
+            self.status_msg = "Cancelled".to_string();
+            return;
+        }
+        match prompt.kind {
+            ConfirmKind::Overwrite(path) => {
+                self.switch_file_target(path);
+                if let Err(e) = self.save_with(true) {
+                    self.status_msg = format!("Error saving: {e}");
+                }
+            }
+            ConfirmKind::DiscardJump(loc) => {
+                self.modified = false;
+                self.saved_generation = self.edit_generation;
+                let col = loc.col;
+                let line = loc.line;
+                match self.open_file(&loc.path) {
+                    Ok(()) => {
+                        self.cursor_y = line.min(self.rope.len_lines().saturating_sub(1));
+                        self.cursor_x = col;
+                        self.clamp_cursor();
+                        self.status_msg = format!("Opened {}", loc.path.display());
+                    }
+                    Err(e) => self.status_msg = format!("Jump failed: {e}"),
+                }
+            }
+        }
+    }
+
+    pub fn apply_server_edit(&mut self, changes: &HashMap<PathBuf, Vec<TextEditItem>>) -> bool {
+        match self.apply_workspace_edits(changes) {
+            Ok(count) => {
+                self.status_msg = format!("Applied workspace edit ({count} edits)");
+                true
+            }
+            Err(e) => {
+                self.status_msg = format!("Workspace edit failed: {e}");
+                false
+            }
+        }
+    }
+
+    pub fn execute_code_action(&mut self, index: usize) {
+        let Some(picker) = self.code_action_picker.clone() else {
+            return;
+        };
+        let Some(action) = picker.actions.get(index) else {
+            return;
+        };
+        if !action.edits.is_empty() {
+            match self.apply_workspace_edits(&action.edits) {
+                Ok(_) => self.status_msg = format!("Applied: {}", action.title),
+                Err(e) => self.status_msg = format!("Action application error: {e}"),
+            }
+        }
+        if let Some(command) = &action.command {
+            if let Some(tx) = &self.lsp_tx {
+                self.lsp_req_id += 1;
+                let _ = tx.send(LspInbound::ExecuteCommand {
+                    command: command.clone(),
+                    arguments: action.command_args.clone(),
+                    req_id: self.lsp_req_id,
+                });
+                self.status_msg = format!("Running {}", action.title);
+            } else if action.edits.is_empty() {
+                self.status_msg = format!("No edit for {}", action.title);
+            }
+        } else if action.edits.is_empty() {
+            self.status_msg = format!("No edit for {}", action.title);
+        }
+        self.code_action_picker = None;
+    }
+
     pub fn clamp_cursor(&mut self) {
         let max_lines = self.rope.len_lines().max(1);
         if self.cursor_y >= max_lines {
@@ -2720,7 +2947,7 @@ impl Editor {
         }
     }
 
-    /// Viewport updater that guarantees instant response on large files[span_46](start_span)[span_46](end_span).
+    /// Viewport updater that guarantees instant response on large files.
     pub fn update_scroll(&mut self, width: usize, height: usize) {
         if height == 0 || width == 0 {
             return;

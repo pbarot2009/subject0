@@ -18,7 +18,9 @@
 //!      references, workspace edits, document symbols, code actions, diagnostics, and
 //!      inlay hints) into buffer-aligned editor types.
 
-pub use crate::syntax::*;
+pub use crate::syntax::{
+    DynamicGrammar, SupportedLanguage, completion_kind_icon, file_icon_and_color, symbol_kind_icon,
+};
 
 use anyhow::{Result, anyhow};
 use lsp_types::{
@@ -86,6 +88,8 @@ pub struct SuggestionItem {
     pub detail: Option<String>,
     pub documentation: Option<String>,
     pub kind: u64,
+    /// LSP `textEdit` range. When set, accept this range instead of the word prefix.
+    pub primary_edit: Option<TextEditItem>,
     pub additional_text_edits: Vec<TextEditItem>,
 }
 
@@ -150,6 +154,9 @@ pub struct CodeActionItem {
     pub kind: Option<String>,
     pub is_preferred: bool,
     pub edits: HashMap<PathBuf, Vec<TextEditItem>>,
+    /// Server command to execute when the action has no embedded edit.
+    pub command: Option<String>,
+    pub command_args: Vec<Value>,
 }
 
 /// Document outline symbol (function, struct, method, variable, enum, etc.).
@@ -351,6 +358,16 @@ pub enum LspInbound {
         req_id: i64,
     },
     Restart,
+    /// Result of a server-requested `workspace/applyEdit`.
+    ApplyEditResult {
+        req_id: Value,
+        applied: bool,
+    },
+    ExecuteCommand {
+        command: String,
+        arguments: Vec<Value>,
+        req_id: i64,
+    },
 }
 
 /// Outbound messages received from the background LSP actor.
@@ -401,6 +418,17 @@ pub enum LspOutbound {
         req_id: i64,
         symbols: Vec<SymbolItem>,
     },
+    /// Server asked the client to apply a workspace edit. Reply via `ApplyEditResult`.
+    ServerApplyEdit {
+        req_id: Value,
+        changes: HashMap<PathBuf, Vec<TextEditItem>>,
+    },
+}
+
+/// Session-tagged outbound event. Stale sessions are ignored by the editor.
+pub struct LspEvent {
+    pub session: u64,
+    pub body: LspOutbound,
 }
 
 // === Cross-Platform Path & Directory Resolution ===
@@ -560,6 +588,26 @@ pub fn utf16_to_char_col(line: &str, utf16_col: usize) -> usize {
         char_count += 1;
     }
     char_count
+}
+
+/// Slices `s` by UTF-16 code units. LSP ranges are UTF-16, not bytes.
+pub fn slice_utf16(s: &str, start: usize, end: usize) -> String {
+    if start >= end {
+        return String::new();
+    }
+    let mut utf16 = 0usize;
+    let mut out = String::new();
+    for c in s.chars() {
+        let next = utf16 + c.len_utf16();
+        if next > start && utf16 < end {
+            out.push(c);
+        }
+        utf16 = next;
+        if utf16 >= end {
+            break;
+        }
+    }
+    out
 }
 
 pub fn char_to_utf16_col(line: &str, char_col: usize) -> usize {
@@ -783,32 +831,43 @@ fn parse_lsp_completions(val: Value) -> Vec<SuggestionItem> {
 
     let mut suggestions = Vec::with_capacity(items.len());
     for item in items {
-        let insert_text = if let Some(it) = item.insert_text {
+        let insert_text = if let Some(it) = item.insert_text.clone() {
             if item.insert_text_format == Some(InsertTextFormat::SNIPPET) {
                 parse_snippet_to_plain_text(&it)
             } else {
                 it
             }
-        } else if let Some(edit) = item.text_edit {
+        } else if let Some(edit) = &item.text_edit {
             match edit {
                 CompletionTextEdit::Edit(te) => {
                     if item.insert_text_format == Some(InsertTextFormat::SNIPPET) {
                         parse_snippet_to_plain_text(&te.new_text)
                     } else {
-                        te.new_text
+                        te.new_text.clone()
                     }
                 }
                 CompletionTextEdit::InsertAndReplace(ir) => {
                     if item.insert_text_format == Some(InsertTextFormat::SNIPPET) {
                         parse_snippet_to_plain_text(&ir.new_text)
                     } else {
-                        ir.new_text
+                        ir.new_text.clone()
                     }
                 }
             }
         } else {
             item.label.clone()
         };
+
+        let primary_edit = item.text_edit.as_ref().map(|edit| match edit {
+            CompletionTextEdit::Edit(te) => text_edit_to_item(te.clone()),
+            CompletionTextEdit::InsertAndReplace(ir) => TextEditItem {
+                start_line: ir.insert.start.line as usize,
+                start_col: ir.insert.start.character as usize,
+                end_line: ir.insert.end.line as usize,
+                end_col: ir.insert.end.character as usize,
+                new_text: ir.new_text.clone(),
+            },
+        });
 
         let documentation = item.documentation.map(|doc| match doc {
             Documentation::String(s) => s,
@@ -830,6 +889,7 @@ fn parse_lsp_completions(val: Value) -> Vec<SuggestionItem> {
             detail: item.detail,
             documentation,
             kind,
+            primary_edit,
             additional_text_edits,
         });
     }
@@ -908,11 +968,7 @@ fn parse_lsp_signature_help(val: Value) -> Option<SignatureHelpInfo> {
         match &p_info.label {
             ParameterLabel::Simple(s) => parameter_label = Some(s.clone()),
             ParameterLabel::LabelOffsets([start, end]) => {
-                let s_idx = *start as usize;
-                let e_idx = *end as usize;
-                if s_idx <= e_idx && e_idx <= signature_label.len() {
-                    parameter_label = Some(signature_label[s_idx..e_idx].to_string());
-                }
+                parameter_label = Some(slice_utf16(&signature_label, *start as usize, *end as usize));
             }
         }
     }
@@ -1040,12 +1096,20 @@ fn parse_lsp_code_actions(val: Value) -> Vec<CodeActionItem> {
     for item in resp {
         match item {
             CodeActionOrCommand::CodeAction(ca) => {
+                let command = ca.command.as_ref().map(|cmd| cmd.command.clone());
+                let command_args = ca
+                    .command
+                    .as_ref()
+                    .and_then(|cmd| cmd.arguments.clone())
+                    .unwrap_or_default();
                 let edits = ca.edit.map(parse_lsp_workspace_edit).unwrap_or_default();
                 actions.push(CodeActionItem {
                     title: ca.title,
                     kind: ca.kind.map(|k| k.as_str().to_string()),
                     is_preferred: ca.is_preferred.unwrap_or(false),
                     edits,
+                    command,
+                    command_args,
                 });
             }
             CodeActionOrCommand::Command(cmd) => {
@@ -1054,6 +1118,8 @@ fn parse_lsp_code_actions(val: Value) -> Vec<CodeActionItem> {
                     kind: None,
                     is_preferred: false,
                     edits: HashMap::new(),
+                    command: Some(cmd.command),
+                    command_args: cmd.arguments.unwrap_or_default(),
                 });
             }
         }
@@ -1494,16 +1560,26 @@ pub async fn run_lsp_actor(
     initial_lang: String,
     server_cmd: String,
     mut rx: mpsc::UnboundedReceiver<LspInbound>,
-    tx: mpsc::UnboundedSender<LspOutbound>,
+    tx: mpsc::UnboundedSender<LspEvent>,
     initial_text: String,
+    project_root: PathBuf,
+    session_id: u64,
 ) {
+    fn emit(tx: &mpsc::UnboundedSender<LspEvent>, session: u64, body: LspOutbound) {
+        let _ = tx.send(LspEvent { session, body });
+    }
+
     let (resolved_cmd, args) = server_cmd_and_args(&server_cmd);
     let Some(bin_path) = resolve_binary_path(&resolved_cmd) else {
-        let _ = tx.send(LspOutbound::Status(LspStatus::NotFound(server_cmd)));
+        emit(&tx, session_id, LspOutbound::Status(LspStatus::NotFound(server_cmd)));
         return;
     };
 
-    let root_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let root_dir = if project_root.as_os_str().is_empty() {
+        env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    } else {
+        project_root
+    };
     let root_uri_str = file_to_uri(&root_dir);
     let root_uri = root_uri_str
         .parse::<Uri>()
@@ -1514,20 +1590,24 @@ pub async fn run_lsp_actor(
     let mut current_text = initial_text;
     let mut current_version = 1i32;
     let mut restart_attempts = 0usize;
-    let mut session_id = 0u64;
 
     'supervisor: loop {
-        session_id += 1;
-        let active_session = session_id;
-        let _ = tx.send(LspOutbound::Status(LspStatus::Starting(server_cmd.clone())));
+        emit(&tx, session_id, LspOutbound::Status(LspStatus::Starting(server_cmd.clone())));
 
         let (mut child, mut stdin, mut stdout) = match spawn_lsp_child(&bin_path, &args) {
             Ok(triplet) => triplet,
             Err(e) => {
-                let _ = tx.send(LspOutbound::Status(LspStatus::Error(format!(
-                    "Failed to start: {e}"
-                ))));
-                return;
+                emit(
+                    &tx,
+                    session_id,
+                    LspOutbound::Status(LspStatus::Error(format!("Failed to start: {e}"))),
+                );
+                restart_attempts += 1;
+                if restart_attempts > 5 {
+                    return;
+                }
+                sleep(Duration::from_millis(400 * (1 << (restart_attempts - 1)))).await;
+                continue;
             }
         };
 
@@ -1535,11 +1615,25 @@ pub async fn run_lsp_actor(
             match perform_handshake(&mut stdin, &mut stdout, &root_dir, &root_uri).await {
                 Ok(legend) => legend,
                 Err(e) => {
-                    let _ = tx.send(LspOutbound::Status(LspStatus::Error(format!(
-                        "Handshake failed: {e}"
-                    ))));
+                    emit(
+                        &tx,
+                        session_id,
+                        LspOutbound::Status(LspStatus::Error(format!("Handshake failed: {e}"))),
+                    );
                     let _ = child.kill().await;
-                    return;
+                    restart_attempts += 1;
+                    if restart_attempts > 5 {
+                        emit(
+                            &tx,
+                            session_id,
+                            LspOutbound::Status(LspStatus::Error(format!(
+                                "Server '{server_cmd}' failed handshake repeatedly."
+                            ))),
+                        );
+                        return;
+                    }
+                    sleep(Duration::from_millis(400 * (1 << (restart_attempts - 1)))).await;
+                    continue;
                 }
             };
 
@@ -1561,7 +1655,7 @@ pub async fn run_lsp_actor(
             let _ = send_lsp_message(&mut stdin, &did_open).await;
         }
 
-        let _ = tx.send(LspOutbound::Status(LspStatus::Ready(server_cmd.clone())));
+        emit(&tx, session_id, LspOutbound::Status(LspStatus::Ready(server_cmd.clone())));
         if restart_attempts > 0 {
             restart_attempts = 0;
         }
@@ -1899,6 +1993,27 @@ pub async fn run_lsp_actor(
                                 let _ = send_lsp_message(&mut stdin, &ds_req).await;
                             }
                         }
+                        Some(LspInbound::ApplyEditResult { req_id, applied }) => {
+                            let resp = serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": req_id,
+                                "result": { "applied": applied }
+                            });
+                            let _ = send_lsp_message(&mut stdin, &resp).await;
+                        }
+                        Some(LspInbound::ExecuteCommand { command, arguments, req_id }) => {
+                            pending_requests.insert(req_id, "executeCommand");
+                            let exec = serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": req_id,
+                                "method": "workspace/executeCommand",
+                                "params": {
+                                    "command": command,
+                                    "arguments": arguments
+                                }
+                            });
+                            let _ = send_lsp_message(&mut stdin, &exec).await;
+                        }
                         None => {
                             graceful_shutdown(&mut stdin, &mut stdout).await;
                             return;
@@ -1907,18 +2022,28 @@ pub async fn run_lsp_actor(
                 }
                 msg = read_lsp_message(&mut stdout) => {
                     if let Ok(json) = msg {
-                        if active_session != session_id {
-                            continue;
-                        }
                         if let Some(method) = json.get("method").and_then(Value::as_str) {
                             if method == "textDocument/publishDiagnostics" {
                                 if let Some(params) = json.get("params").cloned()
                                     && let Ok((diag_uri, diags)) = parse_lsp_diagnostics(params) {
                                         let current_uri = file_to_uri(&current_file);
                                         if uris_match(&diag_uri, &current_uri) {
-                                            let _ = tx.send(LspOutbound::Diagnostics(diags));
+                                            emit(&tx, session_id, LspOutbound::Diagnostics(diags));
                                         }
                                     }
+                            } else if method == "workspace/applyEdit" {
+                                if let Some(req_id) = json.get("id").cloned() {
+                                    let params = json.get("params").cloned().unwrap_or(Value::Null);
+                                    let edit_val = params.get("edit").cloned().unwrap_or(params);
+                                    let changes = serde_json::from_value::<WorkspaceEdit>(edit_val)
+                                        .map(parse_lsp_workspace_edit)
+                                        .unwrap_or_default();
+                                    emit(
+                                        &tx,
+                                        session_id,
+                                        LspOutbound::ServerApplyEdit { req_id, changes },
+                                    );
+                                }
                             } else if let Some(req_id) = json.get("id") {
                                 let resp = serde_json::json!({
                                     "jsonrpc": "2.0",
@@ -1927,8 +2052,6 @@ pub async fn run_lsp_actor(
                                         serde_json::json!([{}])
                                     } else if method == "workspace/workspaceFolders" {
                                         serde_json::json!([{ "uri": root_uri.as_str(), "name": "root" }])
-                                    } else if method == "workspace/applyEdit" {
-                                        serde_json::json!({ "applied": true })
                                     } else {
                                         Value::Null
                                     }
@@ -1943,44 +2066,44 @@ pub async fn run_lsp_actor(
                                     "completion" => {
                                         last_completion_req = None;
                                         let items = parse_lsp_completions(result_val);
-                                        let _ = tx.send(LspOutbound::Completions { req_id: resp_id, items });
+                                        emit(&tx, session_id, LspOutbound::Completions { req_id: resp_id, items });
                                     }
                                     "hover" => {
                                         let hover = parse_lsp_hover(result_val);
-                                        let _ = tx.send(LspOutbound::Hover { req_id: resp_id, hover });
+                                        emit(&tx, session_id, LspOutbound::Hover { req_id: resp_id, hover });
                                     }
                                     "signatureHelp" => {
                                         let help = parse_lsp_signature_help(result_val);
-                                        let _ = tx.send(LspOutbound::SignatureHelp { req_id: resp_id, help });
+                                        emit(&tx, session_id, LspOutbound::SignatureHelp { req_id: resp_id, help });
                                     }
                                     "definition" => {
                                         let locations = parse_lsp_locations(result_val);
-                                        let _ = tx.send(LspOutbound::Definition { req_id: resp_id, locations });
+                                        emit(&tx, session_id, LspOutbound::Definition { req_id: resp_id, locations });
                                     }
                                     "references" => {
                                         let locations = parse_lsp_locations(result_val);
-                                        let _ = tx.send(LspOutbound::References { req_id: resp_id, locations });
+                                        emit(&tx, session_id, LspOutbound::References { req_id: resp_id, locations });
                                     }
                                     "formatting" => {
                                         let edits = parse_lsp_formatting(result_val);
-                                        let _ = tx.send(LspOutbound::Formatting { req_id: resp_id, edits });
+                                        emit(&tx, session_id, LspOutbound::Formatting { req_id: resp_id, edits });
                                     }
                                     "codeAction" => {
                                         let actions = parse_lsp_code_actions(result_val);
-                                        let _ = tx.send(LspOutbound::CodeActions { req_id: resp_id, actions });
+                                        emit(&tx, session_id, LspOutbound::CodeActions { req_id: resp_id, actions });
                                     }
                                     "rename" => {
                                         let edit: WorkspaceEdit = serde_json::from_value(result_val).unwrap_or_default();
                                         let changes = parse_lsp_workspace_edit(edit);
-                                        let _ = tx.send(LspOutbound::Rename { req_id: resp_id, changes });
+                                        emit(&tx, session_id, LspOutbound::Rename { req_id: resp_id, changes });
                                     }
                                     "documentSymbol" => {
                                         let symbols = parse_lsp_document_symbols(result_val);
-                                        let _ = tx.send(LspOutbound::DocumentSymbols { req_id: resp_id, symbols });
+                                        emit(&tx, session_id, LspOutbound::DocumentSymbols { req_id: resp_id, symbols });
                                     }
                                     "inlayHints" => {
                                         let hints = parse_lsp_inlay_hints(result_val);
-                                        let _ = tx.send(LspOutbound::InlayHints { req_id: resp_id, hints });
+                                        emit(&tx, session_id, LspOutbound::InlayHints { req_id: resp_id, hints });
                                     }
                                     "semanticTokens" => {
                                         let mut tokens = Vec::new();
@@ -2013,7 +2136,22 @@ pub async fn run_lsp_actor(
                                                     });
                                                 }
                                             }
-                                        let _ = tx.send(LspOutbound::SemanticTokens { tokens });
+                                        emit(&tx, session_id, LspOutbound::SemanticTokens { tokens });
+                                    }
+                                    "executeCommand" => {
+                                        if let Ok(edit) = serde_json::from_value::<WorkspaceEdit>(result_val) {
+                                            let changes = parse_lsp_workspace_edit(edit);
+                                            if !changes.is_empty() {
+                                                emit(
+                                                    &tx,
+                                                    session_id,
+                                                    LspOutbound::ServerApplyEdit {
+                                                        req_id: Value::Null,
+                                                        changes,
+                                                    },
+                                                );
+                                            }
+                                        }
                                     }
                                     _ => {}
                                 }
@@ -2036,7 +2174,7 @@ pub async fn run_lsp_actor(
         if child_crashed {
             restart_attempts += 1;
             if restart_attempts > 5 {
-                let _ = tx.send(LspOutbound::Status(LspStatus::Error(format!(
+                emit(&tx, session_id, LspOutbound::Status(LspStatus::Error(format!(
                     "Server '{server_cmd}' crashed repeatedly. Reboot halted."
                 ))));
                 while let Some(inbound) = rx.recv().await {
@@ -2049,10 +2187,23 @@ pub async fn run_lsp_actor(
             }
 
             let backoff = Duration::from_millis(400 * (1 << (restart_attempts - 1)));
-            let _ = tx.send(LspOutbound::Status(LspStatus::Starting(format!(
+            emit(&tx, session_id, LspOutbound::Status(LspStatus::Starting(format!(
                 "{server_cmd} (restarting in {backoff:?}...)"
             ))));
             sleep(backoff).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::slice_utf16;
+
+    #[test]
+    fn utf16_slice_does_not_panic_on_non_ascii() {
+        let label = "fn café(名前: &str)";
+        assert_eq!(slice_utf16(label, 3, 7), "café");
+        assert_eq!(slice_utf16(label, 8, 10), "名前");
+        assert!(slice_utf16(label, 20, 40).is_empty() || slice_utf16(label, 4, 4).is_empty());
     }
 }

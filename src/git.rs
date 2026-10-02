@@ -441,6 +441,7 @@ pub enum GitInbound {
     /// Dispatched on buffer typing or modifications.
     UpdateBuffer { path: PathBuf, text: String },
     /// Dispatched on file open, save, or manual refresh.
+    #[allow(dead_code)]
     Refresh { path: PathBuf, text: String },
 }
 
@@ -479,10 +480,11 @@ pub async fn run_git_actor(
 
         for (path, text) in pending_batches {
             let sender = tx.clone();
-            tokio::task::spawn_blocking(move || {
-                let summary = compute_diff(&path, &text);
-                let _ = sender.send(GitOutbound::DiffSummary { path, summary });
-            });
+            let path_for_job = path.clone();
+            let summary = tokio::task::spawn_blocking(move || compute_diff(&path_for_job, &text))
+                .await
+                .unwrap_or_default();
+            let _ = sender.send(GitOutbound::DiffSummary { path, summary });
         }
     }
 }

@@ -2,5 +2,7 @@
   "line_wrap": true,
   "preferred_lsps": {
     "rust": "rust-analyzer"
-  }
+  },
+  "show_inlay_hints": true,
+  "theme": "gruber-darker"
 }

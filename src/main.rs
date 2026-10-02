@@ -10,6 +10,7 @@ mod editor;
 mod git;
 mod lsp;
 mod nerdfonts;
+mod safe_io;
 mod syntax;
 mod theme;
 mod ui;
@@ -32,14 +33,17 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend, layout::Size};
 use tokio::sync::mpsc;
 
-use editor::{CodeActionPicker, Editor, Focus, LocationPicker, Mode, SymbolPicker};
+use editor::{
+    CodeActionPicker, Editor, Focus, HitAction, LocationPicker, LspPicker, Mode, SymbolPicker,
+    ThemePicker,
+};
 use git::{GitInbound, GitOutbound, run_git_actor};
-use lsp::{LspOutbound, LspStatus, SuggestionItem, utf16_to_char_col};
+use lsp::{LspEvent, LspOutbound, LspStatus, SuggestionItem, utf16_to_char_col};
 use theme::Theme;
 use ui::render_ui;
 
 /// RAII Terminal Guard ensuring the host terminal is reliably restored
-/// to canonical mode regardless of exit status[span_8](start_span)[span_8](end_span).
+/// to canonical mode regardless of exit status.
 struct TerminalGuard;
 
 impl TerminalGuard {
@@ -61,7 +65,7 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// Configures the terminal hardware cursor geometry based on the active modal editing state[span_9](start_span)[span_9](end_span).
+/// Configures the terminal hardware cursor geometry based on the active modal editing state.
 fn set_terminal_cursor_style(mode: Mode) {
     let mut stdout = stdout();
     match mode {
@@ -75,7 +79,7 @@ fn set_terminal_cursor_style(mode: Mode) {
     let _ = stdout.flush();
 }
 
-/// Registers a secondary panic hook ensuring screen recovery during thread unwinding[span_10](start_span)[span_10](end_span).
+/// Registers a secondary panic hook ensuring screen recovery during thread unwinding.
 fn setup_panic_hook() {
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -119,9 +123,13 @@ async fn main() -> Result<()> {
         editor.cursor_y = line.saturating_sub(1);
         editor.clamp_cursor();
     }
+    if let Some(col) = cli_args.jump_col {
+        editor.cursor_x = col.saturating_sub(1);
+        editor.clamp_cursor();
+    }
 
-    // Initialize LSP messaging pipeline[span_11](start_span)[span_11](end_span)
-    let (lsp_out_tx, mut lsp_out_rx) = mpsc::unbounded_channel::<LspOutbound>();
+    // Initialize LSP messaging pipeline
+    let (lsp_out_tx, mut lsp_out_rx) = mpsc::unbounded_channel::<LspEvent>();
     editor.lsp_out_tx = Some(lsp_out_tx.clone());
 
     // Initialize background Git actor pipeline
@@ -144,10 +152,13 @@ async fn main() -> Result<()> {
     while !editor.should_quit {
         let mut received_bg_msg = false;
 
-        // Drain LSP background messages[span_12](start_span)[span_12](end_span)
-        while let Ok(msg) = lsp_out_rx.try_recv() {
+        // Drain LSP background messages
+        while let Ok(event) = lsp_out_rx.try_recv() {
+            if event.session != editor.lsp_session {
+                continue;
+            }
             received_bg_msg = true;
-            match msg {
+            match event.body {
                 LspOutbound::Status(s) => {
                     let was_ready = matches!(s, LspStatus::Ready(_));
                     editor.lsp_status = s;
@@ -160,10 +171,15 @@ async fn main() -> Result<()> {
                     editor.syntax.set_semantic_tokens(tokens);
                 }
                 LspOutbound::Diagnostics(d) => editor.diagnostics = d,
-                LspOutbound::InlayHints { req_id: _, hints } => {
-                    editor.inlay_hints = hints;
+                LspOutbound::InlayHints { req_id, hints } => {
+                    if req_id == editor.lsp_req_id {
+                        editor.inlay_hints = hints;
+                    }
                 }
-                LspOutbound::Hover { req_id: _, hover } => {
+                LspOutbound::Hover { req_id, hover } => {
+                    if req_id != editor.lsp_req_id {
+                        continue;
+                    }
                     if let Some(info) = hover {
                         editor.hover_info = Some(info);
                         editor.hover_scroll = 0;
@@ -172,8 +188,10 @@ async fn main() -> Result<()> {
                         editor.status_msg = "No hover documentation available".to_string();
                     }
                 }
-                LspOutbound::SignatureHelp { req_id: _, help } => {
-                    editor.signature_help = help;
+                LspOutbound::SignatureHelp { req_id, help } => {
+                    if req_id == editor.lsp_req_id {
+                        editor.signature_help = help;
+                    }
                 }
                 LspOutbound::Definition {
                     req_id: _,
@@ -211,7 +229,10 @@ async fn main() -> Result<()> {
                         });
                     }
                 }
-                LspOutbound::Formatting { req_id: _, edits } => {
+                LspOutbound::Formatting { req_id, edits } => {
+                    if req_id != editor.lsp_req_id {
+                        continue;
+                    }
                     if edits.is_empty() {
                         editor.status_msg = "Buffer already formatted".to_string();
                     } else {
@@ -219,7 +240,10 @@ async fn main() -> Result<()> {
                         editor.status_msg = "Formatted document with LSP".to_string();
                     }
                 }
-                LspOutbound::CodeActions { req_id: _, actions } => {
+                LspOutbound::CodeActions { req_id, actions } => {
+                    if req_id != editor.lsp_req_id {
+                        continue;
+                    }
                     if actions.is_empty() {
                         editor.status_msg = "No code actions available at cursor".to_string();
                     } else {
@@ -229,7 +253,10 @@ async fn main() -> Result<()> {
                         });
                     }
                 }
-                LspOutbound::Rename { req_id: _, changes } => {
+                LspOutbound::Rename { req_id, changes } => {
+                    if req_id != editor.lsp_req_id {
+                        continue;
+                    }
                     match editor.apply_workspace_edits(&changes) {
                         Ok(count) => {
                             editor.status_msg =
@@ -240,7 +267,10 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
-                LspOutbound::DocumentSymbols { req_id: _, symbols } => {
+                LspOutbound::DocumentSymbols { req_id, symbols } => {
+                    if req_id != editor.lsp_req_id {
+                        continue;
+                    }
                     if symbols.is_empty() {
                         editor.status_msg = "No document symbols found".to_string();
                     } else {
@@ -301,6 +331,14 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
+                LspOutbound::ServerApplyEdit { req_id, changes } => {
+                    let applied = editor.apply_server_edit(&changes);
+                    if !req_id.is_null()
+                        && let Some(tx) = &editor.lsp_tx
+                    {
+                        let _ = tx.send(lsp::LspInbound::ApplyEditResult { req_id, applied });
+                    }
+                }
             }
         }
 
@@ -320,6 +358,15 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+        }
+
+        if editor.pending_bg
+            && editor
+                .bg_deadline
+                .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            editor.flush_background();
+            needs_redraw = true;
         }
 
         if received_bg_msg {
@@ -366,21 +413,149 @@ async fn main() -> Result<()> {
 
 // === Touch & Mouse Handling ===
 
+fn apply_hit(editor: &mut Editor, action: HitAction) {
+    match action {
+        HitAction::ToggleExplorer => {
+            editor.explorer.visible = !editor.explorer.visible;
+            editor.focus = if editor.explorer.visible {
+                Focus::Explorer
+            } else {
+                Focus::Editor
+            };
+            if editor.explorer.visible {
+                editor.explorer.refresh();
+            }
+        }
+        HitAction::ToggleWrap => {
+            editor.line_wrap = !editor.line_wrap;
+            editor.config.line_wrap = editor.line_wrap;
+            let _ = editor.config.save();
+            editor.status_msg = format!(
+                "Line Wrap: {}",
+                if editor.line_wrap { "ON" } else { "OFF" }
+            );
+        }
+        HitAction::ToggleHints => {
+            editor.show_inlay_hints = !editor.show_inlay_hints;
+            editor.config.show_inlay_hints = editor.show_inlay_hints;
+            let _ = editor.config.save();
+            editor.status_msg = format!(
+                "Inlay Hints: {}",
+                if editor.show_inlay_hints { "ON" } else { "OFF" }
+            );
+        }
+        HitAction::OpenPalette => {
+            editor.palette.visible = true;
+            editor.palette.query.clear();
+            editor.palette.selected_idx = 0;
+            editor.palette.scroll = 0;
+        }
+        HitAction::OpenTheme => {
+            let cur_idx = theme::Theme::all()
+                .iter()
+                .position(|t| t.name == editor.theme.name)
+                .unwrap_or(0);
+            editor.theme_picker = Some(ThemePicker {
+                selected_idx: cur_idx,
+            });
+        }
+        HitAction::OpenLsp => {
+            let installed = editor.syntax.language.installed_servers();
+            if installed.is_empty() {
+                editor.status_msg = "No installed LSP found for this file".to_string();
+            } else {
+                editor.lsp_picker = Some(LspPicker {
+                    language_id: editor.syntax.language.lsp_id().to_string(),
+                    candidates: installed,
+                    selected_idx: 0,
+                });
+            }
+        }
+        HitAction::NextDiagnostic => editor.next_diagnostic(),
+        HitAction::ClickTheme(idx) => {
+            if let Some(theme) = theme::Theme::all().get(idx) {
+                editor.set_theme(theme.name);
+                editor.theme_picker = None;
+            }
+        }
+        HitAction::ClickLsp(idx) => {
+            if let Some(picker) = editor.lsp_picker.clone()
+                && let Some(cmd) = picker.candidates.get(idx)
+            {
+                editor.config.preferred_lsps.insert(picker.language_id.clone(), cmd.clone());
+                let _ = editor.config.save();
+                if let Some(path) = editor.path.clone() {
+                    editor.start_lsp_server(&path, &picker.language_id, cmd);
+                }
+                editor.lsp_picker = None;
+                editor.status_msg = format!("LSP: {cmd}");
+            }
+        }
+        HitAction::ClickAction(idx) => editor.execute_code_action(idx),
+        HitAction::ClickSymbol(idx) => {
+            if let Some(picker) = editor.symbol_picker.clone() {
+                let filtered = picker.filtered_symbols();
+                if let Some(sym) = filtered.get(idx) {
+                    editor.record_jump_checkpoint();
+                    editor.cursor_y = sym.line.min(editor.rope.len_lines().saturating_sub(1));
+                    let line_str = editor.rope.line(editor.cursor_y).to_string();
+                    editor.cursor_x = utf16_to_char_col(&line_str, sym.col);
+                    editor.clamp_cursor();
+                    editor.symbol_picker = None;
+                }
+            }
+        }
+        HitAction::ClickLocation(idx) => {
+            if let Some(picker) = editor.location_picker.clone()
+                && let Some(loc) = picker.locations.get(idx).cloned()
+            {
+                editor.location_picker = None;
+                editor.jump_to_location(loc);
+            }
+        }
+        HitAction::ConfirmYes => editor.answer_confirm(true),
+        HitAction::ConfirmNo | HitAction::ClosePopup => {
+            editor.answer_confirm(false);
+            editor.theme_picker = None;
+            editor.lsp_picker = None;
+            editor.code_action_picker = None;
+            editor.symbol_picker = None;
+            editor.location_picker = None;
+            editor.show_help = false;
+            editor.hover_info = None;
+        }
+    }
+}
+
 fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
+    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+        let hit = editor.hit_regions.iter().find(|region| {
+            mouse.column >= region.x
+                && mouse.column < region.x.saturating_add(region.w)
+                && mouse.row >= region.y
+                && mouse.row < region.y.saturating_add(region.h)
+        });
+        if let Some(region) = hit {
+            apply_hit(editor, region.action.clone());
+            return;
+        }
+    }
+
     let status_row = size.height.saturating_sub(2);
     let cmd_row = size.height.saturating_sub(1);
     let viewport_top = 1u16;
     let viewport_bottom = size.height.saturating_sub(3);
 
-    // Dismiss active hover card on outside click[span_13](start_span)[span_13](end_span)
+    // Dismiss active hover card on outside click
     if editor.hover_info.is_some() {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             editor.hover_info = None;
+        } else {
+            return;
         }
-        return;
     }
 
-    // Intercept In-Editor Help Modal[span_14](start_span)[span_14](end_span)
+    // Intercept In-Editor Help Modal
     if editor.show_help {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             let width = 64u16.min(size.width.saturating_sub(4));
@@ -399,7 +574,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         return;
     }
 
-    // Intercept Theme Picker Modal[span_15](start_span)[span_15](end_span)
+    // Intercept Theme Picker Modal
     if editor.theme_picker.is_some() {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             let themes = Theme::all();
@@ -429,7 +604,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         return;
     }
 
-    // Intercept LSP Server Picker Modal[span_16](start_span)[span_16](end_span)
+    // Intercept LSP Server Picker Modal
     if let Some(picker) = &editor.lsp_picker {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             let width = 48u16.min(size.width.saturating_sub(2));
@@ -468,7 +643,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         return;
     }
 
-    // Intercept Command Palette Interactions[span_17](start_span)[span_17](end_span)
+    // Intercept Command Palette Interactions
     if editor.palette.visible {
         let width = 46u16.min(size.width.saturating_sub(2));
         let height = 12u16.min(size.height.saturating_sub(2));
@@ -522,7 +697,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         return;
     }
 
-    // Statusline Interactions[span_18](start_span)[span_18](end_span)
+    // Statusline Interactions
     if mouse.row == status_row {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             let badge_len = match editor.mode {
@@ -557,7 +732,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         0u16
     };
 
-    // File Explorer Sidebar Interactions[span_19](start_span)[span_19](end_span)
+    // File Explorer Sidebar Interactions
     if editor.explorer.visible && mouse.column < explorer_width {
         let max_visible = viewport_bottom.saturating_sub(viewport_top) as usize;
         match mouse.kind {
@@ -597,7 +772,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         return;
     }
 
-    // Completion Dropdown Interactions[span_20](start_span)[span_20](end_span)
+    // Completion Dropdown Interactions
     if editor.completion_visible
         && !editor.completions.is_empty()
         && let Some((px, py, pw, ph)) = editor.completion_rect
@@ -641,7 +816,7 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         }
     }
 
-    // Document Viewport Buffer Interactions[span_21](start_span)[span_21](end_span)
+    // Document Viewport Buffer Interactions
     let gutter_digits = editor.rope.len_lines().max(1).to_string().len().max(2);
     let gutter_width = gutter_digits + 7;
     let content_left = explorer_width + 1u16 + gutter_width as u16;
@@ -650,17 +825,41 @@ fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
         MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {
             if mouse.row >= viewport_top && mouse.row < viewport_bottom {
                 let clicked_screen_row = (mouse.row - viewport_top) as usize;
-                let target_line = (editor.scroll_y + clicked_screen_row)
-                    .min(editor.rope.len_lines().saturating_sub(1));
+                let text_width = (size.width.saturating_sub(content_left) as usize).max(1);
+                let (target_line, sub_row) = if editor.line_wrap {
+                    let mut remaining = clicked_screen_row;
+                    let mut y = editor.scroll_y;
+                    let last = editor.rope.len_lines().saturating_sub(1);
+                    while y < last {
+                        let len = editor::line_len(&editor.rope, y).max(1);
+                        let rows = len.div_ceil(text_width).max(1);
+                        if remaining < rows {
+                            break;
+                        }
+                        remaining = remaining.saturating_sub(rows);
+                        y += 1;
+                    }
+                    (y.min(last), remaining)
+                } else {
+                    (
+                        (editor.scroll_y + clicked_screen_row)
+                            .min(editor.rope.len_lines().saturating_sub(1)),
+                        0,
+                    )
+                };
                 editor.cursor_y = target_line;
 
                 if mouse.column >= content_left {
-                    let target_visual_x = editor.scroll_x + (mouse.column - content_left) as usize;
+                    let visual_x = if editor.line_wrap {
+                        sub_row * text_width + (mouse.column - content_left) as usize
+                    } else {
+                        editor.scroll_x + (mouse.column - content_left) as usize
+                    };
                     let raw_line = editor.rope.line(target_line);
                     let mut current_vx = 0;
                     let mut resolved_char_idx = 0;
                     for (c_idx, ch) in raw_line.chars().enumerate() {
-                        if current_vx >= target_visual_x || ch == '\n' || ch == '\r' {
+                        if current_vx >= visual_x || ch == '\n' || ch == '\r' {
                             break;
                         }
                         current_vx += if ch == '\t' { 4 } else { 1 };
@@ -706,10 +905,19 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
+    if editor.confirm.is_some() {
+        match key.code {
+            KeyCode::Char('y' | 'Y') | KeyCode::Enter => editor.answer_confirm(true),
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => editor.answer_confirm(false),
+            _ => {}
+        }
+        return;
+    }
+
     let prev_mode = editor.mode;
     let max_visible = 6usize;
 
-    // 1. Rename Symbol Prompt Input[span_22](start_span)[span_22](end_span)
+    // 1. Rename Symbol Prompt Input
     if let Some(mut name) = editor.rename_prompt.take() {
         match key.code {
             KeyCode::Esc => {
@@ -733,7 +941,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // 2. Hover Card Viewer[span_23](start_span)[span_23](end_span)
+    // 2. Hover Card Viewer
     if editor.hover_info.is_some() {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
@@ -754,7 +962,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         }
     }
 
-    // 3. Code Actions Picker Modal[span_24](start_span)[span_24](end_span)
+    // 3. Code Actions Picker Modal
     if let Some(mut picker) = editor.code_action_picker.take() {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
@@ -773,16 +981,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                 editor.code_action_picker = Some(picker);
             }
             KeyCode::Enter => {
-                if let Some(action) = picker.actions.get(picker.selected_idx) {
-                    match editor.apply_workspace_edits(&action.edits) {
-                        Ok(_) => {
-                            editor.status_msg = format!("Applied: {}", action.title);
-                        }
-                        Err(e) => {
-                            editor.status_msg = format!("Action application error: {e}");
-                        }
-                    }
-                }
+                editor.execute_code_action(picker.selected_idx);
             }
             _ => {
                 editor.code_action_picker = Some(picker);
@@ -791,7 +990,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // 4. Symbol Outline Picker Modal[span_25](start_span)[span_25](end_span)
+    // 4. Symbol Outline Picker Modal
     if let Some(mut picker) = editor.symbol_picker.take() {
         let filtered_count = picker.filtered_symbols().len();
         match key.code {
@@ -842,7 +1041,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // 5. Locations Picker (Definition / References)[span_26](start_span)[span_26](end_span)
+    // 5. Locations Picker (Definition / References)
     if let Some(mut picker) = editor.location_picker.take() {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
@@ -872,7 +1071,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // 6. Help Modal Navigation[span_27](start_span)[span_27](end_span)
+    // 6. Help Modal Navigation
     if editor.show_help {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q' | '?') => {
@@ -895,7 +1094,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // 7. Theme Picker Modal[span_28](start_span)[span_28](end_span)
+    // 7. Theme Picker Modal
     if let Some(mut picker) = editor.theme_picker.take() {
         let themes = Theme::all();
         match key.code {
@@ -925,7 +1124,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // 8. LSP Server Picker Modal[span_29](start_span)[span_29](end_span)
+    // 8. LSP Server Picker Modal
     if let Some(mut picker) = editor.lsp_picker.take() {
         if picker.candidates.is_empty() {
             editor.status_msg = "No LSP candidates available".to_string();
@@ -968,7 +1167,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // 9. Command Palette Key Events[span_30](start_span)[span_30](end_span)
+    // 9. Command Palette Key Events
     if editor.palette.visible {
         let cmds = editor.palette.filtered_commands();
         match key.code {
@@ -1022,7 +1221,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // 10. Global Shortcuts: Ctrl-E for File Explorer[span_31](start_span)[span_31](end_span)
+    // 10. Global Shortcuts: Ctrl-E for File Explorer
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('e') {
         editor.explorer.visible = !editor.explorer.visible;
         if editor.explorer.visible {
@@ -1034,7 +1233,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // 11. File Explorer Navigation Focus[span_32](start_span)[span_32](end_span)
+    // 11. File Explorer Navigation Focus
     if editor.focus == Focus::Explorer && editor.explorer.visible {
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
@@ -1070,7 +1269,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
         return;
     }
 
-    // 12. Modal Editing Handler[span_33](start_span)[span_33](end_span)
+    // 12. Modal Editing Handler
     match editor.mode {
         Mode::Normal => {
             editor.completion_visible = false;
@@ -1196,7 +1395,12 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                     editor.set_mode(Mode::Insert);
                 }
                 KeyCode::Char('I') => {
-                    editor.cursor_x = 0;
+                    editor.cursor_x = editor
+                        .rope
+                        .line(editor.cursor_y)
+                        .chars()
+                        .take_while(|c| *c == ' ' || *c == '\t')
+                        .count();
                     editor.set_mode(Mode::Insert);
                 }
                 KeyCode::Char('a') => {
@@ -1211,6 +1415,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                     editor.set_mode(Mode::Insert);
                 }
                 KeyCode::Char('u') => editor.undo(),
+                KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => editor.redo(),
                 KeyCode::Char('d') => editor.pending_key = Some('d'),
                 KeyCode::Char('g') => editor.pending_key = Some('g'),
                 KeyCode::Char(']') => editor.pending_key = Some(']'),
