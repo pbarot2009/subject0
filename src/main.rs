@@ -501,26 +501,10 @@ async fn main() -> Result<()> {
 
 // === Touch & Mouse Handling ===
 
-fn apply_hit(editor: &mut Editor, action: HitAction) {
+fn apply_hit(editor: &mut Editor, action: HitAction, click_col: u16) {
     match action {
-        HitAction::ToggleExplorer => {
-            editor.explorer.visible = !editor.explorer.visible;
-            editor.focus = if editor.explorer.visible {
-                Focus::Explorer
-            } else {
-                Focus::Editor
-            };
-            if editor.explorer.visible {
-                editor.explorer.refresh();
-            }
-        }
-        HitAction::ToggleWrap => {
-            editor.line_wrap = !editor.line_wrap;
-            editor.config.line_wrap = editor.line_wrap;
-            let _ = editor.config.save();
-            editor.status_msg =
-                format!("Line Wrap: {}", if editor.line_wrap { "ON" } else { "OFF" });
-        }
+        HitAction::ToggleExplorer => editor.toggle_files(),
+        HitAction::ToggleWrap => editor.toggle_wrap(),
         HitAction::ToggleHints => {
             editor.show_inlay_hints = !editor.show_inlay_hints;
             editor.config.show_inlay_hints = editor.show_inlay_hints;
@@ -648,40 +632,40 @@ fn apply_hit(editor: &mut Editor, action: HitAction) {
                 editor.status_msg = format!("Jumped to {name}");
             }
         }
-        HitAction::ClickEditorLine(line) => {
+        HitAction::ClickEditorLine {
+            line,
+            origin_x,
+            visual_base,
+        } => {
             editor.cursor_y = line.min(editor.rope.len_lines().saturating_sub(1));
             editor.focus = Focus::Editor;
+            if click_col > origin_x {
+                let visual = visual_base + (click_col - origin_x) as usize;
+                let raw = editor.rope.line(editor.cursor_y);
+                let mut vx = 0usize;
+                let mut idx = 0usize;
+                for (c_idx, ch) in raw.chars().enumerate() {
+                    if ch == '\n' || ch == '\r' || vx >= visual {
+                        idx = c_idx;
+                        break;
+                    }
+                    vx += if ch == '\t' { 4 } else { 1 };
+                    idx = c_idx + 1;
+                }
+                editor.cursor_x = idx;
+            } else {
+                editor.cursor_x = 0;
+            }
             editor.clamp_cursor();
-        }
-        HitAction::ToggleProblems => {
-            editor.problems_open = !editor.problems_open;
-            if editor.problems_open && editor.shell_narrow() {
-                editor.explorer.visible = false;
-                editor.outline_open = false;
+            editor.completion_visible = false;
+            editor.hover_info = None;
+            if editor.shell_narrow() {
+                editor.close_sheet();
             }
-            editor.status_msg = if editor.problems_open {
-                "Problems open".to_string()
-            } else {
-                "Problems closed".to_string()
-            };
         }
-        HitAction::ToggleOutline => {
-            editor.outline_open = !editor.outline_open;
-            if editor.outline_open && editor.syntax.tags.is_empty() {
-                editor.request_document_symbols();
-            }
-            editor.status_msg = if editor.outline_open {
-                "Outline open".to_string()
-            } else {
-                "Outline closed".to_string()
-            };
-        }
-        HitAction::CloseSheet => {
-            editor.explorer.visible = false;
-            editor.problems_open = false;
-            editor.outline_open = false;
-            editor.focus = Focus::Editor;
-        }
+        HitAction::ToggleProblems => editor.toggle_problems_panel(),
+        HitAction::ToggleOutline => editor.toggle_outline_panel(),
+        HitAction::CloseSheet => editor.close_sheet(),
         HitAction::ConfirmYes => editor.answer_confirm(true),
         HitAction::ConfirmNo | HitAction::ClosePopup => {
             editor.answer_confirm(false);
@@ -696,372 +680,66 @@ fn apply_hit(editor: &mut Editor, action: HitAction) {
     }
 }
 
-fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, size: Size) {
-    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-        let hit = editor.hit_regions.iter().rev().find(|region| {
-            mouse.column >= region.x
-                && mouse.column < region.x.saturating_add(region.w)
-                && mouse.row >= region.y
-                && mouse.row < region.y.saturating_add(region.h)
-        });
-        if let Some(region) = hit {
-            apply_hit(editor, region.action.clone());
-            return;
-        }
-    }
-
-    let status_row = size.height.saturating_sub(2);
-    let cmd_row = size.height.saturating_sub(1);
-    let viewport_top = 1u16;
-    let viewport_bottom = size.height.saturating_sub(3);
-
-    // Dismiss active hover card on outside click
-    if editor.hover_info.is_some() {
-        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-            editor.hover_info = None;
-        } else {
-            return;
-        }
-    }
-
-    // Intercept In-Editor Help Modal
-    if editor.show_help {
-        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-            let width = 64u16.min(size.width.saturating_sub(4));
-            let height = 22u16.min(size.height.saturating_sub(2));
-            let x = (size.width.saturating_sub(width)) / 2;
-            let y = (size.height.saturating_sub(height)) / 2;
-
-            if mouse.column < x
-                || mouse.column >= x + width
-                || mouse.row < y
-                || mouse.row >= y + height
-            {
-                editor.show_help = false;
-            }
-        }
-        return;
-    }
-
-    // Intercept Theme Picker Modal
-    if editor.theme_picker.is_some() {
-        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-            let themes = Theme::all();
-            let width = 48u16.min(size.width.saturating_sub(2));
-            let height = ((themes.len() as u16) + 4).min(size.height.saturating_sub(2));
-            let x = (size.width.saturating_sub(width)) / 2;
-            let y = (size.height.saturating_sub(height)) / 2;
-
-            if mouse.column > x
-                && mouse.column < x + width - 1
-                && mouse.row >= y + 2
-                && mouse.row < y + 2 + themes.len() as u16
-            {
-                let clicked_idx = (mouse.row - (y + 2)) as usize;
-                if clicked_idx < themes.len() {
-                    editor.set_theme(themes[clicked_idx].name);
-                    editor.theme_picker = None;
-                }
-            } else if mouse.column < x
-                || mouse.column >= x + width
-                || mouse.row < y
-                || mouse.row >= y + height
-            {
-                editor.theme_picker = None;
-            }
-        }
-        return;
-    }
-
-    // Intercept LSP Server Picker Modal
-    if let Some(picker) = &editor.lsp_picker {
-        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-            let width = 48u16.min(size.width.saturating_sub(2));
-            let height = ((picker.candidates.len() as u16) + 4).min(size.height.saturating_sub(2));
-            let x = (size.width.saturating_sub(width)) / 2;
-            let y = (size.height.saturating_sub(height)) / 2;
-
-            if mouse.column > x
-                && mouse.column < x + width - 1
-                && mouse.row >= y + 2
-                && mouse.row < y + 2 + picker.candidates.len() as u16
-            {
-                let clicked_idx = (mouse.row - (y + 2)) as usize;
-                if clicked_idx < picker.candidates.len() {
-                    let chosen = picker.candidates[clicked_idx].clone();
-                    let lang_id = picker.language_id.clone();
-                    editor
-                        .config
-                        .preferred_lsps
-                        .insert(lang_id.clone(), chosen.clone());
-                    let _ = editor.config.save();
-                    editor.status_msg = format!("Selected LSP: {chosen} (saved to .subject0)");
-                    if let Some(path) = editor.path.clone() {
-                        editor.start_lsp_server(&path, &lang_id, &chosen);
-                    }
-                    editor.lsp_picker = None;
-                }
-            } else if mouse.column < x
-                || mouse.column >= x + width
-                || mouse.row < y
-                || mouse.row >= y + height
-            {
-                editor.lsp_picker = None;
-            }
-        }
-        return;
-    }
-
-    // Intercept Command Palette Interactions
-    if editor.palette.visible {
-        let width = 46u16.min(size.width.saturating_sub(2));
-        let height = 12u16.min(size.height.saturating_sub(2));
-        let x = (size.width.saturating_sub(width)) / 2;
-        let y = 1u16;
-
-        let in_palette = mouse.column >= x
-            && mouse.column < x + width
-            && mouse.row >= y
-            && mouse.row < y + height;
-
-        let cmds = editor.palette.filtered_commands();
-        match mouse.kind {
-            MouseEventKind::ScrollDown if in_palette => {
-                if !cmds.is_empty() {
-                    editor.palette.selected_idx = (editor.palette.selected_idx + 1) % cmds.len();
-                }
-                return;
-            }
-            MouseEventKind::ScrollUp if in_palette => {
-                if !cmds.is_empty() {
-                    editor.palette.selected_idx = if editor.palette.selected_idx == 0 {
-                        cmds.len().saturating_sub(1)
-                    } else {
-                        editor.palette.selected_idx - 1
-                    };
-                }
-                return;
-            }
-            MouseEventKind::Down(MouseButton::Left) => {
-                if mouse.column > x
-                    && mouse.column < x + width - 1
-                    && mouse.row >= y + 3
-                    && mouse.row < y + height - 1
-                {
-                    let clicked_row = (mouse.row - (y + 3)) as usize;
-                    let actual_idx = editor.palette.scroll + clicked_row;
-                    if actual_idx < cmds.len() {
-                        let cmd_id = cmds[actual_idx].id;
-                        editor.execute_palette_command(cmd_id);
-                        set_terminal_cursor_style(editor.mode);
-                    }
-                    return;
-                } else if !in_palette {
-                    editor.palette.visible = false;
-                    return;
-                }
-            }
-            _ => {}
-        }
-        return;
-    }
-
-    // Statusline Interactions
-    if mouse.row == status_row {
-        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-            let badge_len = match editor.mode {
-                Mode::Normal | Mode::Insert | Mode::Visual { .. } => 8,
-                Mode::Command => 9,
-            } + 1;
-
-            let col = mouse.column as usize;
-            if col <= badge_len {
-                editor.set_mode(match editor.mode {
-                    Mode::Normal => Mode::Insert,
-                    Mode::Insert | Mode::Command | Mode::Visual { .. } => Mode::Normal,
-                });
-                set_terminal_cursor_style(editor.mode);
-                editor.completion_visible = false;
-            }
-        }
-        return;
-    }
-
-    if mouse.row == cmd_row {
-        return;
-    }
-
-    let explorer_width = if editor.explorer.visible {
-        if size.width < 70 {
-            (size.width * 7 / 10).max(26).min(size.width)
-        } else {
-            26u16
-        }
-    } else {
-        0u16
-    };
-
-    // File Explorer Sidebar Interactions
-    if editor.explorer.visible && mouse.column < explorer_width {
-        let max_visible = viewport_bottom.saturating_sub(viewport_top) as usize;
-        match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                if mouse.row >= viewport_top && mouse.row < viewport_bottom {
-                    let clicked_idx = editor.explorer.scroll + (mouse.row - viewport_top) as usize;
-                    if clicked_idx < editor.explorer.entries.len() {
-                        editor.explorer.selected_idx = clicked_idx;
-                        if editor.explorer.entries[clicked_idx].is_dir {
-                            editor.explorer.toggle_expand(clicked_idx);
-                        } else {
-                            let path = editor.explorer.entries[clicked_idx].path.clone();
-                            if let Err(e) = editor.open_file(path) {
-                                editor.status_msg = e.to_string();
-                            } else {
-                                editor.focus = Focus::Editor;
-                                if size.width < 70 {
-                                    editor.explorer.visible = false;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            MouseEventKind::ScrollDown => {
-                if editor.explorer.selected_idx + 1 < editor.explorer.entries.len() {
-                    editor.explorer.selected_idx += 1;
-                    editor.explorer.update_scroll(max_visible);
-                }
-            }
-            MouseEventKind::ScrollUp if editor.explorer.selected_idx > 0 => {
-                editor.explorer.selected_idx -= 1;
-                editor.explorer.update_scroll(max_visible);
-            }
-            _ => {}
-        }
-        return;
-    }
-
-    // Completion Dropdown Interactions
-    if editor.completion_visible
-        && !editor.completions.is_empty()
-        && let Some((px, py, pw, ph)) = editor.completion_rect
-    {
-        let in_popup =
-            mouse.column >= px && mouse.column < px + pw && mouse.row >= py && mouse.row < py + ph;
-
-        if in_popup {
-            let max_visible = 6usize;
-            match mouse.kind {
-                MouseEventKind::ScrollDown => {
-                    if editor.completion_idx + 1 < editor.completions.len() {
-                        editor.completion_idx += 1;
-                        editor.update_completion_scroll(max_visible);
-                    }
-                    return;
-                }
-                MouseEventKind::ScrollUp => {
-                    if editor.completion_idx > 0 {
-                        editor.completion_idx -= 1;
-                        editor.update_completion_scroll(max_visible);
-                    }
-                    return;
-                }
-                MouseEventKind::Down(MouseButton::Left) => {
-                    if mouse.row > py && mouse.row < py + ph - 1 {
-                        let clicked_row = (mouse.row - (py + 1)) as usize;
-                        let target_idx = editor.completion_scroll + clicked_row;
-                        if target_idx < editor.completions.len() {
-                            editor.completion_idx = target_idx;
-                        }
-                    }
-                    editor.accept_completion();
-                    return;
-                }
-                _ => return,
-            }
-        } else if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-            editor.completion_visible = false;
-            editor.completion_rect = None;
-        }
-    }
-
-    // Document Viewport Buffer Interactions
-    let gutter_digits = editor.rope.len_lines().max(1).to_string().len().max(2);
-    let gutter_width = gutter_digits + 7;
-    let content_left = explorer_width + 1u16 + gutter_width as u16;
-
+fn handle_mouse_event(editor: &mut Editor, mouse: MouseEvent, _size: Size) {
     match mouse.kind {
-        MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {
-            if mouse.row >= viewport_top && mouse.row < viewport_bottom {
-                let clicked_screen_row = (mouse.row - viewport_top) as usize;
-                let text_width = (size.width.saturating_sub(content_left) as usize).max(1);
-                let (target_line, sub_row) = if editor.line_wrap {
-                    let mut remaining = clicked_screen_row;
-                    let mut y = editor.scroll_y;
-                    let last = editor.rope.len_lines().saturating_sub(1);
-                    while y < last {
-                        let len = editor::line_len(&editor.rope, y).max(1);
-                        let rows = len.div_ceil(text_width).max(1);
-                        if remaining < rows {
-                            break;
-                        }
-                        remaining = remaining.saturating_sub(rows);
-                        y += 1;
-                    }
-                    (y.min(last), remaining)
-                } else {
-                    (
-                        (editor.scroll_y + clicked_screen_row)
-                            .min(editor.rope.len_lines().saturating_sub(1)),
-                        0,
-                    )
-                };
-                editor.cursor_y = target_line;
-
-                if mouse.column >= content_left {
-                    let visual_x = if editor.line_wrap {
-                        sub_row * text_width + (mouse.column - content_left) as usize
-                    } else {
-                        editor.scroll_x + (mouse.column - content_left) as usize
-                    };
-                    let raw_line = editor.rope.line(target_line);
-                    let mut current_vx = 0;
-                    let mut resolved_char_idx = 0;
-                    for (c_idx, ch) in raw_line.chars().enumerate() {
-                        if current_vx >= visual_x || ch == '\n' || ch == '\r' {
-                            break;
-                        }
-                        current_vx += if ch == '\t' { 4 } else { 1 };
-                        resolved_char_idx = c_idx + 1;
-                    }
-                    editor.cursor_x = resolved_char_idx;
-                } else {
-                    editor.cursor_x = 0;
-                }
-
-                editor.clamp_cursor();
-                editor.completion_visible = false;
+        MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right) => {
+            let hit = editor.hit_regions.iter().rev().find(|region| {
+                mouse.column >= region.x
+                    && mouse.column < region.x.saturating_add(region.w)
+                    && mouse.row >= region.y
+                    && mouse.row < region.y.saturating_add(region.h)
+            });
+            if let Some(region) = hit {
+                apply_hit(editor, region.action.clone(), mouse.column);
+                return;
+            }
+            let modal = editor.show_help
+                || editor.theme_picker.is_some()
+                || editor.lsp_picker.is_some()
+                || editor.code_action_picker.is_some()
+                || editor.symbol_picker.is_some()
+                || editor.location_picker.is_some()
+                || editor.palette.visible
+                || editor.hover_info.is_some()
+                || editor.rename_prompt.is_some();
+            if modal {
+                editor.show_help = false;
+                editor.theme_picker = None;
+                editor.lsp_picker = None;
+                editor.code_action_picker = None;
+                editor.symbol_picker = None;
+                editor.location_picker = None;
+                editor.palette.visible = false;
                 editor.hover_info = None;
-                editor.focus = Focus::Editor;
-
-                if size.width < 70 && editor.explorer.visible {
-                    editor.explorer.visible = false;
-                }
+                editor.rename_prompt = None;
             }
         }
-        MouseEventKind::ScrollUp => {
-            editor.scroll_y = editor.scroll_y.saturating_sub(3);
-            editor.cursor_y = editor.cursor_y.saturating_sub(3);
-            editor.clamp_cursor();
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            let over_files = editor.hit_regions.iter().any(|region| {
+                matches!(region.action, HitAction::ClickFile(_))
+                    && mouse.column >= region.x
+                    && mouse.column < region.x.saturating_add(region.w)
+            });
+            let down = matches!(mouse.kind, MouseEventKind::ScrollDown);
+            if over_files {
+                if down {
+                    editor.explorer.scroll = editor.explorer.scroll.saturating_add(3);
+                } else {
+                    editor.explorer.scroll = editor.explorer.scroll.saturating_sub(3);
+                }
+            } else if down {
+                if editor.scroll_y + 3 < editor.rope.len_lines() {
+                    editor.scroll_y += 3;
+                    editor.cursor_y =
+                        (editor.cursor_y + 3).min(editor.rope.len_lines().saturating_sub(1));
+                }
+                editor.clamp_cursor();
+            } else {
+                editor.scroll_y = editor.scroll_y.saturating_sub(3);
+                editor.cursor_y = editor.cursor_y.saturating_sub(3);
+                editor.clamp_cursor();
+            }
             editor.completion_visible = false;
-            editor.hover_info = None;
-        }
-        MouseEventKind::ScrollDown if editor.scroll_y + 3 < editor.rope.len_lines() => {
-            editor.scroll_y += 3;
-            editor.cursor_y = (editor.cursor_y + 3).min(editor.rope.len_lines().saturating_sub(1));
-            editor.clamp_cursor();
-            editor.completion_visible = false;
-            editor.hover_info = None;
         }
         _ => {}
     }
@@ -1392,13 +1070,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
 
     // 10. Global Shortcuts: Ctrl-E for File Explorer
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('e') {
-        editor.explorer.visible = !editor.explorer.visible;
-        if editor.explorer.visible {
-            editor.explorer.refresh();
-            editor.focus = Focus::Explorer;
-        } else {
-            editor.focus = Focus::Editor;
-        }
+        editor.toggle_files();
         return;
     }
 
@@ -1928,6 +1600,6 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
 }
 
 #[cfg(test)]
-mod support_tests;
-#[cfg(test)]
 mod audit_tests;
+#[cfg(test)]
+mod support_tests;

@@ -19,22 +19,40 @@ use crate::lsp::{InlayHintType, LspStatus, utf16_to_char_col};
 use crate::syntax::{completion_kind_icon, file_icon_and_color, symbol_kind_icon};
 
 use crate::nerdfonts::{
-    BOX_HORIZONTAL, BOX_VERTICAL, CHECK, CHEVRON_RIGHT, CMD_RENAME, CMD_SYMBOLS, CURSOR_BLOCK,
-    DIAG_ERROR, DIAG_ERROR_PAD, DIAG_HINT, DIAG_HINT_PAD, DIAG_INFO, DIAG_INFO_PAD, DIAG_WARN,
-    DIAG_WARN_PAD, ELLIPSIS, FOLDER, FOLDER_CLOSED, FOLDER_OPEN, FOLDER_OUTLINE, GIT_BRANCH,
-    GUTTER_EMPTY, HELP, HINTS_OFF, HINTS_ON, INFO_DOC, KIND_FUNCTION, LIGHTBULB, LINE_WRAP,
-    LOCATION, LSP_ERROR, LSP_NOT_FOUND, LSP_READY, MODIFIED_DOT, PALETTE, POWERLINE_LEFT,
-    POWERLINE_RIGHT, PROMPT_CHEVRON, PROMPT_COLON, SELECTION_BLANK, SETTINGS_COGS, SPINNER, THEME,
-    TILDE, TOOL_LINK, WRAP_OFF, WRAP_ON,
+    BOX_HORIZONTAL, BOX_VERTICAL, CHECK, CHEVRON_RIGHT, CLOSE, CMD_RENAME, CMD_SYMBOLS,
+    CURSOR_BLOCK, DIAG_ERROR, DIAG_ERROR_PAD, DIAG_HINT, DIAG_HINT_PAD, DIAG_INFO, DIAG_INFO_PAD,
+    DIAG_WARN, DIAG_WARN_PAD, ELLIPSIS, FOLDER, FOLDER_CLOSED, FOLDER_OPEN, FOLDER_OUTLINE,
+    GIT_BRANCH, GUTTER_EMPTY, HELP, HINTS_OFF, HINTS_ON, INFO_DOC, KIND_FUNCTION, LIGHTBULB,
+    LINE_WRAP, LOCATION, LSP_ERROR, LSP_NOT_FOUND, LSP_READY, MODIFIED_DOT, PALETTE,
+    POWERLINE_LEFT, POWERLINE_RIGHT, PROMPT_CHEVRON, PROMPT_COLON, SELECTION_BLANK, SETTINGS_COGS,
+    SPINNER, THEME, TILDE, TOOL_LINK, WRAP_OFF, WRAP_ON,
 };
 
 /// Column budget for the shell. Panels shrink or hide before they overlap the deck.
-pub fn shell_layout(width: u16, height: u16, files: bool, problems: bool, outline: bool) -> (u16, u16, u16, u16, bool) {
+pub fn shell_layout(
+    width: u16,
+    height: u16,
+    files: bool,
+    problems: bool,
+    outline: bool,
+) -> (u16, u16, u16, u16, bool) {
     let narrow = width < 72;
-    let rail = if width >= 110 { 5 } else { 0 };
-    let problems_h = if problems && !narrow && height >= 16 { 4.min(height.saturating_sub(8)) } else { 0 };
-    let mut explorer = if files && !narrow { if width < 100 { 22 } else { 28 } } else { 0 };
-    let mut outline_w = if outline && width >= 130 && height >= 16 { 26 } else { 0 };
+    let rail = if width >= 100 { 3 } else { 0 };
+    let problems_h = if problems && !narrow && height >= 16 {
+        4.min(height.saturating_sub(8))
+    } else {
+        0
+    };
+    let mut explorer = if files && !narrow {
+        if width < 100 { 22 } else { 28 }
+    } else {
+        0
+    };
+    let mut outline_w = if outline && width >= 130 && height >= 16 {
+        26
+    } else {
+        0
+    };
     let mut reserved = rail + explorer + outline_w;
     if width.saturating_sub(reserved) < 24 {
         outline_w = 0;
@@ -51,9 +69,14 @@ fn cols(s: &str) -> usize {
 }
 
 fn char_cols(ch: char) -> usize {
-    if ch == '\u{fe0f}' || ch == '\u{200d}' {
+    let cp = ch as u32;
+    if ch == '\u{fe0f}' || ch == '\u{fe0e}' || ch == '\u{200d}' {
         0
-    } else if (ch as u32) >= 0x1100 {
+    } else if cp >= 0x1100
+        || (0xE000..=0xF8FF).contains(&cp)
+        || (0xF0000..=0xFFFFD).contains(&cp)
+        || (0x100000..=0x10FFFD).contains(&cp)
+    {
         2
     } else {
         1
@@ -81,15 +104,79 @@ fn fit_cols(s: &str, max_cols: usize) -> String {
     out
 }
 
-/// Safely truncates a string by Unicode scalar count without slicing mid-codepoint.
-pub fn safe_truncate(s: &str, max_chars: usize) -> String {
-    if s.chars().count() > max_chars {
-        let mut result: String = s.chars().take(max_chars.saturating_sub(1)).collect();
-        result.push_str(ELLIPSIS);
-        result
-    } else {
-        s.to_string()
+/// Clips `s` to a terminal column budget, keeping the ellipsis inside the budget.
+pub fn safe_truncate(s: &str, max_cols: usize) -> String {
+    clip_cols(s, max_cols)
+}
+
+fn clip_cols(s: &str, max_cols: usize) -> String {
+    if max_cols == 0 || cols(s) <= max_cols {
+        return if max_cols == 0 {
+            String::new()
+        } else {
+            s.to_string()
+        };
     }
+    let ell = ELLIPSIS;
+    let budget = max_cols.saturating_sub(cols(ell));
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in s.chars() {
+        let w = char_cols(ch);
+        if used + w > budget {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push_str(ell);
+    out
+}
+
+fn pad_line(mut spans: Vec<Span<'static>>, width: usize, style: Style) -> Line<'static> {
+    let used: usize = spans.iter().map(|span| cols(span.content.as_ref())).sum();
+    if used < width {
+        spans.push(Span::styled(" ".repeat(width - used), style));
+    }
+    Line::from(spans)
+}
+
+fn explorer_line(
+    depth: usize,
+    icon: &str,
+    icon_color: Color,
+    name: &str,
+    selected: bool,
+    width: usize,
+    theme: crate::theme::Theme,
+) -> Line<'static> {
+    let row_bg = if selected {
+        theme.explorer_sel_bg
+    } else {
+        theme.explorer_bg
+    };
+    let name_style = if selected {
+        Style::default()
+            .bg(row_bg)
+            .fg(theme.explorer_sel_fg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().bg(row_bg).fg(theme.explorer_fg)
+    };
+    let indent = "  ".repeat(depth);
+    let prefix = format!(" {indent}");
+    let icon_s = format!("{icon} ");
+    let used = cols(&prefix) + cols(&icon_s);
+    let label = clip_cols(name, width.saturating_sub(used));
+    pad_line(
+        vec![
+            Span::styled(prefix, name_style),
+            Span::styled(icon_s, Style::default().fg(icon_color).bg(row_bg)),
+            Span::styled(label, name_style),
+        ],
+        width,
+        name_style,
+    )
 }
 
 /// Primary UI rendering entry point dispatched on every event loop redraw tick.
@@ -110,23 +197,6 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
     let show_problems = problems_h > 0;
     let show_outline = outline_w > 0;
     let dock_explorer = explorer_w > 0;
-    if let Some(prompt) = &editor.confirm {
-        let _ = prompt.message.as_str();
-        editor.hit_regions.push(HitRegion {
-            x: 1,
-            y: size.height.saturating_sub(1),
-            w: 8,
-            h: 1,
-            action: HitAction::ConfirmYes,
-        });
-        editor.hit_regions.push(HitRegion {
-            x: 10,
-            y: size.height.saturating_sub(1),
-            w: 8,
-            h: 1,
-            action: HitAction::ConfirmNo,
-        });
-    }
 
     let deck_h = 1u16;
     let cmd_h = 1u16;
@@ -158,9 +228,17 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         ])
         .split(body);
     let rail_area = if show_rail { Some(h_chunks[0]) } else { None };
-    let explorer_area = if dock_explorer { Some(h_chunks[1]) } else { None };
+    let explorer_area = if dock_explorer {
+        Some(h_chunks[1])
+    } else {
+        None
+    };
     let editor_area = h_chunks[2];
-    let outline_area = if show_outline { Some(h_chunks[3]) } else { None };
+    let outline_area = if show_outline {
+        Some(h_chunks[3])
+    } else {
+        None
+    };
 
     // 1. Render File Explorer (Sidebar with padded 2-cell icons)
     if let Some(exp_rect) = explorer_area {
@@ -199,9 +277,6 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
 
         for i in scroll_start..scroll_end {
             let entry = &editor.explorer.entries[i];
-            let is_sel = i == editor.explorer.selected_idx;
-            let indent = "  ".repeat(entry.depth);
-
             let (raw_icon, icon_color) = if entry.is_dir {
                 if entry.expanded {
                     (FOLDER_OPEN, theme.explorer_dir_expanded)
@@ -212,22 +287,15 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
                 let (i_str, c) = file_icon_and_color(Some(&entry.path));
                 (i_str.trim(), c)
             };
-
-            let item_style = if is_sel {
-                Style::default()
-                    .bg(theme.explorer_sel_bg)
-                    .fg(theme.explorer_sel_fg)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme.explorer_fg)
-            };
-
-            tree_lines.push(Line::from(vec![
-                Span::raw(" "),
-                Span::raw(indent),
-                Span::styled(format!("{raw_icon} "), Style::default().fg(icon_color)),
-                Span::styled(entry.name.clone(), item_style),
-            ]));
+            tree_lines.push(explorer_line(
+                entry.depth,
+                raw_icon,
+                icon_color,
+                &entry.name,
+                i == editor.explorer.selected_idx,
+                inner_exp.width as usize,
+                theme,
+            ));
             let row = inner_exp.y + (i - scroll_start) as u16;
             editor.hit_regions.push(HitRegion {
                 x: inner_exp.x,
@@ -289,7 +357,13 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
     let total_lines = editor.rope.len_lines().max(1);
     let line_digits = total_lines.to_string().len().max(2);
     // Gutter layout: Diag (2 cells) + Git Diff (2 cells) + Line Numbers (line_digits + 3 cells)
-    let gutter_width = line_digits + 7;
+    let tight = narrow || size.width < 96;
+    let gutter_width = line_digits + if tight { 3 } else { 7 };
+    let num_tail = if tight {
+        " ".to_string()
+    } else {
+        format!(" {BOX_VERTICAL} ")
+    };
     let text_area_width = (inner_area.width as usize)
         .saturating_sub(gutter_width)
         .max(1);
@@ -319,31 +393,43 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
         }
 
         let is_cursor_line = y == editor.cursor_y;
-        editor.hit_regions.push(HitRegion {
-            x: inner_area.x,
-            y: inner_area.y + current_row,
-            w: inner_area.width,
-            h: 1,
-            action: HitAction::ClickEditorLine(y),
-        });
+        let text_origin = inner_area.x + gutter_width as u16;
 
         // Compiler Diagnostic Indicator (2 cells)
         let line_diag = editor.diagnostics.iter().find(|d| d.line == y);
-        let (diag_marker, diag_style) = match line_diag.map(|d| d.severity) {
-            Some(1) => (DIAG_ERROR_PAD, Style::default().fg(theme.diag_error)),
-            Some(2) => (DIAG_WARN_PAD, Style::default().fg(theme.diag_warn)),
-            Some(3) => (DIAG_INFO_PAD, Style::default().fg(theme.diag_info)),
-            Some(_) => (DIAG_HINT_PAD, Style::default().fg(theme.diag_hint)),
-            None => (GUTTER_EMPTY, Style::default()),
+        let (diag_marker, diag_style) = if tight {
+            match line_diag.map(|d| d.severity) {
+                Some(1) => ("!", Style::default().fg(theme.diag_error)),
+                Some(2) => ("!", Style::default().fg(theme.diag_warn)),
+                Some(3) => ("i", Style::default().fg(theme.diag_info)),
+                Some(_) => (".", Style::default().fg(theme.diag_hint)),
+                None => (" ", Style::default()),
+            }
+        } else {
+            match line_diag.map(|d| d.severity) {
+                Some(1) => (DIAG_ERROR_PAD, Style::default().fg(theme.diag_error)),
+                Some(2) => (DIAG_WARN_PAD, Style::default().fg(theme.diag_warn)),
+                Some(3) => (DIAG_INFO_PAD, Style::default().fg(theme.diag_info)),
+                Some(_) => (DIAG_HINT_PAD, Style::default().fg(theme.diag_hint)),
+                None => (GUTTER_EMPTY, Style::default()),
+            }
         };
 
-        // Git Diff Change Indicator (2 cells)
         let git_change = editor.git_diff.change_for_line(y);
-        let (git_marker, git_style) = match git_change {
-            Some(GutterChange::Added) => ("▎ ", Style::default().fg(theme.git_added)),
-            Some(GutterChange::Modified) => ("▎ ", Style::default().fg(theme.git_modified)),
-            Some(GutterChange::Deleted) => ("▔ ", Style::default().fg(theme.git_deleted)),
-            None => ("  ", Style::default()),
+        let (git_marker, git_style) = if tight {
+            match git_change {
+                Some(GutterChange::Added) => ("+", Style::default().fg(theme.git_added)),
+                Some(GutterChange::Modified) => ("~", Style::default().fg(theme.git_modified)),
+                Some(GutterChange::Deleted) => ("-", Style::default().fg(theme.git_deleted)),
+                None => (" ", Style::default()),
+            }
+        } else {
+            match git_change {
+                Some(GutterChange::Added) => ("▎ ", Style::default().fg(theme.git_added)),
+                Some(GutterChange::Modified) => ("▎ ", Style::default().fg(theme.git_modified)),
+                Some(GutterChange::Deleted) => ("▔ ", Style::default().fg(theme.git_deleted)),
+                None => ("  ", Style::default()),
+            }
         };
 
         let gutter_style = if is_cursor_line {
@@ -466,14 +552,18 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
                     (
                         diag_marker,
                         git_marker,
-                        format!("{:>width$} {BOX_VERTICAL} ", y + 1, width = line_digits),
+                        format!("{:>width$}{num_tail}", y + 1, width = line_digits),
                         gutter_style,
                     )
                 } else {
                     (
                         GUTTER_EMPTY,
                         "  ",
-                        format!("{:>width$} {LINE_WRAP} ", "", width = line_digits),
+                        format!(
+                            "{:>width$}{num_tail}",
+                            if tight { "↳" } else { LINE_WRAP },
+                            width = line_digits
+                        ),
                         Style::default().fg(theme.line_number),
                     )
                 };
@@ -524,7 +614,23 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
                     cursor_screen_pos = Some((cx, cy));
                 }
 
-                visible_lines.push(Line::from(sub_spans));
+                let row_style = if is_cursor_line {
+                    Style::default().bg(theme.cursor_line_bg)
+                } else {
+                    Style::default().bg(theme.bg)
+                };
+                editor.hit_regions.push(HitRegion {
+                    x: inner_area.x,
+                    y: inner_area.y + current_row,
+                    w: inner_area.width,
+                    h: 1,
+                    action: HitAction::ClickEditorLine {
+                        line: y,
+                        origin_x: text_origin,
+                        visual_base: chunk_start,
+                    },
+                });
+                visible_lines.push(pad_line(sub_spans, inner_area.width as usize, row_style));
                 current_row += 1;
                 chunk_start = chunk_end;
                 is_first_sub = false;
@@ -533,7 +639,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             let (marker, git_m, gutter_str, g_style) = (
                 diag_marker,
                 git_marker,
-                format!("{:>width$} {BOX_VERTICAL} ", y + 1, width = line_digits),
+                format!("{:>width$}{num_tail}", y + 1, width = line_digits),
                 gutter_style,
             );
             let mut row_spans = vec![
@@ -578,7 +684,24 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
                 }
             }
 
-            visible_lines.push(Line::from(row_spans));
+            let row_style = if is_cursor_line {
+                Style::default().bg(theme.cursor_line_bg)
+            } else {
+                Style::default().bg(theme.bg)
+            };
+            let visual_base = if editor.line_wrap { 0 } else { editor.scroll_x };
+            editor.hit_regions.push(HitRegion {
+                x: inner_area.x,
+                y: inner_area.y + current_row,
+                w: inner_area.width,
+                h: 1,
+                action: HitAction::ClickEditorLine {
+                    line: y,
+                    origin_x: text_origin,
+                    visual_base,
+                },
+            });
+            visible_lines.push(pad_line(row_spans, inner_area.width as usize, row_style));
             current_row += 1;
         }
     }
@@ -588,7 +711,7 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             Span::raw(GUTTER_EMPTY),
             Span::raw("  "),
             Span::styled(
-                format!("{:>width$} {BOX_VERTICAL} ", TILDE, width = line_digits),
+                format!("{:>width$}{num_tail}", TILDE, width = line_digits),
                 Style::default().fg(theme.line_number),
             ),
         ]));
@@ -597,189 +720,58 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
     frame.render_widget(Paragraph::new(visible_lines), inner_area);
 
     // 3. Render Statusline
-    let (badge_text, badge_color) = match editor.mode {
-        Mode::Normal => (" NORMAL ", theme.mode_normal),
-        Mode::Insert => (" INSERT ", theme.mode_insert),
-        Mode::Command => (" COMMAND ", theme.mode_command),
-        Mode::Visual { .. } => (" VISUAL ", theme.mode_visual),
-    };
-
-    let bar_bg = theme.status_bg;
-    let pill_bg = theme.status_pill_bg;
-    let bar_foreground = theme.status_fg;
-
-    let error_count = editor
-        .diagnostics
-        .iter()
-        .filter(|d| d.severity == 1)
-        .count();
-    let warn_count = editor
-        .diagnostics
-        .iter()
-        .filter(|d| d.severity == 2)
-        .count();
-
-    let sidebar_toggle_badge = if editor.explorer.visible {
-        format!(" {FOLDER} Files ")
-    } else {
-        format!(" {FOLDER_OUTLINE} Files ")
-    };
-    let wrap_badge = if editor.line_wrap {
-        format!(" {WRAP_ON} Wrap ")
-    } else {
-        format!(" {WRAP_OFF} NoWrap ")
-    };
-    let hints_badge = if editor.show_inlay_hints {
-        format!(" {HINTS_ON} Hints ")
-    } else {
-        format!(" {HINTS_OFF} Hints ")
-    };
-
-    let mut status_left_spans = vec![
-        Span::styled(
-            badge_text,
-            Style::default()
-                .bg(badge_color)
-                .fg(Color::Rgb(15, 17, 22))
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            POWERLINE_RIGHT,
-            Style::default().bg(pill_bg).fg(badge_color),
-        ),
-    ];
-
-    // Statusline Git Branch & Diff Counters
-    if let Some(branch) = &editor.git_diff.branch {
-        status_left_spans.push(Span::styled(
-            format!(" {GIT_BRANCH} {branch} "),
-            Style::default()
-                .bg(pill_bg)
-                .fg(theme.git_branch)
-                .add_modifier(Modifier::BOLD),
-        ));
-
-        let added = editor.git_diff.added_lines;
-        let modified = editor.git_diff.modified_lines;
-        let deleted = editor.git_diff.deleted_lines;
-
-        if added > 0 || modified > 0 || deleted > 0 {
-            status_left_spans.push(Span::styled(
-                format!("+{added} ~{modified} -{deleted} "),
-                Style::default().bg(pill_bg).fg(theme.line_number),
-            ));
-        }
-    }
-
-    status_left_spans.extend(vec![
-        Span::styled(
-            sidebar_toggle_badge,
-            Style::default().bg(pill_bg).fg(if editor.explorer.visible {
-                theme.mode_normal
-            } else {
-                bar_foreground
-            }),
-        ),
-        Span::styled(
-            wrap_badge,
-            Style::default().bg(pill_bg).fg(if editor.line_wrap {
-                theme.mode_insert
-            } else {
-                theme.line_number
-            }),
-        ),
-        Span::styled(
-            hints_badge,
-            Style::default().bg(pill_bg).fg(if editor.show_inlay_hints {
-                theme.syn_function
-            } else {
-                theme.line_number
-            }),
-        ),
-        Span::styled(
-            format!(" {PALETTE} Cmd "),
-            Style::default().bg(pill_bg).fg(theme.mode_command),
-        ),
-        Span::styled(POWERLINE_RIGHT, Style::default().bg(bar_bg).fg(pill_bg)),
-    ]);
-
-    let spinner_icon = SPINNER[(editor.spinner_tick / 3) % SPINNER.len()];
-    let mut status_right_spans = Vec::new();
-
-    match &editor.lsp_status {
-        LspStatus::Starting(name) => {
-            status_right_spans.push(Span::styled(
-                format!(" {spinner_icon} {name} "),
-                Style::default()
-                    .bg(bar_bg)
-                    .fg(theme.mode_command)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        }
-        LspStatus::Ready(name) => {
-            status_right_spans.push(Span::styled(
-                format!(" {LSP_READY} {name} "),
-                Style::default().bg(bar_bg).fg(theme.mode_insert),
-            ));
-        }
-        LspStatus::Error(err) => {
-            status_right_spans.push(Span::styled(
-                format!(" {LSP_ERROR} LSP: {err} "),
-                Style::default()
-                    .bg(bar_bg)
-                    .fg(theme.diag_error)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        }
-        LspStatus::NotFound(name) => {
-            status_right_spans.push(Span::styled(
-                format!(" {LSP_NOT_FOUND} {name} missing "),
-                Style::default().bg(bar_bg).fg(theme.mode_command),
-            ));
-        }
-        LspStatus::Disabled => {}
-    }
-
-    if error_count > 0 {
-        status_right_spans.push(Span::styled(
-            format!(" {DIAG_ERROR} {error_count} "),
-            Style::default().bg(bar_bg).fg(theme.diag_error),
-        ));
-    }
-    if warn_count > 0 {
-        status_right_spans.push(Span::styled(
-            format!(" {DIAG_WARN} {warn_count} "),
-            Style::default().bg(bar_bg).fg(theme.diag_warn),
-        ));
-    }
-
-    status_right_spans.extend(vec![
-        Span::styled(POWERLINE_LEFT, Style::default().bg(bar_bg).fg(pill_bg)),
-        Span::styled(
-            format!(" {THEME} {} ", theme.display_name),
-            Style::default().bg(pill_bg).fg(bar_foreground),
-        ),
-        Span::styled(POWERLINE_LEFT, Style::default().bg(pill_bg).fg(badge_color)),
-        Span::styled(
-            format!(
-                " {LOCATION} {}:{} ",
-                editor.cursor_y + 1,
-                editor.cursor_x + 1
-            ),
-            Style::default()
-                .bg(badge_color)
-                .fg(Color::Rgb(15, 17, 22))
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]);
-
-    // The deck is drawn once in `render_shell_chrome` so resize cannot stack two bars.
-
     // 4. Command Bar & Status Messages
     let (screen_x, screen_y) =
         cursor_screen_pos.unwrap_or((inner_area.x + gutter_width as u16, inner_area.y));
 
-    if editor.mode == Mode::Command {
+    if let Some(prompt) = &editor.confirm {
+        let yes = " Yes ";
+        let no = " No ";
+        let msg = clip_cols(
+            &prompt.message,
+            (command_area.width as usize).saturating_sub(cols(yes) + cols(no) + 4),
+        );
+        let line = Line::from(vec![
+            Span::styled(
+                format!(" {msg} "),
+                Style::default().bg(theme.status_bg).fg(theme.status_fg),
+            ),
+            Span::styled(
+                yes,
+                Style::default()
+                    .bg(theme.mode_insert)
+                    .fg(Color::Rgb(15, 17, 22))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" ", Style::default().bg(theme.status_bg)),
+            Span::styled(
+                no,
+                Style::default()
+                    .bg(theme.diag_error)
+                    .fg(Color::Rgb(15, 17, 22))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]);
+        let yes_x = command_area.x + 1 + cols(&msg) as u16 + 1;
+        editor.hit_regions.push(HitRegion {
+            x: yes_x,
+            y: command_area.y,
+            w: cols(yes) as u16,
+            h: 1,
+            action: HitAction::ConfirmYes,
+        });
+        editor.hit_regions.push(HitRegion {
+            x: yes_x + cols(yes) as u16 + 1,
+            y: command_area.y,
+            w: cols(no) as u16,
+            h: 1,
+            action: HitAction::ConfirmNo,
+        });
+        frame.render_widget(
+            Paragraph::new(line).style(Style::default().bg(theme.status_bg)),
+            command_area,
+        );
+    } else if editor.mode == Mode::Command {
         let prompt_line = Line::from(vec![
             Span::styled(
                 format!(" {PROMPT_COLON}"),
@@ -789,7 +781,11 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
             ),
             Span::raw(&editor.command_buffer),
         ]);
-        frame.render_widget(Paragraph::new(prompt_line), command_area);
+        frame.render_widget(
+            Paragraph::new(prompt_line)
+                .style(Style::default().bg(theme.status_bg).fg(theme.status_fg)),
+            command_area,
+        );
         let cmd_chars = editor.command_buffer.chars().count();
         let target_x = (2 + cmd_chars).min((frame.area().width.saturating_sub(1)) as usize) as u16;
         frame.set_cursor_position(Position::new(target_x, command_area.y));
@@ -818,23 +814,33 @@ pub fn render_ui(frame: &mut Frame, editor: &mut Editor) {
                 ),
             };
             Line::from(vec![
-                Span::styled(d_icon, icon_style),
+                Span::styled(d_icon, icon_style.bg(theme.status_bg)),
                 Span::styled(
                     &diag.message,
-                    Style::default().fg(theme.fg).add_modifier(Modifier::ITALIC),
+                    Style::default()
+                        .fg(theme.fg)
+                        .bg(theme.status_bg)
+                        .add_modifier(Modifier::ITALIC),
                 ),
             ])
         } else {
             Line::from(vec![
                 Span::styled(
                     format!(" {CHEVRON_RIGHT} "),
-                    Style::default().fg(theme.line_number),
+                    Style::default().fg(theme.line_number).bg(theme.status_bg),
                 ),
-                Span::styled(&editor.status_msg, Style::default().fg(theme.status_fg)),
+                Span::styled(
+                    &editor.status_msg,
+                    Style::default().fg(theme.status_fg).bg(theme.status_bg),
+                ),
             ])
         };
 
-        frame.render_widget(Paragraph::new(msg_line), command_area);
+        frame.render_widget(
+            Paragraph::new(msg_line)
+                .style(Style::default().bg(theme.status_bg).fg(theme.status_fg)),
+            command_area,
+        );
 
         if editor.focus == Focus::Editor
             && let Some((cx, cy)) = cursor_screen_pos
@@ -1808,6 +1814,18 @@ fn push_hit(editor: &mut Editor, area: Rect, action: HitAction) {
     });
 }
 
+fn short_lsp(name: &str) -> String {
+    let base = name
+        .rsplit(|c| c == '/' || c == '\\')
+        .next()
+        .unwrap_or(name);
+    let base = base
+        .strip_suffix("-language-server")
+        .or_else(|| base.strip_suffix("-lsp"))
+        .unwrap_or(base);
+    base.trim().to_string()
+}
+
 fn render_shell_chrome(
     frame: &mut Frame,
     editor: &mut Editor,
@@ -1823,29 +1841,62 @@ fn render_shell_chrome(
             Block::default().style(Style::default().bg(theme.explorer_bg)),
             area,
         );
+        // Single-cell marks. Wide nerd icons overflow a 3-column rail and paint into the editor.
         let items = [
-            ("F", FOLDER, HitAction::ToggleExplorer, editor.explorer.visible),
-            ("!", DIAG_ERROR, HitAction::ToggleProblems, editor.problems_open),
-            ("O", CMD_SYMBOLS, HitAction::ToggleOutline, editor.outline_open),
-            ("/", PALETTE, HitAction::OpenPalette, editor.palette.visible),
-            ("T", THEME, HitAction::OpenTheme, editor.theme_picker.is_some()),
+            (
+                "F",
+                HitAction::ToggleExplorer,
+                editor.explorer.visible,
+                theme.mode_normal,
+            ),
+            (
+                "!",
+                HitAction::ToggleProblems,
+                editor.problems_open,
+                theme.diag_error,
+            ),
+            (
+                "O",
+                HitAction::ToggleOutline,
+                editor.outline_open,
+                theme.syn_function,
+            ),
+            (
+                "/",
+                HitAction::OpenPalette,
+                editor.palette.visible,
+                theme.mode_command,
+            ),
+            (
+                "T",
+                HitAction::OpenTheme,
+                editor.theme_picker.is_some(),
+                theme.mode_visual,
+            ),
         ];
-        for (i, (letter, icon, action, on)) in items.iter().enumerate() {
+        for (i, (mark, action, on, color)) in items.iter().enumerate() {
             let y = area.y + i as u16;
             if y >= area.bottom() {
                 break;
             }
             let cell = Rect::new(area.x, y, area.width, 1);
-            let style = if *on {
-                Style::default()
-                    .fg(theme.mode_normal)
-                    .bg(theme.explorer_sel_bg)
-                    .add_modifier(Modifier::BOLD)
+            let bg = if *on {
+                theme.explorer_sel_bg
             } else {
-                Style::default().fg(theme.explorer_fg).bg(theme.explorer_bg)
+                theme.explorer_bg
             };
-            let label = fit_cols(&format!("{letter}{icon}"), area.width as usize);
-            frame.render_widget(Paragraph::new(Line::from(Span::styled(label, style))), cell);
+            let fg = if *on { *color } else { theme.line_number };
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    fit_cols(&format!(" {mark} "), area.width as usize),
+                    Style::default().fg(fg).bg(bg).add_modifier(if *on {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+                ))),
+                cell,
+            );
             push_hit(editor, cell, action.clone());
         }
     }
@@ -1856,7 +1907,12 @@ fn render_shell_chrome(
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(theme.border))
             .style(Style::default().bg(theme.explorer_bg))
-            .title(" Outline ");
+            .title(Line::from(Span::styled(
+                format!(" {CMD_SYMBOLS} Outline "),
+                Style::default()
+                    .fg(theme.syn_function)
+                    .add_modifier(Modifier::BOLD),
+            )));
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let tags: Vec<(usize, String)> = editor
@@ -1869,10 +1925,22 @@ fn render_shell_chrome(
             .collect();
         let mut lines = Vec::new();
         for (i, name) in &tags {
-            lines.push(Line::from(Span::styled(
-                safe_truncate(&format!(" {KIND_FUNCTION} {name}"), inner.width as usize),
-                Style::default().fg(theme.syn_function),
-            )));
+            let icon_style = Style::default()
+                .fg(theme.syn_function)
+                .bg(theme.explorer_bg);
+            let name_style = Style::default().fg(theme.explorer_fg).bg(theme.explorer_bg);
+            let label = clip_cols(
+                name,
+                (inner.width as usize).saturating_sub(cols(KIND_FUNCTION) + 2),
+            );
+            lines.push(pad_line(
+                vec![
+                    Span::styled(format!(" {KIND_FUNCTION} "), icon_style),
+                    Span::styled(label, name_style),
+                ],
+                inner.width as usize,
+                name_style,
+            ));
             push_hit(
                 editor,
                 Rect::new(inner.x, inner.y + *i as u16, inner.width, 1),
@@ -1880,9 +1948,15 @@ fn render_shell_chrome(
             );
         }
         if lines.is_empty() {
-            lines.push(Line::from(Span::styled(" no symbols", Style::default().fg(theme.line_number))));
+            lines.push(Line::from(Span::styled(
+                " no symbols",
+                Style::default().fg(theme.line_number),
+            )));
         }
-        frame.render_widget(Paragraph::new(lines), inner);
+        frame.render_widget(
+            Paragraph::new(lines).style(Style::default().bg(theme.explorer_bg)),
+            inner,
+        );
     }
 
     if let Some(area) = problems {
@@ -1890,26 +1964,48 @@ fn render_shell_chrome(
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(theme.diag_warn))
-            .title(format!(" Problems {} ", editor.diagnostics.len()));
+            .style(Style::default().bg(theme.explorer_bg))
+            .title(Line::from(Span::styled(
+                format!(" {DIAG_ERROR} Problems {} ", editor.diagnostics.len()),
+                Style::default()
+                    .fg(theme.diag_warn)
+                    .add_modifier(Modifier::BOLD),
+            )));
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        let diags: Vec<(usize, String, Color)> = editor
+        let diags: Vec<(usize, String, Color, &'static str)> = editor
             .diagnostics
             .iter()
             .take(inner.height as usize)
             .enumerate()
             .map(|(i, d)| {
-                let color = if d.severity == 1 { theme.diag_error } else { theme.diag_warn };
-                let icon = if d.severity == 1 { DIAG_ERROR } else { DIAG_WARN };
-                (i, format!(" {icon} {}:{} {}", d.line + 1, d.col + 1, d.message), color)
+                let (color, icon) = match d.severity {
+                    1 => (theme.diag_error, DIAG_ERROR),
+                    2 => (theme.diag_warn, DIAG_WARN),
+                    3 => (theme.diag_info, DIAG_INFO),
+                    _ => (theme.diag_hint, DIAG_HINT),
+                };
+                (
+                    i,
+                    format!("{}:{} {}", d.line + 1, d.col + 1, d.message),
+                    color,
+                    icon,
+                )
             })
             .collect();
         let mut lines = Vec::new();
-        for (i, text, color) in &diags {
-            lines.push(Line::from(Span::styled(
-                safe_truncate(text, inner.width as usize),
-                Style::default().fg(*color),
-            )));
+        for (i, text, color, icon) in &diags {
+            let icon_style = Style::default().fg(*color).bg(theme.explorer_bg);
+            let name_style = Style::default().fg(theme.explorer_fg).bg(theme.explorer_bg);
+            let label = clip_cols(text, (inner.width as usize).saturating_sub(cols(icon) + 2));
+            lines.push(pad_line(
+                vec![
+                    Span::styled(format!(" {icon} "), icon_style),
+                    Span::styled(label, name_style),
+                ],
+                inner.width as usize,
+                name_style,
+            ));
             push_hit(
                 editor,
                 Rect::new(inner.x, inner.y + *i as u16, inner.width, 1),
@@ -1917,51 +2013,154 @@ fn render_shell_chrome(
             );
         }
         if lines.is_empty() {
-            lines.push(Line::from(Span::styled(" no problems", Style::default().fg(theme.mode_insert))));
+            lines.push(Line::from(Span::styled(
+                " no problems",
+                Style::default().fg(theme.mode_insert),
+            )));
         }
-        frame.render_widget(Paragraph::new(lines), inner);
+        frame.render_widget(
+            Paragraph::new(lines).style(Style::default().bg(theme.explorer_bg)),
+            inner,
+        );
     }
 
-    frame.render_widget(Block::default().style(Style::default().bg(theme.status_bg)), deck);
-    let mode = match editor.mode {
-        Mode::Normal => "N",
-        Mode::Insert => "I",
-        Mode::Command => "C",
-        Mode::Visual { .. } => "V",
+    frame.render_widget(
+        Block::default().style(Style::default().bg(theme.status_bg)),
+        deck,
+    );
+    let (mode, mode_color) = match editor.mode {
+        Mode::Normal => ("N", theme.mode_normal),
+        Mode::Insert => ("I", theme.mode_insert),
+        Mode::Command => ("C", theme.mode_command),
+        Mode::Visual { .. } => ("V", theme.mode_visual),
     };
     let pos = format!("{}:{}", editor.cursor_y + 1, editor.cursor_x + 1);
-    let cells: Vec<(String, HitAction, bool)> = if narrow {
+    let lsp_label = match &editor.lsp_status {
+        crate::lsp::LspStatus::Starting(name) => Some((short_lsp(name), theme.mode_command)),
+        crate::lsp::LspStatus::Ready(name) => Some((short_lsp(name), theme.mode_insert)),
+        crate::lsp::LspStatus::Error(_) => Some(("LSP!".to_string(), theme.diag_error)),
+        crate::lsp::LspStatus::NotFound(_) => Some(("no-lsp".to_string(), theme.mode_command)),
+        crate::lsp::LspStatus::Disabled => None,
+    };
+    let error_count = editor
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == 1)
+        .count();
+    let warn_count = editor
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == 2)
+        .count();
+    let chips: Vec<(String, HitAction, bool, Color)> = if narrow {
         vec![
-            (format!("{FOLDER} Files"), HitAction::ToggleExplorer, editor.explorer.visible),
-            (format!("{DIAG_ERROR} Err"), HitAction::ToggleProblems, editor.problems_open),
-            (format!("{CMD_SYMBOLS} Sym"), HitAction::ToggleOutline, editor.outline_open),
-            (format!("{PALETTE} Cmd"), HitAction::OpenPalette, false),
+            (
+                format!("{FOLDER} Files"),
+                HitAction::ToggleExplorer,
+                editor.explorer.visible,
+                theme.mode_normal,
+            ),
+            (
+                format!("{DIAG_ERROR} Err"),
+                HitAction::ToggleProblems,
+                editor.problems_open,
+                theme.diag_error,
+            ),
+            (
+                format!("{CMD_SYMBOLS} Sym"),
+                HitAction::ToggleOutline,
+                editor.outline_open,
+                theme.syn_function,
+            ),
+            (
+                format!("{PALETTE} Cmd"),
+                HitAction::OpenPalette,
+                false,
+                theme.mode_command,
+            ),
         ]
     } else {
         vec![
-            (format!("{FOLDER} Files"), HitAction::ToggleExplorer, editor.explorer.visible),
-            (format!("{DIAG_ERROR} Problems"), HitAction::ToggleProblems, editor.problems_open),
-            (format!("{CMD_SYMBOLS} Outline"), HitAction::ToggleOutline, editor.outline_open),
-            (format!("{LSP_READY} LSP"), HitAction::OpenLsp, false),
-            (format!("{THEME} Theme"), HitAction::OpenTheme, false),
-            (format!("{LINE_WRAP} Wrap"), HitAction::ToggleWrap, editor.line_wrap),
-            (format!("{HINTS_ON} Hints"), HitAction::ToggleHints, editor.show_inlay_hints),
-            (format!("{DIAG_WARN} Diag"), HitAction::NextDiagnostic, !editor.diagnostics.is_empty()),
+            (
+                format!("{FOLDER} Files"),
+                HitAction::ToggleExplorer,
+                editor.explorer.visible,
+                theme.mode_normal,
+            ),
+            (
+                format!("{DIAG_ERROR} Problems"),
+                HitAction::ToggleProblems,
+                editor.problems_open,
+                theme.diag_warn,
+            ),
+            (
+                format!("{CMD_SYMBOLS} Outline"),
+                HitAction::ToggleOutline,
+                editor.outline_open,
+                theme.syn_function,
+            ),
+            (
+                format!("{LSP_READY} LSP"),
+                HitAction::OpenLsp,
+                false,
+                theme.mode_insert,
+            ),
+            (
+                format!("{THEME} Theme"),
+                HitAction::OpenTheme,
+                false,
+                theme.mode_visual,
+            ),
+            (
+                format!("{LINE_WRAP} Wrap"),
+                HitAction::ToggleWrap,
+                editor.line_wrap,
+                theme.mode_insert,
+            ),
+            (
+                format!("{HINTS_ON} Hints"),
+                HitAction::ToggleHints,
+                editor.show_inlay_hints,
+                theme.syn_function,
+            ),
+            (
+                format!("{PALETTE} Cmd"),
+                HitAction::OpenPalette,
+                false,
+                theme.mode_command,
+            ),
         ]
     };
-    let right = fit_cols(&format!("{mode} {pos}"), 10);
-    let right_w = cols(&right).min(deck.width as usize) as u16;
+    let mode_label = format!(" {mode} ");
+    let pos_label = format!(" {pos} ");
+    let mut right_w = cols(&mode_label) + cols(&pos_label);
+    let lsp_text = lsp_label
+        .as_ref()
+        .map(|(s, _)| clip_cols(s, if narrow { 8 } else { 14 }));
+    if let Some(s) = &lsp_text {
+        right_w += cols(s) + 1;
+    }
+    if error_count > 0 {
+        right_w += cols(&format!("{error_count}")) + 3;
+    }
+    if warn_count > 0 {
+        right_w += cols(&format!("{warn_count}")) + 3;
+    }
+    let right_w = (right_w as u16).min(deck.width.saturating_sub(8));
     let left_w = deck.width.saturating_sub(right_w);
-    let cell_w = (left_w / cells.len() as u16).max(1);
-    for (i, (label, action, on)) in cells.iter().enumerate() {
-        let x = deck.x + i as u16 * cell_w;
-        if x >= deck.x + left_w {
+    let mut x = deck.x;
+    let left_end = deck.x + left_w;
+    for (label, action, on, color) in &chips {
+        let w = (cols(label) + 1).max(5) as u16;
+        if x + w > left_end {
             break;
         }
-        let w = cell_w.min(deck.x + left_w - x);
         let cell = Rect::new(x, deck.y, w, 1);
         let style = if *on {
-            Style::default().fg(theme.mode_normal).bg(theme.explorer_sel_bg).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(*color)
+                .bg(theme.explorer_sel_bg)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(theme.status_fg).bg(theme.status_bg)
         };
@@ -1970,43 +2169,146 @@ fn render_shell_chrome(
             cell,
         );
         push_hit(editor, cell, action.clone());
+        x += w;
     }
-    let right_area = Rect::new(deck.x + left_w, deck.y, right_w, 1);
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            right,
-            Style::default().fg(theme.mode_insert).bg(theme.status_bg).add_modifier(Modifier::BOLD),
-        ))),
-        right_area,
-    );
+    if let Some(branch) = &editor.git_diff.branch {
+        if x < left_end {
+            let added = editor.git_diff.added_lines;
+            let modified = editor.git_diff.modified_lines;
+            let deleted = editor.git_diff.deleted_lines;
+            let extra = if added + modified + deleted > 0 {
+                format!(" +{added} ~{modified} -{deleted}")
+            } else {
+                String::new()
+            };
+            let text = format!(" {GIT_BRANCH} {branch}{extra}");
+            let w = cols(&text).min((left_end - x) as usize) as u16;
+            if w > 2 {
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        fit_cols(&text, w as usize),
+                        Style::default()
+                            .fg(theme.git_branch)
+                            .bg(theme.status_bg)
+                            .add_modifier(Modifier::BOLD),
+                    ))),
+                    Rect::new(x, deck.y, w, 1),
+                );
+            }
+        }
+    }
+    let mut rx = deck.x + left_w;
+    if error_count > 0 && rx < deck.right() {
+        let text = format!(" {DIAG_ERROR}{error_count}");
+        let w = cols(&text).min((deck.right() - rx) as usize) as u16;
+        let cell = Rect::new(rx, deck.y, w, 1);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                fit_cols(&text, w as usize),
+                Style::default().fg(theme.diag_error).bg(theme.status_bg),
+            ))),
+            cell,
+        );
+        push_hit(editor, cell, HitAction::NextDiagnostic);
+        rx += w;
+    }
+    if warn_count > 0 && rx < deck.right() {
+        let text = format!(" {DIAG_WARN}{warn_count}");
+        let w = cols(&text).min((deck.right() - rx) as usize) as u16;
+        let cell = Rect::new(rx, deck.y, w, 1);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                fit_cols(&text, w as usize),
+                Style::default().fg(theme.diag_warn).bg(theme.status_bg),
+            ))),
+            cell,
+        );
+        push_hit(editor, cell, HitAction::NextDiagnostic);
+        rx += w;
+    }
+    if let Some((label, color)) = lsp_text.zip(lsp_label.map(|(_, c)| c)) {
+        if rx < deck.right() {
+            let w = (cols(&label) + 1).min((deck.right() - rx) as usize) as u16;
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    fit_cols(&format!(" {label}"), w as usize),
+                    Style::default().fg(color).bg(theme.status_bg),
+                ))),
+                Rect::new(rx, deck.y, w, 1),
+            );
+            rx += w;
+        }
+    }
+    if rx < deck.right() {
+        let rest = deck.right() - rx;
+        let mode_w = cols(&mode_label).min(rest as usize) as u16;
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                fit_cols(&mode_label, mode_w as usize),
+                Style::default()
+                    .fg(Color::Rgb(15, 17, 22))
+                    .bg(mode_color)
+                    .add_modifier(Modifier::BOLD),
+            ))),
+            Rect::new(rx, deck.y, mode_w, 1),
+        );
+        rx += mode_w;
+        if rx < deck.right() {
+            let pos_w = deck.right() - rx;
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    fit_cols(&pos_label, pos_w as usize),
+                    Style::default()
+                        .fg(theme.mode_insert)
+                        .bg(theme.status_bg)
+                        .add_modifier(Modifier::BOLD),
+                ))),
+                Rect::new(rx, deck.y, pos_w, 1),
+            );
+        }
+    }
 
     if narrow && (editor.explorer.visible || editor.problems_open || editor.outline_open) {
         let body = frame.area();
-        let top = 1u16.min(body.height.saturating_sub(3));
-        let bottom = deck.y.max(top + 4);
-        let sheet = Rect::new(0, top, body.width, bottom.saturating_sub(top));
+        let sheet = Rect::new(0, 0, body.width, deck.y.max(4));
         frame.render_widget(Clear, sheet);
-        let title = if editor.explorer.visible {
-            " Files "
+        let (title, title_color) = if editor.explorer.visible {
+            (format!(" {FOLDER} Files "), theme.mode_normal)
         } else if editor.problems_open {
-            " Problems "
+            (format!(" {DIAG_ERROR} Problems "), theme.diag_warn)
         } else {
-            " Outline "
+            (format!(" {CMD_SYMBOLS} Outline "), theme.syn_function)
         };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(theme.border_focused))
             .style(Style::default().bg(theme.explorer_bg))
-            .title(title);
+            .title(Line::from(Span::styled(
+                title,
+                Style::default()
+                    .fg(title_color)
+                    .add_modifier(Modifier::BOLD),
+            )));
         let inner = block.inner(sheet);
         frame.render_widget(block, sheet);
-        push_hit(editor, Rect::new(sheet.right().saturating_sub(4), sheet.y, 3, 1), HitAction::CloseSheet);
+        let close = Rect::new(sheet.right().saturating_sub(6), sheet.y, 5, 2);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "  x ",
+                Style::default()
+                    .fg(theme.diag_error)
+                    .bg(theme.explorer_bg)
+                    .add_modifier(Modifier::BOLD),
+            ))),
+            Rect::new(sheet.right().saturating_sub(5), sheet.y, 4, 1),
+        );
+        push_hit(editor, close, HitAction::CloseSheet);
         if editor.explorer.visible {
             editor.explorer.update_scroll(inner.height as usize);
             let start = editor.explorer.scroll;
             let end = (start + inner.height as usize).min(editor.explorer.entries.len());
-            let rows: Vec<(usize, String, bool)> = editor
+            let rows: Vec<(usize, usize, &'static str, Color, String, bool)> = editor
                 .explorer
                 .entries
                 .iter()
@@ -2014,48 +2316,97 @@ fn render_shell_chrome(
                 .skip(start)
                 .take(end.saturating_sub(start))
                 .map(|(i, entry)| {
-                    let mark = if entry.is_dir {
-                        if entry.expanded { FOLDER_OPEN } else { FOLDER_CLOSED }
+                    let (icon, color) = if entry.is_dir {
+                        if entry.expanded {
+                            (FOLDER_OPEN, theme.explorer_dir_expanded)
+                        } else {
+                            (FOLDER_CLOSED, theme.explorer_dir)
+                        }
                     } else {
-                        file_icon_and_color(Some(&entry.path)).0.trim()
+                        let (icon, color) = file_icon_and_color(Some(&entry.path));
+                        (icon.trim(), color)
                     };
                     (
                         i,
-                        format!("{}{mark} {}", "  ".repeat(entry.depth), entry.name),
+                        entry.depth,
+                        icon,
+                        color,
+                        entry.name.clone(),
                         i == editor.explorer.selected_idx,
                     )
                 })
                 .collect();
             let mut lines = Vec::new();
-            for (offset, (i, text, selected)) in rows.iter().enumerate() {
-                lines.push(Line::from(Span::styled(
-                    safe_truncate(text, inner.width as usize),
-                    Style::default().fg(if *selected { theme.explorer_sel_fg } else { theme.explorer_fg }),
-                )));
+            for (offset, (i, depth, icon, color, name, selected)) in rows.iter().enumerate() {
+                lines.push(explorer_line(
+                    *depth,
+                    icon,
+                    *color,
+                    name,
+                    *selected,
+                    inner.width as usize,
+                    theme,
+                ));
                 push_hit(
                     editor,
                     Rect::new(inner.x, inner.y + offset as u16, inner.width, 1),
                     HitAction::ClickFile(*i),
                 );
             }
-            frame.render_widget(Paragraph::new(lines), inner);
+            frame.render_widget(
+                Paragraph::new(lines).style(Style::default().bg(theme.explorer_bg)),
+                inner,
+            );
         } else if editor.problems_open {
-            let diags: Vec<(usize, String)> = editor
+            let diags: Vec<(usize, String, Color, &'static str)> = editor
                 .diagnostics
                 .iter()
                 .take(inner.height as usize)
                 .enumerate()
-                .map(|(i, d)| (i, format!(" {}:{} {}", d.line + 1, d.col + 1, d.message)))
+                .map(|(i, d)| {
+                    let (color, icon) = match d.severity {
+                        1 => (theme.diag_error, DIAG_ERROR),
+                        2 => (theme.diag_warn, DIAG_WARN),
+                        3 => (theme.diag_info, DIAG_INFO),
+                        _ => (theme.diag_hint, DIAG_HINT),
+                    };
+                    (
+                        i,
+                        format!("{}:{} {}", d.line + 1, d.col + 1, d.message),
+                        color,
+                        icon,
+                    )
+                })
                 .collect();
             let mut lines = Vec::new();
-            for (i, text) in &diags {
-                lines.push(Line::from(Span::styled(
-                    safe_truncate(text, inner.width as usize),
-                    Style::default().fg(theme.diag_error),
-                )));
-                push_hit(editor, Rect::new(inner.x, inner.y + *i as u16, inner.width, 1), HitAction::ClickProblem(*i));
+            for (i, text, color, icon) in &diags {
+                let icon_style = Style::default().fg(*color).bg(theme.explorer_bg);
+                let name_style = Style::default().fg(theme.explorer_fg).bg(theme.explorer_bg);
+                let label = clip_cols(text, (inner.width as usize).saturating_sub(cols(icon) + 2));
+                lines.push(pad_line(
+                    vec![
+                        Span::styled(format!(" {icon} "), icon_style),
+                        Span::styled(label, name_style),
+                    ],
+                    inner.width as usize,
+                    name_style,
+                ));
+                push_hit(
+                    editor,
+                    Rect::new(inner.x, inner.y + *i as u16, inner.width, 1),
+                    HitAction::ClickProblem(*i),
+                );
             }
-            frame.render_widget(Paragraph::new(lines), inner);
+            if lines.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    " no problems",
+                    Style::default().fg(theme.mode_insert),
+                )));
+            }
+            frame.render_widget(
+                Paragraph::new(lines).style(Style::default().bg(theme.explorer_bg)),
+                inner,
+            );
         } else {
             let tags: Vec<(usize, String)> = editor
                 .syntax
@@ -2067,13 +2418,38 @@ fn render_shell_chrome(
                 .collect();
             let mut lines = Vec::new();
             for (i, name) in &tags {
-                lines.push(Line::from(Span::styled(
-                    safe_truncate(name, inner.width as usize),
-                    Style::default().fg(theme.syn_function),
-                )));
-                push_hit(editor, Rect::new(inner.x, inner.y + *i as u16, inner.width, 1), HitAction::ClickOutline(*i));
+                let icon_style = Style::default()
+                    .fg(theme.syn_function)
+                    .bg(theme.explorer_bg);
+                let name_style = Style::default().fg(theme.explorer_fg).bg(theme.explorer_bg);
+                let label = clip_cols(
+                    name,
+                    (inner.width as usize).saturating_sub(cols(KIND_FUNCTION) + 2),
+                );
+                lines.push(pad_line(
+                    vec![
+                        Span::styled(format!(" {KIND_FUNCTION} "), icon_style),
+                        Span::styled(label, name_style),
+                    ],
+                    inner.width as usize,
+                    name_style,
+                ));
+                push_hit(
+                    editor,
+                    Rect::new(inner.x, inner.y + *i as u16, inner.width, 1),
+                    HitAction::ClickOutline(*i),
+                );
             }
-            frame.render_widget(Paragraph::new(lines), inner);
+            if lines.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    " no symbols",
+                    Style::default().fg(theme.line_number),
+                )));
+            }
+            frame.render_widget(
+                Paragraph::new(lines).style(Style::default().bg(theme.explorer_bg)),
+                inner,
+            );
         }
     }
 }

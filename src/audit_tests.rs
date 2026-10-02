@@ -6,12 +6,12 @@ use std::path::PathBuf;
 
 use ropey::Rope;
 
-use crate::editor::{line_len, Editor};
+use crate::editor::{Editor, line_len};
 use crate::git::compute_hunks_from_text;
 use crate::grammar::grammar_symbol;
 use crate::lsp::{
-    char_to_utf16_col, parse_snippet_to_plain_text, slice_utf16, utf16_to_char_col, DiagnosticItem,
-    SuggestionItem, TextEditItem,
+    DiagnosticItem, SuggestionItem, TextEditItem, char_to_utf16_col, parse_snippet_to_plain_text,
+    slice_utf16, utf16_to_char_col,
 };
 use crate::safe_io::{atomic_write_with, file_stamp};
 

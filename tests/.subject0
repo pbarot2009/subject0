@@ -1,5 +1,5 @@
 {
-  "line_wrap": true,
+  "line_wrap": false,
   "preferred_lsps": {
     "python": "pyright"
   },

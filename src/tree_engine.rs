@@ -109,7 +109,9 @@ fn indent_from_query(
                     level += 1;
                 }
             } else if name == "outdent" || name == "outdent.always" {
-                if node.start_byte() >= byte_pos && node.start_position().row == byte_line(source, byte_pos) {
+                if node.start_byte() >= byte_pos
+                    && node.start_position().row == byte_line(source, byte_pos)
+                {
                     level -= 1;
                 }
             }

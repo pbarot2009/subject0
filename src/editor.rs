@@ -192,7 +192,11 @@ pub enum HitAction {
     ClickFile(usize),
     ClickProblem(usize),
     ClickOutline(usize),
-    ClickEditorLine(usize),
+    ClickEditorLine {
+        line: usize,
+        origin_x: u16,
+        visual_base: usize,
+    },
     ToggleProblems,
     ToggleOutline,
     CloseSheet,
@@ -2424,9 +2428,11 @@ impl Editor {
             self.rope.remove(insert_pos..insert_pos + ws_len);
         }
         let prev_needs_space = insert_pos > 0
-            && !matches!(self.rope.char(insert_pos - 1), ' ' | '\t' | '\n' | '(' | '[' | '{');
-        let next_exists = insert_pos < self.rope.len_chars()
-            && self.rope.char(insert_pos) != '\n';
+            && !matches!(
+                self.rope.char(insert_pos - 1),
+                ' ' | '\t' | '\n' | '(' | '[' | '{'
+            );
+        let next_exists = insert_pos < self.rope.len_chars() && self.rope.char(insert_pos) != '\n';
         if prev_needs_space && next_exists {
             self.rope.insert_char(insert_pos, ' ');
         }
@@ -2710,10 +2716,7 @@ impl Editor {
             let prefix = self.current_word_prefix();
             let prefix_len = prefix.chars().count();
             let end_col = self.cursor_utf16_col();
-            let start_col = end_col.saturating_sub(char_to_utf16_col(
-                &prefix,
-                prefix_len,
-            ));
+            let start_col = end_col.saturating_sub(char_to_utf16_col(&prefix, prefix_len));
             edits.push(TextEditItem {
                 start_line: self.cursor_y,
                 start_col,
@@ -2754,7 +2757,8 @@ impl Editor {
         replacement: &str,
     ) -> Option<usize> {
         let primary = edits.iter().rev().find(|e| e.new_text == replacement)?;
-        let primary_start = Self::lsp_pos_to_char_index(rope, primary.start_line, primary.start_col);
+        let primary_start =
+            Self::lsp_pos_to_char_index(rope, primary.start_line, primary.start_col);
         let mut shift = 0isize;
         for edit in edits {
             let start = Self::lsp_pos_to_char_index(rope, edit.start_line, edit.start_col);
@@ -2893,20 +2897,8 @@ impl Editor {
                 }
             }
             CommandId::SelectAll => self.select_all(),
-            CommandId::ToggleExplorer => {
-                self.explorer.visible = !self.explorer.visible;
-                if self.explorer.visible {
-                    self.explorer.refresh();
-                    self.focus = Focus::Explorer;
-                } else {
-                    self.focus = Focus::Editor;
-                }
-            }
-            CommandId::ToggleWrap => {
-                self.line_wrap = !self.line_wrap;
-                self.status_msg =
-                    format!("Line Wrap: {}", if self.line_wrap { "ON" } else { "OFF" });
-            }
+            CommandId::ToggleExplorer => self.toggle_files(),
+            CommandId::ToggleWrap => self.toggle_wrap(),
             CommandId::Save => {
                 if let Err(e) = self.save() {
                     self.status_msg = format!("Error saving: {e}");
@@ -3317,6 +3309,68 @@ impl Editor {
     /// True when the terminal is too narrow for a docked sidebar.
     pub fn shell_narrow(&self) -> bool {
         self.term_cols < 72
+    }
+
+    /// Opens the file sheet. On a narrow screen this is the only open panel.
+    pub fn toggle_files(&mut self) {
+        self.explorer.visible = !self.explorer.visible;
+        if self.explorer.visible {
+            if self.shell_narrow() {
+                self.problems_open = false;
+                self.outline_open = false;
+            }
+            self.explorer.refresh();
+            self.focus = Focus::Explorer;
+        } else {
+            self.focus = Focus::Editor;
+        }
+    }
+
+    /// Opens the problems sheet. On a narrow screen this is the only open panel.
+    pub fn toggle_problems_panel(&mut self) {
+        self.problems_open = !self.problems_open;
+        if self.problems_open && self.shell_narrow() {
+            self.explorer.visible = false;
+            self.outline_open = false;
+        }
+        self.status_msg = if self.problems_open {
+            "Problems open".to_string()
+        } else {
+            "Problems closed".to_string()
+        };
+    }
+
+    /// Opens the outline sheet. On a narrow screen this is the only open panel.
+    pub fn toggle_outline_panel(&mut self) {
+        self.outline_open = !self.outline_open;
+        if self.outline_open {
+            if self.shell_narrow() {
+                self.explorer.visible = false;
+                self.problems_open = false;
+            }
+            if self.syntax.tags.is_empty() {
+                self.request_document_symbols();
+            }
+        }
+        self.status_msg = if self.outline_open {
+            "Outline open".to_string()
+        } else {
+            "Outline closed".to_string()
+        };
+    }
+
+    pub fn toggle_wrap(&mut self) {
+        self.line_wrap = !self.line_wrap;
+        self.config.line_wrap = self.line_wrap;
+        let _ = self.config.save();
+        self.status_msg = format!("Line Wrap: {}", if self.line_wrap { "ON" } else { "OFF" });
+    }
+
+    pub fn close_sheet(&mut self) {
+        self.explorer.visible = false;
+        self.problems_open = false;
+        self.outline_open = false;
+        self.focus = Focus::Editor;
     }
 
     pub fn clamp_cursor(&mut self) {
