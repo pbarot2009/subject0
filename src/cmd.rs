@@ -259,11 +259,13 @@ impl CliArgs {
             }
 
             let temp_dir = env::temp_dir().join(format!("s0_queries_{}", process::id()));
+            println!("  {yellow}{CHEVRON_RIGHT}{r} Cloning subject0 queries");
             let status = Command::new("git")
                 .args([
                     "clone",
                     "--depth",
                     "1",
+                    "--quiet",
                     "https://github.com/pbarot2009/subject0.git",
                 ])
                 .arg(&temp_dir)
@@ -481,7 +483,7 @@ impl CliArgs {
       {white}s0 src/main.rs:50:10{r}
 
       {gray}# Check system grammars, Git, and LSP servers:{r}
-      {white}s0 --health{r}"
+      {white}s0 --health\n  Editor: :colors :links :calls :incoming :outgoing use the Helix-style LSP methods{r}"
         );
     }
 

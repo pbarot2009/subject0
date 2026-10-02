@@ -851,6 +851,7 @@ pub struct Editor {
     pub lsp_out_tx: Option<mpsc::UnboundedSender<LspEvent>>,
     pub spinner_tick: usize,
     pub lsp_req_id: i64,
+    pub pending_rename: Option<String>,
     pub doc_version: i32,
 
     // Git Version Control State
@@ -988,6 +989,7 @@ impl Editor {
             lsp_out_tx: None,
             spinner_tick: 0,
             lsp_req_id: 10,
+            pending_rename: None,
 
             doc_version: 1,
             completions: Vec::new(),
@@ -1656,14 +1658,65 @@ impl Editor {
         }
         if let Some(tx) = &self.lsp_tx {
             self.lsp_req_id += 1;
+            self.pending_rename = Some(new_name.to_string());
             let col = self.cursor_utf16_col();
-            let _ = tx.send(LspInbound::Rename {
+            let _ = tx.send(LspInbound::PrepareRename {
                 line: self.cursor_y,
                 col,
                 new_name: new_name.to_string(),
                 req_id: self.lsp_req_id,
             });
-            self.status_msg = format!("Renaming to '{new_name}'…");
+            self.status_msg = format!("Preparing rename to '{new_name}'…");
+        }
+    }
+
+    pub fn finish_rename(&mut self) {
+        let Some(new_name) = self.pending_rename.clone() else {
+            return;
+        };
+        if let Some(tx) = &self.lsp_tx {
+            self.lsp_req_id += 1;
+            let col = self.cursor_utf16_col();
+            let _ = tx.send(LspInbound::Rename {
+                line: self.cursor_y,
+                col,
+                new_name,
+                req_id: self.lsp_req_id,
+            });
+        }
+    }
+
+    pub fn request_document_colors(&mut self) {
+        if let Some(tx) = &self.lsp_tx {
+            self.lsp_req_id += 1;
+            let _ = tx.send(LspInbound::DocumentColor {
+                req_id: self.lsp_req_id,
+            });
+            self.status_msg = "Querying document colors…".to_string();
+        }
+    }
+
+    pub fn request_document_links(&mut self) {
+        if let Some(tx) = &self.lsp_tx {
+            self.lsp_req_id += 1;
+            let _ = tx.send(LspInbound::DocumentLink {
+                req_id: self.lsp_req_id,
+            });
+            self.status_msg = "Querying document links…".to_string();
+        }
+    }
+
+    pub fn request_call_hierarchy(&mut self, direction: &str) {
+        if let Some(tx) = &self.lsp_tx {
+            self.lsp_req_id += 1;
+            let col = self.cursor_utf16_col();
+            let _ = tx.send(LspInbound::CallHierarchy {
+                direction: direction.to_string(),
+                line: self.cursor_y,
+                col,
+                req_id: self.lsp_req_id,
+            });
+            self.status_msg = format!("Call hierarchy ({direction})…");
         }
     }
 
@@ -2941,6 +2994,11 @@ impl Editor {
             "hl" | "highlight" => self.request_document_highlight(),
             "ws" | "workspace-symbols" => self.request_workspace_symbols(),
             "fmt-range" | "range-fmt" => self.request_range_formatting(),
+            "colors" => self.request_document_colors(),
+            "links" => self.request_document_links(),
+            "calls" => self.request_call_hierarchy("prepare"),
+            "incoming" => self.request_call_hierarchy("incoming"),
+            "outgoing" => self.request_call_hierarchy("outgoing"),
             "fold" => self.toggle_fold(),
             "indent" | "=" => self.reindent_line(),
             "af" => self.select_textobject("function", false),

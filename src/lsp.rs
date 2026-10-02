@@ -398,6 +398,24 @@ pub enum LspInbound {
         arguments: Vec<Value>,
         req_id: i64,
     },
+    PrepareRename {
+        line: usize,
+        col: usize,
+        new_name: String,
+        req_id: i64,
+    },
+    DocumentColor {
+        req_id: i64,
+    },
+    DocumentLink {
+        req_id: i64,
+    },
+    CallHierarchy {
+        direction: String,
+        line: usize,
+        col: usize,
+        req_id: i64,
+    },
 }
 
 /// Outbound messages received from the background LSP actor.
@@ -462,6 +480,23 @@ pub enum LspOutbound {
         symbols: Vec<SymbolItem>,
     },
     /// Server asked the client to apply a workspace edit. Reply via `ApplyEditResult`.
+    PrepareRename {
+        req_id: i64,
+        ok: bool,
+        placeholder: String,
+    },
+    DocumentColors {
+        req_id: i64,
+        count: usize,
+    },
+    DocumentLinks {
+        req_id: i64,
+        locations: Vec<LocationItem>,
+    },
+    CallHierarchy {
+        req_id: i64,
+        locations: Vec<LocationItem>,
+    },
     ServerApplyEdit {
         req_id: Value,
         changes: HashMap<PathBuf, Vec<TextEditItem>>,
@@ -822,6 +857,24 @@ async fn send_position_request(
         });
         let _ = send_lsp_message(stdin, &req).await;
     }
+}
+
+fn parse_document_links(val: Value) -> Vec<LocationItem> {
+    val.as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| {
+                    let target = item.get("target")?.as_str()?.to_string();
+                    let line = item.get("range")?.get("start")?.get("line")?.as_u64()? as usize;
+                    Some(LocationItem {
+                        path: PathBuf::from(target),
+                        line,
+                        col: 0,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn parse_document_highlights(val: Value) -> Vec<(usize, usize, usize)> {
@@ -1781,6 +1834,8 @@ pub async fn run_lsp_actor(
         }
 
         let mut pending_requests: HashMap<i64, &'static str> = HashMap::new();
+        let mut pending_rename: HashMap<i64, String> = HashMap::new();
+        let mut pending_call: HashMap<i64, String> = HashMap::new();
         let mut last_completion_req: Option<i64> = None;
         let mut child_crashed = false;
         let mut manual_reboot = false;
@@ -2180,6 +2235,38 @@ pub async fn run_lsp_actor(
                             });
                             let _ = send_lsp_message(&mut stdin, &resp).await;
                         }
+                        Some(LspInbound::PrepareRename { line, col, new_name, req_id }) => {
+                            pending_requests.insert(req_id, "prepareRename");
+                            pending_rename.insert(req_id, new_name);
+                            send_position_request(&mut stdin, &current_file, req_id, "textDocument/prepareRename", line, col).await;
+                        }
+                        Some(LspInbound::DocumentColor { req_id }) => {
+                            pending_requests.insert(req_id, "documentColor");
+                            let uri_str = file_to_uri(&current_file);
+                            if let Ok(uri) = uri_str.parse::<Uri>() {
+                                let req = serde_json::json!({
+                                    "jsonrpc": "2.0", "id": req_id, "method": "textDocument/documentColor",
+                                    "params": { "textDocument": { "uri": uri } }
+                                });
+                                let _ = send_lsp_message(&mut stdin, &req).await;
+                            }
+                        }
+                        Some(LspInbound::DocumentLink { req_id }) => {
+                            pending_requests.insert(req_id, "documentLink");
+                            let uri_str = file_to_uri(&current_file);
+                            if let Ok(uri) = uri_str.parse::<Uri>() {
+                                let req = serde_json::json!({
+                                    "jsonrpc": "2.0", "id": req_id, "method": "textDocument/documentLink",
+                                    "params": { "textDocument": { "uri": uri } }
+                                });
+                                let _ = send_lsp_message(&mut stdin, &req).await;
+                            }
+                        }
+                        Some(LspInbound::CallHierarchy { direction, line, col, req_id }) => {
+                            pending_requests.insert(req_id, "prepareCallHierarchy");
+                            pending_call.insert(req_id, direction);
+                            send_position_request(&mut stdin, &current_file, req_id, "textDocument/prepareCallHierarchy", line, col).await;
+                        }
                         Some(LspInbound::ExecuteCommand { command, arguments, req_id }) => {
                             pending_requests.insert(req_id, "executeCommand");
                             let exec = serde_json::json!({
@@ -2304,6 +2391,53 @@ pub async fn run_lsp_actor(
                                         let edit: WorkspaceEdit = serde_json::from_value(result_val).unwrap_or_default();
                                         let changes = parse_lsp_workspace_edit(edit);
                                         emit(&tx, session_id, LspOutbound::Rename { req_id: resp_id, changes });
+                                    }
+                                    "prepareRename" => {
+                                        let placeholder = result_val.get("placeholder").and_then(Value::as_str).unwrap_or("").to_string();
+                                        let ok = !result_val.is_null();
+                                        let _ = pending_rename.remove(&resp_id);
+                                        emit(&tx, session_id, LspOutbound::PrepareRename { req_id: resp_id, ok, placeholder });
+                                    }
+                                    "documentColor" => {
+                                        let count = result_val.as_array().map(|a| a.len()).unwrap_or(0);
+                                        emit(&tx, session_id, LspOutbound::DocumentColors { req_id: resp_id, count });
+                                    }
+                                    "documentLink" => {
+                                        let locations = parse_document_links(result_val);
+                                        emit(&tx, session_id, LspOutbound::DocumentLinks { req_id: resp_id, locations });
+                                    }
+                                    "prepareCallHierarchy" => {
+                                        let direction = pending_call.remove(&resp_id).unwrap_or_else(|| "prepare".into());
+                                        let items = result_val.as_array().cloned().unwrap_or_default();
+                                        if direction == "prepare" || items.is_empty() {
+                                            let locations = items.iter().filter_map(|item| {
+                                                let uri = item.get("uri")?.as_str()?.to_string();
+                                                let range = item.get("range")?;
+                                                let line = range.get("start")?.get("line")?.as_u64()? as usize;
+                                                Some(LocationItem { path: PathBuf::from(uri), line, col: 0 })
+                                            }).collect();
+                                            emit(&tx, session_id, LspOutbound::CallHierarchy { req_id: resp_id, locations });
+                                        } else if let Some(item) = items.first() {
+                                            let method = if direction == "outgoing" { "callHierarchy/outgoingCalls" } else { "callHierarchy/incomingCalls" };
+                                            let follow = resp_id + 100_000;
+                                            pending_requests.insert(follow, "callHierarchyCalls");
+                                            let req = serde_json::json!({
+                                                "jsonrpc": "2.0", "id": follow, "method": method,
+                                                "params": { "item": item }
+                                            });
+                                            let _ = send_lsp_message(&mut stdin, &req).await;
+                                        }
+                                    }
+                                    "callHierarchyCalls" => {
+                                        let locations = result_val.as_array().map(|arr| {
+                                            arr.iter().filter_map(|item| {
+                                                let call = item.get("from").or_else(|| item.get("to"))?;
+                                                let uri = call.get("uri")?.as_str()?.to_string();
+                                                let line = call.get("range")?.get("start")?.get("line")?.as_u64()? as usize;
+                                                Some(LocationItem { path: PathBuf::from(uri), line, col: 0 })
+                                            }).collect()
+                                        }).unwrap_or_default();
+                                        emit(&tx, session_id, LspOutbound::CallHierarchy { req_id: resp_id, locations });
                                     }
                                     "documentSymbol" => {
                                         let symbols = parse_lsp_document_symbols(result_val);

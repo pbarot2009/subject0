@@ -290,6 +290,46 @@ async fn main() -> Result<()> {
                         });
                     }
                 }
+                LspOutbound::PrepareRename {
+                    req_id,
+                    ok,
+                    placeholder,
+                } => {
+                    if req_id == editor.lsp_req_id && ok {
+                        if !placeholder.is_empty() {
+                            editor.status_msg = format!("Rename placeholder: {placeholder}");
+                        }
+                        editor.finish_rename();
+                    } else if req_id == editor.lsp_req_id {
+                        editor.pending_rename = None;
+                        editor.status_msg = "Server cannot rename this symbol".to_string();
+                    }
+                }
+                LspOutbound::DocumentColors { req_id, count } => {
+                    if req_id == editor.lsp_req_id {
+                        editor.status_msg = format!("{count} document colors");
+                    }
+                }
+                LspOutbound::DocumentLinks { req_id, locations } => {
+                    if req_id == editor.lsp_req_id {
+                        editor.location_picker = Some(LocationPicker {
+                            title: "Document links",
+                            locations,
+                            selected_idx: 0,
+                            scroll: 0,
+                        });
+                    }
+                }
+                LspOutbound::CallHierarchy { req_id, locations } => {
+                    if req_id == editor.lsp_req_id || req_id == editor.lsp_req_id + 100_000 {
+                        editor.location_picker = Some(LocationPicker {
+                            title: "Call hierarchy",
+                            locations,
+                            selected_idx: 0,
+                            scroll: 0,
+                        });
+                    }
+                }
                 LspOutbound::Rename { req_id, changes } => {
                     if req_id != editor.lsp_req_id {
                         continue;
