@@ -10,7 +10,27 @@
 //! - `tags.scm` — fallback document symbols
 //! - `folds.scm` — fold ranges
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use tree_sitter::{Language, Node, Query, QueryCursor, StreamingIterator, Tree};
+
+fn cached_query(language: &Language, src: &str) -> Option<&'static Query> {
+    static CACHE: Mutex<Option<HashMap<String, &'static Query>>> = Mutex::new(None);
+    let mut guard = CACHE.lock().ok()?;
+    if guard.is_none() {
+        *guard = Some(HashMap::new());
+    }
+    let cache = guard.as_mut()?;
+    let key = src.to_string();
+    if let Some(query) = cache.get(&key) {
+        return Some(*query);
+    }
+    let query = Query::new(language, src).ok()?;
+    let leaked: &'static Query = Box::leak(Box::new(query));
+    cache.insert(key, leaked);
+    Some(leaked)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ByteRange {
@@ -50,24 +70,46 @@ pub fn suggest_indent(
     line: usize,
     indent_width: usize,
 ) -> Option<String> {
+    let line_start = line_byte(source, line)?;
+    suggest_indent_at_byte(language, source, tree, query_src, line_start, indent_width)
+}
+
+/// Suggested indent for a byte offset that will become the new line start.
+pub fn suggest_indent_at_byte(
+    language: &Language,
+    source: &str,
+    tree: &Tree,
+    query_src: &str,
+    byte_pos: usize,
+    indent_width: usize,
+) -> Option<String> {
     if query_src.trim().is_empty() {
         return None;
     }
-    let query = Query::new(language, query_src).ok()?;
-    let line_start = line_byte(source, line)?;
+    let query = cached_query(language, query_src)?;
+    indent_from_query(query, source, tree, byte_pos, indent_width)
+}
+
+fn indent_from_query(
+    query: &Query,
+    source: &str,
+    tree: &Tree,
+    byte_pos: usize,
+    indent_width: usize,
+) -> Option<String> {
     let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+    let mut matches = cursor.matches(query, tree.root_node(), source.as_bytes());
     let mut level: i32 = 0;
     while let Some(m) = matches.next() {
         for cap in m.captures {
             let name = query.capture_names()[cap.index as usize];
             let node = cap.node;
             if name == "indent" || name == "indent.always" {
-                if node.start_byte() < line_start && node.end_byte() > line_start {
+                if node.start_byte() < byte_pos && node.end_byte() > byte_pos {
                     level += 1;
                 }
             } else if name == "outdent" || name == "outdent.always" {
-                if node.start_byte() >= line_start && node.start_position().row as usize == line {
+                if node.start_byte() >= byte_pos && node.start_position().row == byte_line(source, byte_pos) {
                     level -= 1;
                 }
             }
@@ -75,6 +117,10 @@ pub fn suggest_indent(
     }
     let level = level.max(0) as usize;
     Some(" ".repeat(level.saturating_mul(indent_width.max(1))))
+}
+
+fn byte_line(source: &str, byte: usize) -> usize {
+    source.bytes().take(byte).filter(|b| *b == b'\n').count()
 }
 
 /// Smallest textobject of `object` (for example `function`) covering `byte_pos`.
@@ -90,14 +136,14 @@ pub fn textobject_at(
     if query_src.trim().is_empty() {
         return None;
     }
-    let query = Query::new(language, query_src).ok()?;
+    let query = cached_query(language, query_src)?;
     let want = if inside {
         format!("{object}.inside")
     } else {
         format!("{object}.around")
     };
     let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+    let mut matches = cursor.matches(query, tree.root_node(), source.as_bytes());
     let mut best: Option<ByteRange> = None;
     while let Some(m) = matches.next() {
         for cap in m.captures {
@@ -131,12 +177,12 @@ pub fn rainbow_spans(
     if query_src.trim().is_empty() {
         return Vec::new();
     }
-    let Ok(query) = Query::new(language, query_src) else {
+    let Some(query) = cached_query(language, query_src) else {
         return Vec::new();
     };
     let mut cursor = QueryCursor::new();
     let mut scopes: Vec<(usize, usize)> = Vec::new();
-    let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+    let mut matches = cursor.matches(query, tree.root_node(), source.as_bytes());
     while let Some(m) = matches.next() {
         for cap in m.captures {
             let name = query.capture_names()[cap.index as usize];
@@ -175,11 +221,11 @@ pub fn collect_tags(
     if query_src.trim().is_empty() {
         return Vec::new();
     }
-    let Ok(query) = Query::new(language, query_src) else {
+    let Some(query) = cached_query(language, query_src) else {
         return Vec::new();
     };
     let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+    let mut matches = cursor.matches(query, tree.root_node(), source.as_bytes());
     let mut tags = Vec::new();
     while let Some(m) = matches.next() {
         let mut name = None;
@@ -220,11 +266,11 @@ pub fn collect_folds(
     if query_src.trim().is_empty() {
         return Vec::new();
     }
-    let Ok(query) = Query::new(language, query_src) else {
+    let Some(query) = cached_query(language, query_src) else {
         return Vec::new();
     };
     let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+    let mut matches = cursor.matches(query, tree.root_node(), source.as_bytes());
     let mut folds = Vec::new();
     while let Some(m) = matches.next() {
         for cap in m.captures {

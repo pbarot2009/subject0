@@ -917,7 +917,7 @@ fn injection_query_loaded_for_rust() {
 
 #[test]
 fn byte_point_0() {
-    let src = "a\n".repeat(0 + 1);
+    let src = "a\n".to_string();
     assert_eq!(byte_to_point(&src, 0), (0, 0));
 }
 

@@ -75,9 +75,17 @@ pub fn atomic_write_with(
     let perms = fs::metadata(path).ok().map(|meta| meta.permissions());
     let file_name = path
         .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("s0_buffer");
-    let tmp_path = path.with_file_name(format!(".{file_name}.s0tmp"));
+        .map(|n| n.to_string_lossy().replace('/', "_"))
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "s0_buffer".to_string());
+    let tmp_path = path.with_file_name(format!(
+        ".{file_name}.{}.{}.s0tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
 
     {
         let file = OpenOptions::new()
@@ -97,10 +105,10 @@ pub fn atomic_write_with(
 
     if fs::rename(&tmp_path, path).is_err() {
         fs::copy(&tmp_path, path)?;
-        let _ = fs::remove_file(&tmp_path);
         if let Ok(file) = File::open(path) {
             let _ = file.sync_all();
         }
+        let _ = fs::remove_file(&tmp_path);
     }
 
     if let Some(parent) = path.parent()

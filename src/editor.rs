@@ -155,7 +155,11 @@ impl AppConfig {
         if let Some(parent) = self.source_path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        fs::write(&self.source_path, serde_json::to_string_pretty(&val)?)?;
+        let body = serde_json::to_string_pretty(&val)?;
+        atomic_write_with(&self.source_path, |writer| {
+            writer.write_all(body.as_bytes())?;
+            Ok(())
+        })?;
         Ok(())
     }
 }
@@ -651,7 +655,11 @@ impl FileExplorer {
         }
     }
 
-    fn read_directory(dir: &Path, depth: usize) -> Vec<FileEntry> {
+    fn read_directory(dir: &Path, depth: usize, visited: &mut HashSet<PathBuf>) -> Vec<FileEntry> {
+        let canonical = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        if !visited.insert(canonical) {
+            return Vec::new();
+        }
         let mut entries = Vec::new();
         if let Ok(read_dir) = fs::read_dir(dir) {
             let mut paths: Vec<PathBuf> = read_dir
@@ -787,7 +795,7 @@ impl FileExplorer {
             self.entries[idx].expanded = true;
             let current_depth = self.entries[idx].depth;
             let dir_path = self.entries[idx].path.clone();
-            let children = Self::read_directory(&dir_path, current_depth + 1);
+            let children = Self::read_directory(&dir_path, current_depth + 1, &mut HashSet::new());
 
             let insert_pos = idx + 1;
             self.entries.splice(insert_pos..insert_pos, children);
@@ -1167,22 +1175,29 @@ impl Editor {
 
     /// Jumps backward through the location jump-list history.
     pub fn jump_backward(&mut self) {
-        if self.jump_idx > 0 && !self.jump_list.is_empty() {
-            if self.jump_idx == self.jump_list.len() {
-                self.record_jump_checkpoint();
+        if self.jump_list.is_empty() {
+            self.status_msg = "Already at oldest jump position".to_string();
+            return;
+        }
+        if self.jump_idx == self.jump_list.len() {
+            let before = self.jump_list.len();
+            self.record_jump_checkpoint();
+            if self.jump_list.len() == before {
                 self.jump_idx = self.jump_idx.saturating_sub(1);
             }
-            self.jump_idx = self.jump_idx.saturating_sub(1);
-            if let Some(cp) = self.jump_list.get(self.jump_idx).cloned() {
-                self.jump_to_char_pos(cp.path, cp.line, cp.col);
-                self.status_msg = format!(
-                    "Jumped back ({}/{})",
-                    self.jump_idx + 1,
-                    self.jump_list.len()
-                );
-            }
-        } else {
+        }
+        if self.jump_idx == 0 {
             self.status_msg = "Already at oldest jump position".to_string();
+            return;
+        }
+        self.jump_idx -= 1;
+        if let Some(cp) = self.jump_list.get(self.jump_idx).cloned() {
+            self.jump_to_char_pos(cp.path, cp.line, cp.col);
+            self.status_msg = format!(
+                "Jumped back ({}/{})",
+                self.jump_idx + 1,
+                self.jump_list.len()
+            );
         }
     }
 
@@ -1229,9 +1244,17 @@ impl Editor {
         self.insert_snapshot_taken = false;
         self.diagnostics.clear();
         self.completion_visible = false;
+        self.completions.clear();
         self.inlay_hints.clear();
         self.hover_info = None;
         self.signature_help = None;
+        self.folded_lines.clear();
+        self.doc_highlights.clear();
+        self.code_action_picker = None;
+        self.symbol_picker = None;
+        self.location_picker = None;
+        self.rename_prompt = None;
+        self.pending_rename = None;
 
         self.syntax = SyntaxEngine::new(Some(&path_buf));
         let text = self.rope.to_string();
@@ -1246,6 +1269,7 @@ impl Editor {
                         path: path_buf.clone(),
                         text,
                         lang_id: lang_id.to_string(),
+                        version: self.doc_version,
                     });
                     self.request_semantic_tokens();
                     self.request_inlay_hints();
@@ -1286,6 +1310,7 @@ impl Editor {
                         path: abs_path,
                         text,
                         lang_id: lang_id.to_string(),
+                        version: self.doc_version.max(1),
                     });
                     self.request_semantic_tokens();
                     self.request_inlay_hints();
@@ -2011,30 +2036,40 @@ impl Editor {
         }
     }
 
-    /// Shifts diagnostic coordinates down when lines are added strictly below them.
+    /// Shifts diagnostic coordinates when lines are inserted after `after_line`.
     fn shift_diagnostics_down(&mut self, after_line: usize, count: usize) {
+        if count == 0 {
+            return;
+        }
         for d in &mut self.diagnostics {
             if d.line > after_line {
                 d.line += count;
+            }
+            if d.end_line > after_line {
                 d.end_line += count;
             }
         }
     }
 
-    /// Shifts diagnostic coordinates down when lines are inserted at or above them.
+    /// Shifts diagnostic coordinates when lines are inserted at or above them.
     fn shift_diagnostics_down_from(&mut self, from_line: usize, count: usize) {
+        if count == 0 {
+            return;
+        }
         for d in &mut self.diagnostics {
             if d.line >= from_line {
                 d.line += count;
+            }
+            if d.end_line >= from_line {
                 d.end_line += count;
             }
         }
     }
 
-    /// Shifts diagnostic coordinates up when a line above them is removed.
+    /// Shifts diagnostic coordinates up when a line is removed.
     fn shift_diagnostics_up(&mut self, removed_line: usize) {
         self.diagnostics
-            .retain(|d| d.line != removed_line && d.end_line != removed_line);
+            .retain(|d| !(d.line == removed_line && d.end_line == removed_line));
         for d in &mut self.diagnostics {
             if d.line > removed_line {
                 d.line = d.line.saturating_sub(1);
@@ -2042,13 +2077,16 @@ impl Editor {
             if d.end_line > removed_line {
                 d.end_line = d.end_line.saturating_sub(1);
             }
+            if d.end_line < d.line {
+                d.end_line = d.line;
+            }
         }
     }
 
     pub fn on_buffer_modified(&mut self) {
         let text = self.rope.to_string();
         self.syntax.reparse(&text);
-        self.doc_version = self.doc_version.wrapping_add(1);
+        self.doc_version = self.doc_version.saturating_add(1).max(1);
 
         let max_lines = self.rope.len_lines().max(1);
         self.diagnostics.retain(|d| d.line < max_lines);
@@ -2302,9 +2340,9 @@ impl Editor {
                     .chars()
                     .map(|c| {
                         if c.is_uppercase() {
-                            c.to_lowercase().next().unwrap_or(c)
+                            c.to_lowercase().collect::<String>()
                         } else {
-                            c.to_uppercase().next().unwrap_or(c)
+                            c.to_uppercase().collect::<String>()
                         }
                     })
                     .collect();
@@ -2322,14 +2360,14 @@ impl Editor {
                 if idx < self.rope.len_chars() {
                     self.snapshot();
                     let c = self.rope.char(idx);
-                    let toggled = if c.is_uppercase() {
-                        c.to_lowercase().next().unwrap_or(c)
+                    let toggled: String = if c.is_uppercase() {
+                        c.to_lowercase().collect()
                     } else {
-                        c.to_uppercase().next().unwrap_or(c)
+                        c.to_uppercase().collect()
                     };
                     self.rope.remove(idx..=idx);
-                    self.rope.insert_char(idx, toggled);
-                    self.cursor_x += 1;
+                    self.rope.insert(idx, &toggled);
+                    self.cursor_x += toggled.chars().count();
                     self.note_edit();
                     self.clamp_cursor();
                     self.on_buffer_modified();
@@ -2370,7 +2408,13 @@ impl Editor {
         if ws_len > 0 {
             self.rope.remove(insert_pos..insert_pos + ws_len);
         }
-        self.rope.insert_char(insert_pos, ' ');
+        let prev_needs_space = insert_pos > 0
+            && !matches!(self.rope.char(insert_pos - 1), ' ' | '\t' | '\n' | '(' | '[' | '{');
+        let next_exists = insert_pos < self.rope.len_chars()
+            && self.rope.char(insert_pos) != '\n';
+        if prev_needs_space && next_exists {
+            self.rope.insert_char(insert_pos, ' ');
+        }
 
         self.shift_diagnostics_up(self.cursor_y + 1);
 
@@ -2526,7 +2570,7 @@ impl Editor {
             self.cursor_y += 1;
             self.cursor_x = inner_indent.chars().count();
         } else {
-            let suggested = self.syntax.suggested_indent(self.cursor_y + 1);
+            let suggested = self.syntax.suggested_indent_at_byte(idx);
             let indent = suggested.unwrap_or(indent);
             let to_insert = format!("{le}{indent}");
             self.rope.insert(idx, &to_insert);
@@ -2641,31 +2685,43 @@ impl Editor {
         let item = self.completions[self.completion_idx].clone();
         let replacement = item.insert_text.clone();
 
+        let mut edits = item.additional_text_edits.clone();
         if let Some(edit) = &item.primary_edit {
-            let mut edits = item.additional_text_edits.clone();
             edits.push(TextEditItem {
-                new_text: replacement,
+                new_text: replacement.clone(),
                 ..edit.clone()
             });
-            Self::apply_edits_to_rope(&mut self.rope, &edits);
-            let end_idx = Self::lsp_pos_to_char_index(&self.rope, edit.end_line, edit.end_col);
-            let new_line = self.rope.char_to_line(end_idx.min(self.rope.len_chars()));
-            let line_start = self.rope.line_to_char(new_line);
-            self.cursor_y = new_line;
-            self.cursor_x = end_idx.saturating_sub(line_start);
         } else {
             let prefix = self.current_word_prefix();
             let prefix_len = prefix.chars().count();
-            let idx = self.char_index();
-            let start = idx.saturating_sub(prefix_len);
-            self.rope.remove(start..idx);
-            self.rope.insert(start, &replacement);
-            if !item.additional_text_edits.is_empty() {
-                Self::apply_edits_to_rope(&mut self.rope, &item.additional_text_edits);
-            }
-            let end_idx = start + replacement.chars().count();
-            let new_line = self.rope.char_to_line(end_idx.min(self.rope.len_chars()));
-            let line_start = self.rope.line_to_char(new_line);
+            let end_col = self.cursor_utf16_col();
+            let start_col = end_col.saturating_sub(char_to_utf16_col(
+                &prefix,
+                prefix_len,
+            ));
+            edits.push(TextEditItem {
+                start_line: self.cursor_y,
+                start_col,
+                end_line: self.cursor_y,
+                end_col,
+                new_text: replacement.clone(),
+            });
+        }
+
+        let cursor_idx = Self::cursor_index_after_edits(&self.rope, &edits, &replacement);
+        Self::apply_edits_to_rope(&mut self.rope, &edits);
+        if let Some(end_idx) = cursor_idx {
+            let end_idx = end_idx.min(self.rope.len_chars());
+            let new_line = if self.rope.len_chars() == 0 {
+                0
+            } else {
+                self.rope.char_to_line(end_idx.min(self.rope.len_chars()))
+            };
+            let line_start = if new_line < self.rope.len_lines() {
+                self.rope.line_to_char(new_line)
+            } else {
+                0
+            };
             self.cursor_y = new_line;
             self.cursor_x = end_idx.saturating_sub(line_start);
         }
@@ -2674,6 +2730,27 @@ impl Editor {
         self.completion_visible = false;
         self.clamp_cursor();
         self.on_buffer_modified();
+    }
+
+    /// Character index where `replacement` ends after `edits` are applied to `rope`.
+    fn cursor_index_after_edits(
+        rope: &Rope,
+        edits: &[TextEditItem],
+        replacement: &str,
+    ) -> Option<usize> {
+        let primary = edits.iter().rev().find(|e| e.new_text == replacement)?;
+        let primary_start = Self::lsp_pos_to_char_index(rope, primary.start_line, primary.start_col);
+        let mut shift = 0isize;
+        for edit in edits {
+            let start = Self::lsp_pos_to_char_index(rope, edit.start_line, edit.start_col);
+            if start >= primary_start {
+                continue;
+            }
+            let end = Self::lsp_pos_to_char_index(rope, edit.end_line, edit.end_col);
+            let removed = end.saturating_sub(start) as isize;
+            shift += edit.new_text.chars().count() as isize - removed;
+        }
+        Some((primary_start as isize + shift).max(0) as usize + replacement.chars().count())
     }
 
     pub fn delete_under_cursor(&mut self) {
@@ -3186,6 +3263,42 @@ impl Editor {
         self.code_action_picker = None;
     }
 
+    /// True when `y` is inside a closed fold and should not take a screen row.
+    pub fn line_hidden(&self, y: usize) -> bool {
+        self.folded_lines.iter().any(|start| {
+            y > *start
+                && self
+                    .syntax
+                    .fold_at(*start)
+                    .is_some_and(|f| y <= f.end_line && y != f.start_line)
+        })
+    }
+
+    /// Moves the cursor by `delta` visible lines, skipping folded rows.
+    pub fn move_vertical(&mut self, delta: isize) {
+        if delta == 0 {
+            return;
+        }
+        let max = self.rope.len_lines().saturating_sub(1);
+        let step: isize = if delta < 0 { -1 } else { 1 };
+        let mut remaining = delta.abs();
+        let mut y = self.cursor_y as isize;
+        let mut guard = 0;
+        while remaining > 0 && guard < 100_000 {
+            guard += 1;
+            let next = y + step;
+            if next < 0 || next > max as isize {
+                break;
+            }
+            y = next;
+            if !self.line_hidden(y as usize) {
+                remaining -= 1;
+            }
+        }
+        self.cursor_y = y.max(0) as usize;
+        self.clamp_cursor();
+    }
+
     pub fn clamp_cursor(&mut self) {
         let max_lines = self.rope.len_lines().max(1);
         if self.cursor_y >= max_lines {
@@ -3240,6 +3353,9 @@ impl Editor {
 
             let mut visual_rows_down = 0;
             for y in self.scroll_y..self.cursor_y {
+                if self.line_hidden(y) {
+                    continue;
+                }
                 visual_rows_down += line_visual_rows(y, &self.rope);
                 if visual_rows_down >= height {
                     break;

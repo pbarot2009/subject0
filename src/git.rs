@@ -278,12 +278,7 @@ pub fn compute_hunks_from_text(head_text: &str, buffer_text: &str) -> Vec<GitHun
     let clean_head = head_text.replace("\r\n", "\n");
     let clean_buf = buffer_text.replace("\r\n", "\n");
 
-    let head_lines: Vec<&str> = if clean_head.is_empty() {
-        Vec::new()
-    } else {
-        clean_head.split('\n').collect()
-    };
-
+    let head_lines = split_diff_lines(&clean_head);
     let input = InternedInput::new(clean_head.as_str(), clean_buf.as_str());
     let sink = HunkSink {
         before_lines: &head_lines,
@@ -291,6 +286,18 @@ pub fn compute_hunks_from_text(head_text: &str, buffer_text: &str) -> Vec<GitHun
     };
 
     diff(Algorithm::Histogram, &input, sink)
+}
+
+/// Splits text the same way a rope counts lines: a trailing newline is not an extra line.
+fn split_diff_lines(text: &str) -> Vec<&str> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    if text.ends_with('\n') {
+        lines.pop();
+    }
+    lines
 }
 
 // === CLI Fallback Engine for Complex Platform Layouts ===

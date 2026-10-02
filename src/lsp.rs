@@ -383,6 +383,7 @@ pub enum LspInbound {
         path: PathBuf,
         text: String,
         lang_id: String,
+        version: i32,
     },
     CancelRequest {
         req_id: i64,
@@ -428,6 +429,7 @@ pub enum LspOutbound {
         items: Vec<SuggestionItem>,
     },
     SemanticTokens {
+        req_id: i64,
         tokens: Vec<SemanticTokenSpan>,
     },
     InlayHints {
@@ -656,6 +658,8 @@ pub fn uris_match(a: &str, b: &str) -> bool {
 }
 
 pub fn utf16_to_char_col(line: &str, utf16_col: usize) -> usize {
+    let line = line.strip_suffix('\n').unwrap_or(line);
+    let line = line.strip_suffix('\r').unwrap_or(line);
     let mut current_utf16 = 0usize;
     let mut char_count = 0usize;
     for c in line.chars() {
@@ -689,6 +693,8 @@ pub fn slice_utf16(s: &str, start: usize, end: usize) -> String {
 }
 
 pub fn char_to_utf16_col(line: &str, char_col: usize) -> usize {
+    let line = line.strip_suffix('\n').unwrap_or(line);
+    let line = line.strip_suffix('\r').unwrap_or(line);
     let mut utf16_count = 0usize;
     for (idx, ch) in line.chars().enumerate() {
         if idx >= char_col {
@@ -707,24 +713,28 @@ pub fn parse_snippet_to_plain_text(snippet: &str) -> String {
         if c == '$' {
             if let Some(&'{') = chars.peek() {
                 chars.next();
-                let mut placeholder = String::new();
-                let mut has_colon = false;
+                let mut raw = String::new();
+                let mut depth = 1;
                 for ch in chars.by_ref() {
-                    if ch == '}' {
-                        break;
-                    }
-                    if ch == ':' && !has_colon {
-                        has_colon = true;
-                        continue;
-                    }
-                    if has_colon {
-                        placeholder.push(ch);
+                    if ch == '{' {
+                        depth += 1;
+                        raw.push(ch);
+                    } else if ch == '}' {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                        raw.push(ch);
+                    } else {
+                        raw.push(ch);
                     }
                 }
-                result.push_str(&placeholder);
+                result.push_str(&snippet_placeholder_text(&raw));
             } else if let Some(&next_c) = chars.peek() {
                 if next_c.is_ascii_digit() {
-                    chars.next();
+                    while chars.peek().is_some_and(char::is_ascii_digit) {
+                        chars.next();
+                    }
                 } else {
                     result.push(c);
                 }
@@ -747,6 +757,25 @@ pub fn parse_snippet_to_plain_text(snippet: &str) -> String {
         }
     }
     result
+}
+
+fn snippet_placeholder_text(raw: &str) -> String {
+    let body = raw.trim();
+    if body.is_empty() {
+        return String::new();
+    }
+    let rest = body.trim_start_matches(|c: char| c.is_ascii_digit());
+    if rest.is_empty() {
+        return String::new();
+    }
+    if let Some(choice) = rest.strip_prefix('|') {
+        let choice = choice.strip_suffix('|').unwrap_or(choice);
+        return choice.split(',').next().unwrap_or("").to_string();
+    }
+    if let Some(text) = rest.strip_prefix(':') {
+        return parse_snippet_to_plain_text(text);
+    }
+    String::new()
 }
 
 // === JSON-RPC LSP Framing ===
@@ -1755,6 +1784,7 @@ pub async fn run_lsp_actor(
     let mut current_text = initial_text;
     let mut current_version = 1i32;
     let mut restart_attempts = 0usize;
+    let mut document_was_open = false;
 
     'supervisor: loop {
         emit(
@@ -1822,6 +1852,7 @@ pub async fn run_lsp_actor(
                 }
             });
             let _ = send_lsp_message(&mut stdin, &did_open).await;
+            document_was_open = true;
         }
 
         emit(
@@ -1848,26 +1879,30 @@ pub async fn run_lsp_actor(
                             manual_reboot = true;
                             break 'event_loop;
                         }
-                        Some(LspInbound::OpenFile { path, text, lang_id }) => {
+                        Some(LspInbound::OpenFile {
+                            path,
+                            text,
+                            lang_id,
+                            version,
+                        }) => {
                             let old_uri_str = file_to_uri(&current_file);
                             let new_uri_str = file_to_uri(&path);
-
-                            if old_uri_str != new_uri_str
-                                && let Ok(old_uri) = old_uri_str.parse::<Uri>() {
-                                    let did_close = serde_json::json!({
-                                        "jsonrpc": "2.0",
-                                        "method": "textDocument/didClose",
-                                        "params": DidCloseTextDocumentParams {
-                                            text_document: TextDocumentIdentifier { uri: old_uri }
-                                        }
-                                    });
-                                    let _ = send_lsp_message(&mut stdin, &did_close).await;
-                                }
+                            if document_was_open && let Ok(old_uri) = old_uri_str.parse::<Uri>() {
+                                let did_close = serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "textDocument/didClose",
+                                    "params": DidCloseTextDocumentParams {
+                                        text_document: TextDocumentIdentifier { uri: old_uri }
+                                    }
+                                });
+                                let _ = send_lsp_message(&mut stdin, &did_close).await;
+                            }
 
                             current_file = path;
                             current_text = text;
                             current_lang = lang_id;
-                            current_version = 1;
+                            current_version = version.max(1);
+                            document_was_open = true;
 
                             if let Ok(new_uri) = new_uri_str.parse::<Uri>() {
                                 let did_open = serde_json::json!({
@@ -2478,7 +2513,7 @@ pub async fn run_lsp_actor(
                                                     });
                                                 }
                                             }
-                                        emit(&tx, session_id, LspOutbound::SemanticTokens { tokens });
+                                        emit(&tx, session_id, LspOutbound::SemanticTokens { req_id: resp_id, tokens });
                                     }
                                     "executeCommand" => {
                                         if let Ok(edit) = serde_json::from_value::<WorkspaceEdit>(result_val) {

@@ -1396,6 +1396,20 @@ impl SyntaxEngine {
         tree_engine::suggest_indent(lang, &self.source, tree, &self.query_pack.indents, line, 4)
     }
 
+    /// Indent at a byte offset. Used by Enter before the new line exists.
+    pub fn suggested_indent_at_byte(&self, byte: usize) -> Option<String> {
+        let lang = self.ts_language.as_ref()?;
+        let tree = self.tree.as_ref()?;
+        tree_engine::suggest_indent_at_byte(
+            lang,
+            &self.source,
+            tree,
+            &self.query_pack.indents,
+            byte,
+            4,
+        )
+    }
+
     /// Byte range of a textobject (`function`, `class`, `comment`, ...) at a byte offset.
     pub fn textobject_range(
         &self,

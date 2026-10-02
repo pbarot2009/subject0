@@ -1,6 +1,14 @@
 ## Unreleased
 
-- CLI grammar commands accept `s0 grammar`, `--grammar=install`, and `install=lang`, reject unknown flags and extra arguments, and alias `c++`, `ts`, `c#`.
+- Fixed completion acceptance so auto-imports apply against the original buffer and the cursor lands at the end of the inserted text.
+- LSP `didOpen` always closes the previous document first, including the same URI, and keeps the editor document version.
+- Stale definition, reference, highlight, and semantic-token responses are ignored unless the request id matches.
+- Diagnostic ranges keep both ends when lines are inserted or deleted. Folds are skipped by `j`/`k` and cleared on file open.
+- Git hunk text no longer treats a trailing newline as an extra line. Config and buffer saves use unique atomic temp files.
+- Tree-sitter indent, fold, tag, and textobject queries are compiled once per process.
+- Fixture files under `tests/` are no longer compiled as Cargo integration tests. Added regression coverage for edits, snippets, and diffs.
+
+# Changelog
 - Static grammars reduced to Rust, C, Python, JavaScript, TypeScript, TSX, Go, JSON, HTML, Markdown, and Bash. C++ uses C until `s0 --grammar install cpp`.
 - Execute all Tree-sitter query files (highlights, locals, injections, indents, textobjects, rainbows, tags, folds) with `;; inherits:` resolution.
 - Per-language grammar install (`s0 --grammar install <lang>`), not a fetch-all. Static grammars stay built in.

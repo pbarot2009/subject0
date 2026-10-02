@@ -170,8 +170,10 @@ async fn main() -> Result<()> {
                         editor.request_inlay_hints();
                     }
                 }
-                LspOutbound::SemanticTokens { tokens } => {
-                    editor.syntax.set_semantic_tokens(tokens);
+                LspOutbound::SemanticTokens { req_id, tokens } => {
+                    if req_id == editor.lsp_req_id {
+                        editor.syntax.set_semantic_tokens(tokens);
+                    }
                 }
                 LspOutbound::Diagnostics(d) => editor.diagnostics = d,
                 LspOutbound::InlayHints { req_id, hints } => {
@@ -196,15 +198,16 @@ async fn main() -> Result<()> {
                         editor.signature_help = help;
                     }
                 }
-                LspOutbound::Definition {
-                    req_id: _,
-                    locations,
-                } => {
+                LspOutbound::Definition { req_id, locations } => {
+                    if req_id != editor.lsp_req_id {
+                        continue;
+                    }
                     if locations.is_empty() {
                         editor.status_msg = "No definition found".to_string();
                     } else if locations.len() == 1 {
-                        let loc = locations.into_iter().next().unwrap();
-                        editor.jump_to_location(loc);
+                        if let Some(loc) = locations.into_iter().next() {
+                            editor.jump_to_location(loc);
+                        }
                     } else {
                         editor.location_picker = Some(LocationPicker {
                             title: "Go to Definition",
@@ -216,14 +219,18 @@ async fn main() -> Result<()> {
                 }
                 LspOutbound::Goto {
                     title,
-                    req_id: _,
+                    req_id,
                     locations,
                 } => {
+                    if req_id != editor.lsp_req_id {
+                        continue;
+                    }
                     if locations.is_empty() {
                         editor.status_msg = format!("No results for {title}");
                     } else if locations.len() == 1 {
-                        let loc = locations.into_iter().next().unwrap();
-                        editor.jump_to_location(loc);
+                        if let Some(loc) = locations.into_iter().next() {
+                            editor.jump_to_location(loc);
+                        }
                     } else {
                         editor.location_picker = Some(LocationPicker {
                             title,
@@ -233,7 +240,10 @@ async fn main() -> Result<()> {
                         });
                     }
                 }
-                LspOutbound::DocumentHighlights { req_id: _, ranges } => {
+                LspOutbound::DocumentHighlights { req_id, ranges } => {
+                    if req_id != editor.lsp_req_id {
+                        continue;
+                    }
                     editor.doc_highlights = ranges;
                     editor.status_msg = format!("{} highlight ranges", editor.doc_highlights.len());
                 }
@@ -248,15 +258,16 @@ async fn main() -> Result<()> {
                         scroll: 0,
                     });
                 }
-                LspOutbound::References {
-                    req_id: _,
-                    locations,
-                } => {
+                LspOutbound::References { req_id, locations } => {
+                    if req_id != editor.lsp_req_id {
+                        continue;
+                    }
                     if locations.is_empty() {
                         editor.status_msg = "No references found".to_string();
                     } else if locations.len() == 1 {
-                        let loc = locations.into_iter().next().unwrap();
-                        editor.jump_to_location(loc);
+                        if let Some(loc) = locations.into_iter().next() {
+                            editor.jump_to_location(loc);
+                        }
                     } else {
                         editor.location_picker = Some(LocationPicker {
                             title: "Find References",
@@ -1532,7 +1543,7 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                 }
                 KeyCode::Char('u') => editor.undo(),
                 KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    editor.redo()
+                    editor.redo();
                 }
                 KeyCode::Char('d') => editor.pending_key = Some('d'),
                 KeyCode::Char('g') => editor.pending_key = Some('g'),
@@ -1559,12 +1570,10 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                     }
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
-                    editor.cursor_y = editor.cursor_y.saturating_sub(1);
+                    editor.move_vertical(-1);
                 }
                 KeyCode::Char('j') | KeyCode::Down => {
-                    if editor.cursor_y + 1 < editor.rope.len_lines() {
-                        editor.cursor_y += 1;
-                    }
+                    editor.move_vertical(1);
                 }
                 KeyCode::Char('x') => editor.delete_under_cursor(),
                 KeyCode::Char('?') => {
@@ -1654,12 +1663,10 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                     }
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
-                    editor.cursor_y = editor.cursor_y.saturating_sub(1);
+                    editor.move_vertical(-1);
                 }
-                KeyCode::Char('j') | KeyCode::Down
-                    if editor.cursor_y + 1 < editor.rope.len_lines() =>
-                {
-                    editor.cursor_y += 1;
+                KeyCode::Char('j') | KeyCode::Down => {
+                    editor.move_vertical(1);
                 }
                 _ => {}
             }
@@ -1776,13 +1783,11 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
                     editor.completion_visible = false;
                 }
                 KeyCode::Up => {
-                    editor.cursor_y = editor.cursor_y.saturating_sub(1);
+                    editor.move_vertical(-1);
                     editor.completion_visible = false;
                 }
                 KeyCode::Down => {
-                    if editor.cursor_y + 1 < editor.rope.len_lines() {
-                        editor.cursor_y += 1;
-                    }
+                    editor.move_vertical(1);
                     editor.completion_visible = false;
                 }
                 KeyCode::Char(c) => {
@@ -1844,3 +1849,5 @@ fn handle_key_event(editor: &mut Editor, key: KeyEvent) {
 
 #[cfg(test)]
 mod support_tests;
+#[cfg(test)]
+mod audit_tests;

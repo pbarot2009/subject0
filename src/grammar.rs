@@ -283,9 +283,16 @@ pub fn load_dynamic_language(name: &str) -> Result<tree_sitter::Language> {
         let lib = Library::new(&path)?;
         let symbol = grammar_symbol(name);
         let func: libloading::Symbol<unsafe extern "C" fn() -> *const ()> =
-            lib.get(symbol.as_bytes())?;
+            match lib.get(symbol.as_bytes()) {
+                Ok(func) => func,
+                Err(err) => {
+                    drop(lib);
+                    return Err(anyhow!("grammar '{name}' missing symbol {symbol}: {err}"));
+                }
+            };
         let raw = func();
         if raw.is_null() {
+            drop(lib);
             return Err(anyhow!("grammar '{name}' exported a null language"));
         }
         let lang = tree_sitter::Language::from_raw(raw.cast());
